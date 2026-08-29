@@ -1,0 +1,45 @@
+# Otush — Flatpak manifest (GNOME Software integration)
+#
+# Build with:
+#   flatpak-builder --user build-dir packaging/flatpak/com.clusterat.otush.yml
+#   flatpak build-export repo build-dir && flatpak install --user repo com.clusterat.otush
+#
+# Flatpak gives automatic portal permissions (microphone, global shortcuts)
+# and updates through GNOME Software.
+
+app-id: com.clusterat.otush
+runtime: org.gnome.Platform
+runtime-version: '46'
+sdk: org.gnome.Sdk
+command: otush
+finish-args:
+  # Wayland (native) + X11 fallback
+  - --socket=wayland
+  - --socket=x11
+  - --share=ipc
+  - --device=dri
+  # Microphone capture (PipeWire/portals)
+  - --socket=pulseaudio
+  - --device=all
+  # Global shortcuts portal
+  - --talk-name=org.freedesktop.portal.*
+  - --talk-name=org.freedesktop.portal.GlobalShortcuts
+  # StatusNotifierItem tray
+  - --talk-name=org.kde.StatusNotifierWatcher
+  # Model downloads
+  - --share=network
+  # User data (settings, models, history)
+  - --persist=.local/share/com.clusterat.otush
+modules:
+  - name: otush
+    buildsystem: simple
+    build-commands:
+      - cargo build --release --frozen
+      - install -Dm755 target/release/otush /app/bin/otush
+      - install -Dm644 packaging/com.clusterat.otush.desktop /app/share/applications/com.clusterat.otush.desktop
+      - install -Dm644 resources/otush-128.png /app/share/icons/hicolor/128x128/apps/com.clusterat.otush.png
+      - install -Dm644 resources/otush-icon.svg /app/share/icons/hicolor/scalable/apps/com.clusterat.otush.svg
+      - cp -r resources /app/share/otush/resources
+    sources:
+      - type: dir
+        path: ../..

@@ -1,0 +1,38 @@
+# Otush — native GNOME (GTK4/libadwaita) build
+#
+# Debian packaging (cargo deb compatible):
+#
+#   cargo install cargo-deb
+#   cargo deb
+#
+# The resulting .deb depends on the native GTK stack and bundles the
+# `resources/` dir under /usr/share/otush/resources (see `files` below).
+
+[package]
+name = "otush"
+section = "sound"
+priority = "optional"
+maintainer = "Otush contributors <otush@clusterat.com>"
+homepage = "https://github.com/ATClus/otush"
+description = "A free, open source, offline speech-to-text application for GNOME"
+
+[source]
+root = ".."
+
+[dependencies]
+libgtk-4-1
+libadwaita-1-0
+libgtk-4-layer-shell1
+libopenblas0
+
+[assets]
+# Desktop entry + icon
+target = "/usr/share/applications/"
+source = "com.clusterat.otush.desktop"
+target = "/usr/share/icons/hicolor/128x128/apps/"
+source = "../resources/otush-128.png"
+dest = "com.clusterat.otush.png"
+
+# Bundled resources (sounds, tray icons, VAD model)
+target = "/usr/share/otush/resources/"
+source = "../resources/"

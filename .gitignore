@@ -1,0 +1,55 @@
+# Logs
+logs
+*.log
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+lerna-debug.log*
+
+package-lock.json
+
+node_modules
+dist
+dist-ssr
+*.local
+*.local.*
+
+# Editor directories and files
+.vscode/*
+!.vscode/extensions.json
+.idea
+.DS_Store
+*.suo
+*.ntvs*
+*.njsproj
+*.sln
+*.sw?
+
+.claude/
+
+/target/
+recording_*
+.crush/
+
+# Playwright
+playwright-report/
+test-results/
+blob-report/
+
+.direnv
+.envrc
+
+# Nix build output
+result
+
+# Local build toolchain prefix (GTK4/libadwaita dev packages extracted for
+# compile-checking in sandboxed/rootless environments)
+/.build/
+
+# Staged transcribe-cpp shared runtime libraries (Linux .so), bundled into the
+# package at build time.
+/resources/transcribe-libs/
+
+# Python bytecode (scripts/)
+__pycache__/
