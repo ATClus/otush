@@ -102,8 +102,8 @@ assets = [
     ["resources/otush-128.png", "usr/share/icons/hicolor/128x128/apps/com.clusterat.otush.png", "644"],
     ["resources/otush-icon.svg", "usr/share/icons/hicolor/scalable/apps/com.clusterat.otush.svg", "644"],
     ["resources/transcribe-libs/*", "usr/share/otush/resources/transcribe-libs/", "644"],
-    ["resources/transcribe-libs/*", "usr/lib/otush/", "644"],
     ["resources/models/*", "usr/share/otush/resources/models/", "644"],
+    ["resources/default_settings.json", "usr/share/otush/resources/", "644"],
     ["resources/*.png", "usr/share/otush/resources/", "644"],
     ["resources/*.wav", "usr/share/otush/resources/", "644"],
 ]

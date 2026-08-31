@@ -59,6 +59,11 @@ jobs:
       - name: Build release
         run: cargo build --release
 
+      - name: Stage bundled transcribe shared libraries
+        run: |
+          mkdir -p resources/transcribe-libs
+          find target/release/build/ -type f -name "*.so*" -exec cp -u {} resources/transcribe-libs/ \;
+
       - name: Upload binary
         uses: actions/upload-artifact@v4
         with:

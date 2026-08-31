@@ -33,6 +33,11 @@ jobs:
       - name: Build release binary
         run: cargo build --release
 
+      - name: Stage bundled transcribe shared libraries
+        run: |
+          mkdir -p resources/transcribe-libs
+          find target/release/build/ -type f -name "*.so*" -exec cp -u {} resources/transcribe-libs/ \;
+
       - name: Build Debian package (.deb)
         run: |
           cargo install cargo-deb --locked
