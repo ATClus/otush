@@ -1,4 +1,4 @@
-// Re-export all audio components
+pub mod decoder;
 mod device;
 pub mod dsp;
 mod recorder;
@@ -6,6 +6,10 @@ mod resampler;
 mod utils;
 mod visualizer;
 
+pub use decoder::{
+    decode_media_bytes, decode_media_file, resample_audio, DecodedAudio, ProgressCallback,
+    TARGET_SAMPLE_RATE,
+};
 pub use device::{list_input_devices, list_output_devices, CpalDeviceInfo};
 pub use dsp::{HighPassFilter, NoiseGate, VoiceEnhancer, VoiceEnhancerConfig};
 pub use recorder::{
