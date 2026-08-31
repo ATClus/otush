@@ -432,7 +432,13 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
                 let content = match ext {
                     "srt" => crate::audio_toolkit::export_to_srt(&doc.segments),
                     "vtt" => crate::audio_toolkit::export_to_vtt(&doc.segments),
-                    "txt" => crate::audio_toolkit::export_to_txt(&doc.segments, true),
+                    "txt" => {
+                        if let Some(ref post) = doc.summary_or_post_processed {
+                            post.clone()
+                        } else {
+                            crate::audio_toolkit::export_to_txt(&doc.segments, false)
+                        }
+                    }
                     "json" => crate::audio_toolkit::export_to_json(&doc).unwrap_or_default(),
                     "md" => crate::audio_toolkit::export_to_markdown(&doc),
                     _ => String::new(),

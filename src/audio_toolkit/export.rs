@@ -395,15 +395,14 @@ pub fn export_to_markdown(doc: &TranscriptDocument) -> String {
 
     out.push_str("## 🎙️ Transcript\n\n");
     for seg in &doc.segments {
-        let ts = format_timestamp_human(seg.start_ms);
         let text = seg.text.trim();
         if text.is_empty() {
             continue;
         }
         if let Some(ref speaker) = seg.speaker {
-            out.push_str(&format!("**`{}` {}**: {}\n\n", ts, speaker, text));
+            out.push_str(&format!("**{}**: {}\n\n", speaker, text));
         } else {
-            out.push_str(&format!("**`{}`** {}\n\n", ts, text));
+            out.push_str(&format!("{}\n\n", text));
         }
     }
 
