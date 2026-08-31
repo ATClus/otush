@@ -604,137 +604,6 @@ pub fn is_no_input_device_error(error_message: &str) -> bool {
             && normalized.contains("coreaudio"))
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        handle_input_block, is_microphone_access_denied, is_no_input_device_error, run_consumer,
-        AudioChunk, AudioRecorder, Cmd,
-    };
-    use std::{
-        sync::{
-            atomic::{AtomicBool, Ordering},
-            mpsc, Arc,
-        },
-        thread,
-        time::{Duration, Instant},
-    };
-
-    #[test]
-    fn unopened_recorder_does_not_need_reopen() {
-        // No worker has been spawned yet, so there is nothing to reap. Guards
-        // against inverting the "no worker" case, which would make every first
-        // open() take the rebuild path.
-        let recorder = AudioRecorder::new().expect("recorder");
-        assert!(!recorder.needs_reopen());
-    }
-
-    #[test]
-    fn stream_error_requires_reopen() {
-        let recorder = AudioRecorder::new().expect("recorder");
-        recorder.stream_error.store(true, Ordering::Relaxed);
-        assert!(recorder.needs_reopen());
-    }
-
-    #[test]
-    fn shutdown_is_processed_without_audio_samples() {
-        let (sample_tx, sample_rx) = mpsc::channel();
-        let (cmd_tx, cmd_rx) = mpsc::channel();
-        let (done_tx, done_rx) = mpsc::channel();
-        let worker = thread::spawn(move || {
-            run_consumer(
-                48_000,
-                None,
-                sample_rx,
-                cmd_rx,
-                None,
-                None,
-                Arc::new(AtomicBool::new(false)),
-                Instant::now(),
-            );
-            let _ = done_tx.send(());
-        });
-
-        cmd_tx.send(Cmd::Shutdown).expect("send shutdown");
-        let stopped = done_rx.recv_timeout(Duration::from_secs(1));
-
-        // Unblock the old implementation so a failing test still exits cleanly.
-        drop(sample_tx);
-        worker.join().expect("join consumer");
-        assert!(stopped.is_ok(), "shutdown waited for an audio sample");
-    }
-
-    #[test]
-    fn boundary_block_forwarded_before_eos() {
-        let (tx, rx) = mpsc::channel();
-        let stop_flag = AtomicBool::new(false);
-        let mut eos_sent = false;
-        let mut scratch = Vec::new();
-        let mut push = |flag: &AtomicBool, eos: &mut bool, block: &[f32]| {
-            handle_input_block::<f32>(block, 1, None, flag, eos, &mut scratch, &tx)
-        };
-
-        // Running: blocks forwarded, no sentinel.
-        push(&stop_flag, &mut eos_sent, &[0.1]);
-        assert!(matches!(rx.try_recv(), Ok(AudioChunk::Samples(_))));
-        assert!(rx.try_recv().is_err());
-
-        // The block observing the stop flag is still forwarded, then EOS.
-        stop_flag.store(true, Ordering::Relaxed);
-        push(&stop_flag, &mut eos_sent, &[0.5, 0.5]);
-        match rx.try_recv() {
-            Ok(AudioChunk::Samples(samples)) => assert_eq!(samples, vec![0.5, 0.5]),
-            _ => panic!("boundary block must be forwarded, not dropped"),
-        }
-        assert!(matches!(rx.try_recv(), Ok(AudioChunk::EndOfStream)));
-
-        // Later blocks are dropped until the flag clears, then capture resumes.
-        push(&stop_flag, &mut eos_sent, &[0.9]);
-        assert!(rx.try_recv().is_err(), "blocks after EOS must be dropped");
-        stop_flag.store(false, Ordering::Relaxed);
-        push(&stop_flag, &mut eos_sent, &[0.2]);
-        assert!(matches!(rx.try_recv(), Ok(AudioChunk::Samples(_))));
-        assert!(rx.try_recv().is_err(), "no sentinel while running");
-    }
-
-    #[test]
-    fn detects_access_is_denied() {
-        assert!(is_microphone_access_denied("Access is denied"));
-    }
-
-    #[test]
-    fn detects_permission_denied() {
-        assert!(is_microphone_access_denied("permission denied"));
-    }
-
-    #[test]
-    fn detects_windows_error_code() {
-        assert!(is_microphone_access_denied("WASAPI error: 0x80070005"));
-    }
-
-    #[test]
-    fn does_not_match_unrelated_errors() {
-        assert!(!is_microphone_access_denied("device not found"));
-    }
-
-    #[test]
-    fn detects_no_input_device() {
-        assert!(is_no_input_device_error("No input device found"));
-    }
-
-    #[test]
-    fn detects_coreaudio_config_error() {
-        assert!(is_no_input_device_error(
-            "Failed to fetch preferred config: A backend-specific error has occurred: An unknown error unknown to the coreaudio-rs API occurred"
-        ));
-    }
-
-    #[test]
-    fn does_not_match_other_errors_for_no_device() {
-        assert!(!is_no_input_device_error("permission denied"));
-        assert!(!is_no_input_device_error("device not found"));
-    }
-}
-
 #[allow(clippy::too_many_arguments)]
 fn run_consumer(
     in_sample_rate: u32,
@@ -1023,5 +892,136 @@ fn run_consumer(
                 let _ = ready_tx.send(());
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        handle_input_block, is_microphone_access_denied, is_no_input_device_error, run_consumer,
+        AudioChunk, AudioRecorder, Cmd,
+    };
+    use std::{
+        sync::{
+            atomic::{AtomicBool, Ordering},
+            mpsc, Arc,
+        },
+        thread,
+        time::{Duration, Instant},
+    };
+
+    #[test]
+    fn unopened_recorder_does_not_need_reopen() {
+        // No worker has been spawned yet, so there is nothing to reap. Guards
+        // against inverting the "no worker" case, which would make every first
+        // open() take the rebuild path.
+        let recorder = AudioRecorder::new().expect("recorder");
+        assert!(!recorder.needs_reopen());
+    }
+
+    #[test]
+    fn stream_error_requires_reopen() {
+        let recorder = AudioRecorder::new().expect("recorder");
+        recorder.stream_error.store(true, Ordering::Relaxed);
+        assert!(recorder.needs_reopen());
+    }
+
+    #[test]
+    fn shutdown_is_processed_without_audio_samples() {
+        let (sample_tx, sample_rx) = mpsc::channel();
+        let (cmd_tx, cmd_rx) = mpsc::channel();
+        let (done_tx, done_rx) = mpsc::channel();
+        let worker = thread::spawn(move || {
+            run_consumer(
+                48_000,
+                None,
+                sample_rx,
+                cmd_rx,
+                None,
+                None,
+                Arc::new(AtomicBool::new(false)),
+                Instant::now(),
+            );
+            let _ = done_tx.send(());
+        });
+
+        cmd_tx.send(Cmd::Shutdown).expect("send shutdown");
+        let stopped = done_rx.recv_timeout(Duration::from_secs(1));
+
+        // Unblock the old implementation so a failing test still exits cleanly.
+        drop(sample_tx);
+        worker.join().expect("join consumer");
+        assert!(stopped.is_ok(), "shutdown waited for an audio sample");
+    }
+
+    #[test]
+    fn boundary_block_forwarded_before_eos() {
+        let (tx, rx) = mpsc::channel();
+        let stop_flag = AtomicBool::new(false);
+        let mut eos_sent = false;
+        let mut scratch = Vec::new();
+        let mut push = |flag: &AtomicBool, eos: &mut bool, block: &[f32]| {
+            handle_input_block::<f32>(block, 1, None, flag, eos, &mut scratch, &tx)
+        };
+
+        // Running: blocks forwarded, no sentinel.
+        push(&stop_flag, &mut eos_sent, &[0.1]);
+        assert!(matches!(rx.try_recv(), Ok(AudioChunk::Samples(_))));
+        assert!(rx.try_recv().is_err());
+
+        // The block observing the stop flag is still forwarded, then EOS.
+        stop_flag.store(true, Ordering::Relaxed);
+        push(&stop_flag, &mut eos_sent, &[0.5, 0.5]);
+        match rx.try_recv() {
+            Ok(AudioChunk::Samples(samples)) => assert_eq!(samples, vec![0.5, 0.5]),
+            _ => panic!("boundary block must be forwarded, not dropped"),
+        }
+        assert!(matches!(rx.try_recv(), Ok(AudioChunk::EndOfStream)));
+
+        // Later blocks are dropped until the flag clears, then capture resumes.
+        push(&stop_flag, &mut eos_sent, &[0.9]);
+        assert!(rx.try_recv().is_err(), "blocks after EOS must be dropped");
+        stop_flag.store(false, Ordering::Relaxed);
+        push(&stop_flag, &mut eos_sent, &[0.2]);
+        assert!(matches!(rx.try_recv(), Ok(AudioChunk::Samples(_))));
+        assert!(rx.try_recv().is_err(), "no sentinel while running");
+    }
+
+    #[test]
+    fn detects_access_is_denied() {
+        assert!(is_microphone_access_denied("Access is denied"));
+    }
+
+    #[test]
+    fn detects_permission_denied() {
+        assert!(is_microphone_access_denied("permission denied"));
+    }
+
+    #[test]
+    fn detects_windows_error_code() {
+        assert!(is_microphone_access_denied("WASAPI error: 0x80070005"));
+    }
+
+    #[test]
+    fn does_not_match_unrelated_errors() {
+        assert!(!is_microphone_access_denied("device not found"));
+    }
+
+    #[test]
+    fn detects_no_input_device() {
+        assert!(is_no_input_device_error("No input device found"));
+    }
+
+    #[test]
+    fn detects_coreaudio_config_error() {
+        assert!(is_no_input_device_error(
+            "Failed to fetch preferred config: A backend-specific error has occurred: An unknown error unknown to the coreaudio-rs API occurred"
+        ));
+    }
+
+    #[test]
+    fn does_not_match_other_errors_for_no_device() {
+        assert!(!is_no_input_device_error("permission denied"));
+        assert!(!is_no_input_device_error("device not found"));
     }
 }

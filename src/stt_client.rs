@@ -736,7 +736,7 @@ mod tests {
         let samples = generate_test_audio_samples();
         assert_eq!(samples.len(), 8000);
         for &s in &samples {
-            assert!(s >= -1.0 && s <= 1.0);
+            assert!((-1.0..=1.0).contains(&s));
         }
     }
 

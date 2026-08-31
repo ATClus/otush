@@ -177,14 +177,14 @@ pub(crate) fn send_chord(
     }
 }
 
-/// Attempts the receipt-sequenced paste. Returns `Err` before anything has
-/// been published when the platform transaction cannot start, in which case
-/// the caller should fall back to the legacy paste path. On `Ok`, publishing
-/// and chord injection have completed and the guarded restore (plus
-/// auto-submit) finishes asynchronously.
-///
-/// The platform-specific implementation was removed with non-Linux support;
-/// this entry point exists to document the contract for a future re-add.
+// Attempts the receipt-sequenced paste. Returns `Err` before anything has
+// been published when the platform transaction cannot start, in which case
+// the caller should fall back to the legacy paste path. On `Ok`, publishing
+// and chord injection have completed and the guarded restore (plus
+// auto-submit) finishes asynchronously.
+//
+// The platform-specific implementation was removed with non-Linux support;
+// this entry point exists to document the contract for a future re-add.
 
 #[cfg(test)]
 mod tests {
