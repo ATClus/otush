@@ -1,12 +1,11 @@
 //! Settings pages, one per sidebar section.
 
-pub mod about;
 pub mod advanced;
-pub mod debug;
+pub mod audio;
 pub mod general;
 pub mod history;
 pub mod models;
-pub mod post_processing;
+pub mod providers_llm;
 
 use crate::context::AppContext;
 use libadwaita::prelude::*;
@@ -44,12 +43,11 @@ pub fn track_row(group: &libadwaita::PreferencesGroup, row: &impl IsA<gtk4::Widg
 pub fn build_page(id: &str, ctx: &AppContext) -> gtk4::Widget {
     match id {
         "general" => general::build(ctx),
-        "models" => models::build(ctx),
-        "post_processing" => post_processing::build(ctx),
+        "audio" => audio::build(ctx),
+        "models" | "transcription" | "providers" => models::build(ctx),
+        "post_processing" | "prompts" => providers_llm::build(ctx),
         "history" => history::build(ctx),
-        "advanced" => advanced::build(ctx),
-        "debug" => debug::build(ctx),
-        "about" => about::build(ctx),
+        "advanced" | "debug" | "about" => advanced::build(ctx),
         other => placeholder(other, ""),
     }
 }

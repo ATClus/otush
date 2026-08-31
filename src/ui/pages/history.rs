@@ -3,6 +3,8 @@
 
 use crate::commands::history as history_cmds;
 use crate::context::{AppContext, AppEvent};
+use gdk4::prelude::*;
+use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
 /// Build the History preferences page.
@@ -46,10 +48,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
     // Initial render + live refresh on history events.
     let ctx = ctx.clone();
-    let group = entries_group.clone();
-    refresh_entries(&ctx, &group);
+    refresh_entries(&ctx, &entries_group);
 
-    let group_for_events = glib::SendWeakRef::from(group.downgrade());
+    let group_for_events = glib::SendWeakRef::from(entries_group.downgrade());
     let bus = ctx.bus.clone();
     bus.subscribe(move |event| {
         let ctx = ctx.clone();
@@ -93,18 +94,52 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                         row.set_subtitle(&ts);
                         row.set_expanded(false);
 
-                        let text = if entry.post_processed_text.is_some() {
-                            entry.post_processed_text.clone().unwrap_or_default()
+                        let primary_text = entry
+                            .post_processed_text
+                            .as_deref()
+                            .filter(|s| !s.trim().is_empty())
+                            .unwrap_or(&entry.transcription_text);
+
+                        let has_distinct_post_process = entry
+                            .post_processed_text
+                            .as_deref()
+                            .map(|pp| !pp.trim().is_empty() && pp != entry.transcription_text)
+                            .unwrap_or(false);
+
+                        if has_distinct_post_process {
+                            let pp_text = entry.post_processed_text.as_deref().unwrap_or_default();
+                            let processed_row = libadwaita::ActionRow::new();
+                            processed_row.set_title("Processed Transcript");
+                            processed_row.set_subtitle(&glib::markup_escape_text(pp_text));
+                            processed_row.set_subtitle_lines(0);
+                            processed_row.set_activatable(false);
+                            let copy_pp_btn = create_copy_button(&ctx, pp_text);
+                            processed_row.add_suffix(&copy_pp_btn);
+                            row.add_row(&processed_row);
+
+                            if !entry.transcription_text.trim().is_empty() {
+                                let raw_row = libadwaita::ActionRow::new();
+                                raw_row.set_title("Original Transcript");
+                                raw_row.set_subtitle(&glib::markup_escape_text(
+                                    &entry.transcription_text,
+                                ));
+                                raw_row.set_subtitle_lines(0);
+                                raw_row.set_activatable(false);
+                                let copy_raw_btn =
+                                    create_copy_button(&ctx, &entry.transcription_text);
+                                raw_row.add_suffix(&copy_raw_btn);
+                                row.add_row(&raw_row);
+                            }
                         } else {
-                            entry.transcription_text.clone()
-                        };
-                        let text_row = libadwaita::ActionRow::new();
-                        text_row.set_title("Transcript");
-                        text_row.set_subtitle(&glib::markup_escape_text(
-                            &text.chars().take(160).collect::<String>(),
-                        ));
-                        text_row.set_activatable(false);
-                        row.add_row(&text_row);
+                            let text_row = libadwaita::ActionRow::new();
+                            text_row.set_title("Transcript");
+                            text_row.set_subtitle(&glib::markup_escape_text(primary_text));
+                            text_row.set_subtitle_lines(0);
+                            text_row.set_activatable(false);
+                            let copy_text_btn = create_copy_button(&ctx, primary_text);
+                            text_row.add_suffix(&copy_text_btn);
+                            row.add_row(&text_row);
+                        }
 
                         // Saved toggle.
                         let saved_row = libadwaita::SwitchRow::new();
@@ -121,8 +156,75 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                         });
                         row.add_row(&saved_row);
 
-                        // Retry.
-                        let retry_button = gtk4::Button::with_label("Retry");
+                        // Copy button for the expander row header.
+                        let copy_button = create_copy_button(&ctx, primary_text);
+                        row.add_suffix(&copy_button);
+
+                        // Audio Playback.
+                        let is_playing = history_cmds::is_playing_history_audio(entry.id);
+                        let play_button = if is_playing {
+                            let btn = gtk4::Button::from_icon_name("media-playback-stop-symbolic");
+                            btn.set_tooltip_text(Some("Stop audio playback"));
+                            btn
+                        } else {
+                            let btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
+                            btn.set_tooltip_text(Some("Play recording audio"));
+                            btn
+                        };
+                        play_button.set_valign(gtk4::Align::Center);
+
+                        let audio_path = ctx.history.get_audio_file_path(&entry.file_name);
+                        if !audio_path.exists() {
+                            play_button.set_sensitive(false);
+                            play_button.set_tooltip_text(Some("Audio recording not available"));
+                        } else {
+                            let play_ctx = ctx.clone();
+                            let play_id = entry.id;
+                            let btn_weak = glib::SendWeakRef::from(play_button.downgrade());
+                            play_button.connect_clicked(move |_| {
+                                let ctx = play_ctx.clone();
+                                let id = play_id;
+                                let btn_weak = btn_weak.clone();
+                                crate::runtime::spawn(async move {
+                                    match history_cmds::toggle_play_history_audio(&ctx, id).await {
+                                        Ok(playing) => {
+                                            glib::MainContext::default().invoke(move || {
+                                                if let Some(btn) =
+                                                    btn_weak.into_weak_ref().upgrade()
+                                                {
+                                                    if playing {
+                                                        btn.set_icon_name(
+                                                            "media-playback-stop-symbolic",
+                                                        );
+                                                        btn.set_tooltip_text(Some(
+                                                            "Stop audio playback",
+                                                        ));
+                                                    } else {
+                                                        btn.set_icon_name(
+                                                            "media-playback-start-symbolic",
+                                                        );
+                                                        btn.set_tooltip_text(Some(
+                                                            "Play recording audio",
+                                                        ));
+                                                    }
+                                                }
+                                            });
+                                        }
+                                        Err(e) => {
+                                            log::error!("Failed to play history audio: {}", e);
+                                        }
+                                    }
+                                });
+                            });
+                        }
+                        play_button.add_css_class("flat");
+                        row.add_suffix(&play_button);
+
+                        // Retry
+                        let retry_button = gtk4::Button::from_icon_name("view-refresh-symbolic");
+                        retry_button.set_tooltip_text(Some("Retry transcription"));
+                        retry_button.set_valign(gtk4::Align::Center);
+                        retry_button.add_css_class("flat");
                         let retry_ctx = ctx.clone();
                         let retry_id = entry.id;
                         retry_button.connect_clicked(move |_| {
@@ -135,9 +237,11 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                         });
                         row.add_suffix(&retry_button);
 
-                        // Delete.
-                        let delete_button = gtk4::Button::with_label("Delete");
-                        delete_button.add_css_class("destructive-action");
+                        // Delete
+                        let delete_button = gtk4::Button::from_icon_name("user-trash-symbolic");
+                        delete_button.set_tooltip_text(Some("Delete recording"));
+                        delete_button.set_valign(gtk4::Align::Center);
+                        delete_button.add_css_class("flat");
                         let delete_ctx = ctx.clone();
                         let delete_id = entry.id;
                         delete_button.connect_clicked(move |_| {
@@ -163,4 +267,39 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
             }
         });
     });
+}
+
+fn create_copy_button(ctx: &AppContext, text: &str) -> gtk4::Button {
+    let btn = gtk4::Button::from_icon_name("edit-copy-symbolic");
+    btn.set_tooltip_text(Some("Copy transcript"));
+    btn.set_valign(gtk4::Align::Center);
+    btn.add_css_class("flat");
+
+    if text.trim().is_empty() {
+        btn.set_sensitive(false);
+        btn.set_tooltip_text(Some("Transcript is empty"));
+        return btn;
+    }
+
+    let ctx = ctx.clone();
+    let text = text.to_string();
+    let btn_weak = glib::SendWeakRef::from(btn.downgrade());
+    btn.connect_clicked(move |_| {
+        let _ = crate::clipboard::write_clipboard_text(&ctx, &text);
+        if let Some(display) = gdk4::Display::default() {
+            display.clipboard().set_text(&text);
+        }
+        if let Some(btn) = btn_weak.clone().into_weak_ref().upgrade() {
+            btn.set_icon_name("object-select-symbolic");
+            btn.set_tooltip_text(Some("Copied!"));
+            let btn_reset = glib::SendWeakRef::from(btn.downgrade());
+            glib::timeout_add_local_once(std::time::Duration::from_millis(1500), move || {
+                if let Some(btn) = btn_reset.into_weak_ref().upgrade() {
+                    btn.set_icon_name("edit-copy-symbolic");
+                    btn.set_tooltip_text(Some("Copy transcript"));
+                }
+            });
+        }
+    });
+    btn
 }

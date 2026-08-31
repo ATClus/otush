@@ -16,12 +16,16 @@ const SECTIONS: &[Section] = &[
         title: "General",
     },
     Section {
+        id: "audio",
+        title: "Audio",
+    },
+    Section {
         id: "models",
-        title: "Models",
+        title: "Speech-to-Text",
     },
     Section {
         id: "post_processing",
-        title: "Post-Processing",
+        title: "AI &amp; Prompts",
     },
     Section {
         id: "history",
@@ -29,15 +33,7 @@ const SECTIONS: &[Section] = &[
     },
     Section {
         id: "advanced",
-        title: "Advanced",
-    },
-    Section {
-        id: "debug",
-        title: "Debug",
-    },
-    Section {
-        id: "about",
-        title: "About",
+        title: "Advanced &amp; System",
     },
 ];
 
@@ -50,7 +46,8 @@ pub fn build_main_window(
 ) -> (libadwaita::ApplicationWindow, libadwaita::ToastOverlay) {
     let window = libadwaita::ApplicationWindow::new(app);
     window.set_title(Some("Otush"));
-    window.set_default_size(880, 620);
+    window.set_default_size(740, 520);
+    window.set_size_request(500, 360);
 
     // Toast overlay wraps everything.
     let toast_overlay = libadwaita::ToastOverlay::new();

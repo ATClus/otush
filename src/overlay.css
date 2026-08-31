@@ -1,0 +1,41 @@
+/* Otush recording overlay — fullscreen transparent surface (Whisper Flow
+ * inspired). The pill card, record button and waveform are painted with Cairo
+ * (see overlay.rs). This stylesheet makes the window background genuinely
+ * transparent (so the desktop shows through everywhere except the pill) and
+ * styles the two text labels. Every rule is scoped to the `.otush-overlay-*`
+ * classes so the app-wide provider never affects the rest of the UI.
+ *
+ * Both `background-color: transparent` and `background-image: none` are set so
+ * the (possibly dark / gradient) Adwaita or libadwaita theme cannot paint an
+ * opaque backdrop over the window; `gdk_surface_set_opaque_region` (empty) in
+ * overlay.rs then forces the compositor to use the alpha channel.
+ */
+
+window.otush-overlay-window,
+window.background.otush-overlay-window,
+window.otush-overlay-window.background,
+.otush-overlay-window,
+.otush-overlay-window.background {
+  background-color: transparent;
+  background-image: none;
+  box-shadow: none;
+  border-width: 0;
+  border-style: none;
+  border-radius: 0;
+  padding: 0;
+  margin: 0;
+}
+
+.otush-overlay-state {
+  font-weight: 600;
+  font-size: 12px;
+  letter-spacing: 0.2px;
+  color: rgba(255, 255, 255, 0.96);
+}
+
+.otush-overlay-text {
+  font-size: 13px;
+  font-weight: 450;
+  line-height: 1.45;
+  color: rgba(255, 255, 255, 0.92);
+}
