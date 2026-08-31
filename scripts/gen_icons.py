@@ -1,231 +1,402 @@
 #!/usr/bin/env python3
-"""Generate the Otush icon set (app icon + tray icons).
+"""Otush Icon Generator - GNOME 46+ Standard (Libadwaita).
 
-Brand colors (GNOME-style blue -> violet):
-  top    #6FA8FF
-  bottom #8B5CF6
-
-Outputs (written to resources/):
-  otush.png                512x512 app icon
-  otush-128.png            128x128 app icon (hicolor install)
-  otush-icon.svg           scalable app icon (hicolor)
-  tray_idle.png            mic outline, light gray  (dark panels)
-  tray_idle_dark.png       mic outline, dark gray   (light panels)
-  tray_recording.png       filled mic + red dot     (dark panels)
-  tray_recording_dark.png  filled mic + red dot     (light panels)
-  tray_transcribing.png    mic + waveform bars      (dark panels)
-  tray_transcribing_dark.png mic + waveform bars    (light panels)
-  tray_idle_warning.png    mic outline + warning    (dark panels)
-  tray_idle_warning_dark.png mic outline + warning  (light panels)
-  recording.png            colored filled mic + dot (brand)
-  transcribing.png         colored mic + bars       (brand)
-
-Run from the repository root: python3 scripts/gen_icons.py
+Composition:
+  1. Base: Adwaita squircle with lower 3D bevel and top edge highlight.
+  2. Backdrop: Integrated translucent audio soundwaves spectrum.
+  3. Contact Shadow: Soft ambient occlusion to elevate the studio mic from the background.
+  4. Foreground: Sharp and solid studio microphone.
 """
 
 import os
+import math
 from PIL import Image, ImageDraw, ImageFilter
 
-SS = 4  # supersampling factor for smooth edges
-OUT = os.path.join(os.path.dirname(__file__), "..", "resources")
+SS = 4  # 4x Supersampling for high-precision anti-aliasing
 
-TOP = (111, 168, 255)     # #6FA8FF
-BOTTOM = (139, 92, 246)   # #8B5CF6
-WHITE = (255, 255, 255, 255)
-LIGHT_GRAY = (230, 230, 230, 255)   # for dark panels
-DARK_GRAY = (74, 74, 74, 255)       # for light panels
-RED = (255, 62, 84, 255)            # recording dot
-AMBER = (255, 176, 32, 255)         # warning
+# Detect output directory
+SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
+if os.path.basename(SCRIPT_DIR) == "scripts":
+    OUT_DIR = os.path.join(SCRIPT_DIR, "..", "resources")
+else:
+    OUT_DIR = os.path.join(SCRIPT_DIR, "resources")
+
+# ==============================================================================
+# GNOME 46+ Palette (Libadwaita)
+# ==============================================================================
+# Base Theme (Adwaita Blue -> Violet)
+BLUE_TOP    = (98, 160, 234)   # #62A0EA
+BLUE_MID    = (53, 132, 228)   # #3584E4
+BLUE_BOT    = (28, 113, 216)   # #1C71D8
+VIOLET_DEEP = (98, 68, 197)    # #6244C5
+BLUE_BEVEL  = (16, 68, 135)    # Base bevel shadow
+
+# Active Recording Theme (Vibrant GNOME Red matching the recording pulse)
+RED_TOP     = (255, 75, 85)    # #FF4B55 - bright scarlet red
+RED_MID     = (240, 32, 50)    # #F02032 - pure recording red
+RED_BOT     = (205, 18, 38)    # #CD1226 - deep crimson
+RED_BEVEL   = (135, 14, 26)
+
+# Element Colors
+WHITE            = (255, 255, 255, 255)
+WAVE_TINT_NORMAL = (255, 255, 255, 48)  # Subtle translucent waves (20% opacity)
+WAVE_TINT_REC    = (255, 255, 255, 65)  # Crisp recording waves
+DARK_PANEL_TRAY  = (255, 255, 255, 240) # Crisp white (94%) for dark GNOME Shell panel
+LIGHT_PANEL_TRAY = (40, 40, 45, 240)    # Dark gray for light panels
+ACCENT_AMBER     = (246, 211, 45, 255)  # Warning / Attention
 
 
 def canvas(size):
-    """Supersampled transparent canvas."""
+    """Creates a transparent RGBA canvas with supersampling."""
     return Image.new("RGBA", (size * SS, size * SS), (0, 0, 0, 0))
 
 
-def downscale(img, size):
+def downsample(img, size):
+    """Resizes with Lanczos filter ensuring smooth edges."""
     return img.resize((size, size), Image.LANCZOS)
 
 
-def draw_mic(d, cx, top, w, h, radius, color, filled, width=2.4, ss=SS):
-    """Draw a microphone glyph in a 64-unit logical space (supersampled)."""
-    x0, y0 = (cx - w / 2) * ss, top * ss
-    x1, y1 = (cx + w / 2) * ss, (top + h) * ss
-    r = radius * ss
-    if filled:
-        d.rounded_rectangle([x0, y0, x1, y1], radius=r, fill=color)
-    else:
-        d.rounded_rectangle([x0, y0, x1, y1], radius=r, outline=color, width=round(width * ss))
-    # Stand: semicircle below the body
-    arc_cx = cx * ss
-    arc_top = (top + h) * ss
-    arc_r = (w / 2 + 1.5) * ss
-    d.arc(
-        [arc_cx - arc_r, arc_top - arc_r, arc_cx + arc_r, arc_top + arc_r],
-        start=180, end=360, fill=color, width=round(width * ss),
-    )
-    # Stem + base
-    stem_top = arc_top + arc_r
-    d.line(
-        [arc_cx, stem_top, arc_cx, stem_top + 5 * ss],
-        fill=color, width=round(width * ss),
-    )
-    d.line(
-        [arc_cx - 5.5 * ss, stem_top + 7 * ss, arc_cx + 5.5 * ss, stem_top + 7 * ss],
-        fill=color, width=round(width * ss),
-    )
-
-
-def draw_bars(d, cx, bottom, heights, color, width=3.0, gap=4.5, ss=SS):
-    """Draw waveform bars to the right of the mic."""
-    x = cx
-    for hgt in heights:
-        top = bottom - hgt
-        d.rounded_rectangle(
-            [x * ss, top * ss, (x + width) * ss, bottom * ss],
-            radius=1.5 * ss, fill=color,
-        )
-        x += width + gap
-
-
-def draw_warning_triangle(d, cx, top, size, color, ss=SS):
-    """Small exclamation triangle (warning badge)."""
-    half = size / 2
-    pts = [
-        (cx * ss, top * ss),
-        ((cx - half) * ss, (top + size) * ss),
-        ((cx + half) * ss, (top + size) * ss),
-    ]
-    d.polygon(pts, fill=color)
-    # Exclamation dot
-    ex_cx = cx * ss
-    ex_top = (top + size * 0.52) * ss
-    d.ellipse([ex_cx - 1.1 * ss, ex_top, ex_cx + 1.1 * ss, ex_top + 2.2 * ss], fill=(255, 255, 255, 255))
-    d.ellipse(
-        [ex_cx - 1.1 * ss, (top + size * 0.78) * ss, ex_cx + 1.1 * ss, (top + size * 0.78 + 2.2) * ss],
-        fill=(255, 255, 255, 255),
-    )
-
-
-def tray_icon(mic_color, filled=False, bars=None, warning=False, dot=False):
-    img = canvas(64)
-    d = ImageDraw.Draw(img)
-    draw_mic(d, 30, 14, 17, 26, 8.5, mic_color, filled)
-    if bars:
-        draw_bars(d, 45, 44, bars, mic_color)
-    if warning:
-        draw_warning_triangle(d, 49, 10, 12, AMBER)
-    if dot:
-        d.ellipse([46 * SS, 46 * SS, 56 * SS, 56 * SS], fill=RED)
-    return downscale(img, 64)
-
-
-def gradient_rect(size, radius, top=TOP, bottom=BOTTOM, margin=None):
-    """Rounded-rect with a vertical blue->violet gradient (supersampled)."""
-    if margin is None:
-        margin = size * 0.055  # transparent padding around the shape
+# ==============================================================================
+# Layer 1: Adwaita Base (Squircle + Bevel + Top Highlight Glow)
+# ==============================================================================
+def render_adwaita_surface(size, top_c, mid_c, bot_c, bevel_c, has_bevel=True):
     img = canvas(size)
+    margin = size * 0.07 * SS
+    box_w = (size * SS) - (2 * margin)
+    box_h = box_w
+    radius = box_w * 0.225
+    bevel_h = (3.0 * SS) if has_bevel else 0.0
+
+    if has_bevel:
+        # 1. Lower Depth Bevel
+        d = ImageDraw.Draw(img)
+        d.rounded_rectangle(
+            [margin, margin + bevel_h, margin + box_w, margin + box_h + bevel_h],
+            radius=radius, fill=bevel_c + (255,)
+        )
+
+    # 2. Vertical Plate Gradient
     grad = Image.new("RGBA", (size * SS, size * SS))
     gd = ImageDraw.Draw(grad)
-    for y in range(size * SS):
-        t = y / (size * SS - 1)
-        c = tuple(int(top[i] + (bottom[i] - top[i]) * t) for i in range(3)) + (255,)
-        gd.line([(0, y), (size * SS, y)], fill=c)
-    m = margin * SS
+    for y in range(int(margin), int(margin + box_h)):
+        t = (y - margin) / float(box_h)
+        if t < 0.5:
+            f = t / 0.5
+            col = tuple(int(top_c[i] + (mid_c[i] - top_c[i]) * f) for i in range(3))
+        else:
+            f = (t - 0.5) / 0.5
+            col = tuple(int(mid_c[i] + (bot_c[i] - mid_c[i]) * f) for i in range(3))
+        gd.line([(margin, y), (margin + box_w, y)], fill=col + (255,))
+
     mask = Image.new("L", (size * SS, size * SS), 0)
     md = ImageDraw.Draw(mask)
-    md.rounded_rectangle([m, m, size * SS - 1 - m, size * SS - 1 - m], radius=radius * SS, fill=255)
+    md.rounded_rectangle([margin, margin, margin + box_w, margin + box_h], radius=radius, fill=255)
     img.paste(grad, (0, 0), mask)
-    # Soft top highlight
-    hl = Image.new("RGBA", (size * SS, size * SS), (0, 0, 0, 0))
-    hd = ImageDraw.Draw(hl)
-    for y in range(int(size * SS * 0.45)):
-        a = int(30 * (1 - y / (size * SS * 0.45)))
-        hd.line([(0, y), (size * SS, y)], fill=(255, 255, 255, a))
-    hl = hl.filter(ImageFilter.GaussianBlur(radius=size * SS * 0.03))
-    img.alpha_composite(hl)
-    # Clip back to the rounded rect
-    final = Image.new("RGBA", (size * SS, size * SS), (0, 0, 0, 0))
-    final.paste(img, (0, 0), mask)
-    return downscale(final, size)
+
+    # 3. Inner Top Glow (1.5px top highlight)
+    glow = Image.new("RGBA", (size * SS, size * SS), (0, 0, 0, 0))
+    g_draw = ImageDraw.Draw(glow)
+    g_draw.rounded_rectangle(
+        [margin + SS, margin + SS, margin + box_w - SS, margin + box_h - SS],
+        radius=radius - SS, outline=(255, 255, 255, 55), width=max(1, round(1.2 * SS))
+    )
+    img.alpha_composite(glow)
+
+    return img
 
 
-def gradient_mic(size=64, bars=None, dot=False):
-    """Colored tray icon: mic filled with the brand gradient."""
-    img = canvas(64)
-    grad = Image.new("RGBA", (64 * SS, 64 * SS))
-    gd = ImageDraw.Draw(grad)
-    for y in range(64 * SS):
-        t = y / (64 * SS - 1)
-        c = tuple(int(TOP[i] + (BOTTOM[i] - TOP[i]) * t) for i in range(3)) + (255,)
-        gd.line([(0, y), (64 * SS, y)], fill=c)
-    mask = Image.new("L", (64 * SS, 64 * SS), 0)
+# ==============================================================================
+# Layer 2: Background Soundwaves Spectrum
+# ==============================================================================
+def draw_backdrop_soundwaves(img, size, color=WAVE_TINT_NORMAL, ss=SS):
+    """Renders stylized equalizer bars in the background."""
+    wave_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    wd = ImageDraw.Draw(wave_layer)
+
+    cx = (size / 2.0) * ss
+    cy = (size / 2.0) * ss
+    box_w = ((size * ss) - (2 * (size * 0.07 * ss)))
+    bar_w = 4.5 * ss
+    gap = 4.5 * ss
+
+    height_factors = [0.22, 0.40, 0.65, 0.88, 0.52, 0.95, 0.52, 0.88, 0.65, 0.40, 0.22]
+    num_bars = len(height_factors)
+    total_w = (num_bars * bar_w) + ((num_bars - 1) * gap)
+    start_x = cx - (total_w / 2.0)
+
+    for i, factor in enumerate(height_factors):
+        x0 = start_x + (i * (bar_w + gap))
+        x1 = x0 + bar_w
+        bar_h = (box_w * 0.58) * factor
+        y0 = cy - (bar_h / 2.0)
+        y1 = cy + (bar_h / 2.0)
+        wd.rounded_rectangle([x0, y0, x1, y1], radius=bar_w / 2.0, fill=color)
+
+    margin = size * 0.07 * ss
+    mask = Image.new("L", img.size, 0)
     md = ImageDraw.Draw(mask)
-    draw_mic(md, 30, 14, 17, 26, 8.5, 255, filled=True)
-    if bars:
-        draw_bars(md, 45, 44, bars, 255)
-    img.paste(grad, (0, 0), mask)
-    if dot:
-        d = ImageDraw.Draw(img)
-        d.ellipse([46 * SS, 46 * SS, 56 * SS, 56 * SS], fill=RED)
-    return downscale(img, 64)
+    md.rounded_rectangle([margin, margin, margin + box_w, margin + box_w], radius=box_w * 0.225, fill=255)
+
+    img.paste(wave_layer, (0, 0), mask)
 
 
-def app_icon(size):
-    img = gradient_rect(size, radius=size * 0.225)
-    ss = SS * (size / 512.0) if size != 512 else SS
-    # Redraw mic at full res directly onto the icon canvas for crispness
-    big = Image.new("RGBA", (size * SS, size * SS), (0, 0, 0, 0))
-    d = ImageDraw.Draw(big)
-    scale = size / 512.0
-    # Mic geometry in 512-space, scaled
-    cx = 256 * scale * SS
-    top = 118 * scale * SS
-    w = 124 * scale * SS
-    h = 206 * scale * SS
-    r = 62 * scale * SS
-    lw = 26 * scale * SS
-    d.rounded_rectangle([cx - w / 2, top, cx + w / 2, top + h], radius=r, fill=WHITE)
-    arc_r = (w / 2 + 14) * scale * SS
-    arc_top = (top + h) * SS
-    d.arc(
-        [cx - arc_r, arc_top - arc_r, cx + arc_r, arc_top + arc_r],
-        start=180, end=360, fill=WHITE, width=round(lw),
-    )
-    stem_top = arc_top + arc_r
-    d.line([cx, stem_top, cx, stem_top + 30 * scale * SS], fill=WHITE, width=round(lw))
-    d.line(
-        [cx - 42 * scale * SS, stem_top + 40 * scale * SS, cx + 42 * scale * SS, stem_top + 40 * scale * SS],
-        fill=WHITE, width=round(lw),
-    )
-    img = img.resize((size * SS, size * SS), Image.LANCZOS)
-    img.alpha_composite(big)
-    return downscale(img, size)
+# ==============================================================================
+# Layers 3 and 4: Studio Microphone with Soft Shadow
+# ==============================================================================
+def draw_studio_mic_geometry(d, cx, cy, h, color=WHITE, is_shadow=False):
+    """Draws exact studio microphone geometry."""
+    cap_w = h * 0.38
+    cap_h = h * 0.58
+    arc_w = h * 0.58
+    arc_h = h * 0.46
+    stroke = h * 0.088
+    stem_h = h * 0.12
+    base_w = h * 0.40
+
+    total_h = cap_h + (arc_h * 0.4) + stem_h + stroke
+    top_y = cy - (total_h * 0.46)
+
+    # 1. Main Capsule
+    cap_x0 = cx - (cap_w / 2.0)
+    cap_x1 = cap_x0 + cap_w
+    cap_y0 = top_y
+    cap_y1 = cap_y0 + cap_h
+    d.rounded_rectangle([cap_x0, cap_y0, cap_x1, cap_y1], radius=cap_w / 2.0, fill=color)
+
+    if not is_shadow:
+        # Subtle internal microphone grill line
+        grill_y = cap_y0 + (cap_h * 0.42)
+        d.line([cap_x0 + stroke * 0.3, grill_y, cap_x1 - stroke * 0.3, grill_y], fill=(0, 0, 0, 35), width=max(1, round(stroke * 0.25)))
+
+    # 2. U-Arc Holder
+    arc_top = cap_y1 - (arc_h * 0.65)
+    arc_box = [cx - (arc_w / 2.0), arc_top, cx + (arc_w / 2.0), arc_top + arc_h]
+    d.arc(arc_box, start=10, end=170, fill=color, width=round(stroke))
+
+    # 3. Vertical Stem
+    stem_top = arc_top + arc_h - (stroke * 0.4)
+    stem_bot = stem_top + stem_h
+    d.rounded_rectangle([cx - (stroke / 2.0), stem_top, cx + (stroke / 2.0), stem_bot], radius=stroke / 2.0, fill=color)
+
+    # 4. Stabilizing Base
+    base_y0 = stem_bot
+    base_y1 = base_y0 + stroke
+    d.rounded_rectangle([cx - (base_w / 2.0), base_y0, cx + (base_w / 2.0), base_y1], radius=stroke / 2.0, fill=color)
 
 
+def draw_studio_microphone_with_shadow(img, size, color=WHITE, ss=SS):
+    """Renders diffuse contact shadow and composites the solid microphone."""
+    cx = (size / 2.0) * ss
+    cy = (size / 2.0) * ss
+    h = size * 0.46 * ss
+
+    # 1. Soft Shadow Layer (Ambient Occlusion)
+    shadow_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    s_draw = ImageDraw.Draw(shadow_layer)
+    shadow_offset_y = 3.0 * ss
+    draw_studio_mic_geometry(s_draw, cx, cy + shadow_offset_y, h, color=(0, 0, 0, 90), is_shadow=True)
+    shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=3.5 * ss))
+    img.alpha_composite(shadow_layer)
+
+    # 2. Foreground Solid Microphone Layer
+    mic_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    m_draw = ImageDraw.Draw(mic_layer)
+    draw_studio_mic_geometry(m_draw, cx, cy, h, color=color, is_shadow=False)
+    img.alpha_composite(mic_layer)
+
+
+# ==============================================================================
+# GNOME 46+ Tray Icons (Full Optical Proportion 16px/24px)
+# ==============================================================================
+def draw_warning_badge(d, cx, cy, size, color=ACCENT_AMBER, ss=SS):
+    cx = cx * ss
+    cy = cy * ss
+    s = size * ss
+    half = s / 2.0
+    pts = [(cx, cy - half), (cx - half * 1.15, cy + half), (cx + half * 1.15, cy + half)]
+    d.polygon(pts, fill=color)
+    bar_w = s * 0.14
+    d.line([(cx, cy - half * 0.2), (cx, cy + half * 0.3)], fill=(0, 0, 0, 220), width=round(bar_w))
+    d.ellipse([cx - bar_w / 2.0, cy + half * 0.55, cx + bar_w / 2.0, cy + half * 0.55 + bar_w], fill=(0, 0, 0, 220))
+
+
+def make_app_icon(size, is_recording=False, has_bevel=True):
+    """Generates the full primary application icon with all layers integrated."""
+    if is_recording:
+        base = render_adwaita_surface(size, RED_TOP, RED_MID, RED_BOT, RED_BEVEL, has_bevel=has_bevel)
+        draw_backdrop_soundwaves(base, size, color=WAVE_TINT_REC, ss=SS)
+    else:
+        base = render_adwaita_surface(size, BLUE_TOP, BLUE_MID, VIOLET_DEEP, BLUE_BEVEL, has_bevel=has_bevel)
+        draw_backdrop_soundwaves(base, size, color=WAVE_TINT_NORMAL, ss=SS)
+
+    draw_studio_microphone_with_shadow(base, size, color=WHITE, ss=SS)
+    return downsample(base, size)
+
+
+def make_tray_symbolic(color, transcribing=False, recording=False, warning=False):
+    """Generates high-definition symbolic icon filling the standard GNOME 46+ icon height."""
+    img = canvas(64)
+    d = ImageDraw.Draw(img)
+    ss = SS
+    cx = 32.0 * ss
+
+    # GNOME 46+ microphone geometry (~84% optical height fill)
+    cap_w = 20.0 * ss
+    cap_h = 32.0 * ss
+    cap_y0 = 6.0 * ss
+    cap_y1 = cap_y0 + cap_h
+
+    arc_w = 38.0 * ss
+    arc_h = 28.0 * ss
+    arc_top = 18.0 * ss
+    stroke = 6.5 * ss
+
+    stem_top = arc_top + arc_h - (stroke * 0.3)
+    stem_h = 8.5 * ss
+    stem_bot = stem_top + stem_h
+
+    base_w = 30.0 * ss
+    base_h = 6.0 * ss
+    base_y0 = stem_bot
+    base_y1 = base_y0 + base_h
+
+    if transcribing:
+        # Animated lateral equalizer waves
+        wave_heights = [12.0 * ss, 22.0 * ss, 14.0 * ss]
+        bar_w = 4.0 * ss
+        for i, h in enumerate(wave_heights):
+            x_l = (8.0 + i * 5.0) * ss
+            x_r = (56.0 - (i + 1) * 5.0) * ss
+            y0 = (24.0 * ss) - (h / 2.0)
+            y1 = y0 + h
+            d.rounded_rectangle([x_l, y0, x_l + bar_w, y1], radius=bar_w / 2.0, fill=color[:3] + (160,))
+            d.rounded_rectangle([x_r, y0, x_r + bar_w, y1], radius=bar_w / 2.0, fill=color[:3] + (160,))
+
+    # 1. Central microphone capsule
+    d.rounded_rectangle([cx - cap_w / 2.0, cap_y0, cx + cap_w / 2.0, cap_y1], radius=cap_w / 2.0, fill=color)
+
+    # 2. U-Arc support
+    arc_box = [cx - arc_w / 2.0, arc_top, cx + arc_w / 2.0, arc_top + arc_h]
+    d.arc(arc_box, start=0, end=180, fill=color, width=round(stroke))
+
+    # 3. Vertical stem
+    d.rounded_rectangle([cx - stroke / 2.0, stem_top, cx + stroke / 2.0, stem_bot], radius=stroke / 2.0, fill=color)
+
+    # 4. Lower base
+    d.rounded_rectangle([cx - base_w / 2.0, base_y0, cx + base_w / 2.0, base_y1], radius=base_h / 2.0, fill=color)
+
+    if recording:
+        # Pulsing bright red recording dot on top-right
+        dot_r = 8.5 * ss
+        dot_cx = 49.0 * ss
+        dot_cy = 13.0 * ss
+        d.ellipse([dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r], fill=RED_TOP + (255,))
+        # Subtle contrast outline around the red dot
+        d.ellipse([dot_cx - dot_r, dot_cy - dot_r, dot_cx + dot_r, dot_cy + dot_r], outline=(255, 255, 255, 200), width=round(1.5 * ss))
+
+    if warning:
+        draw_warning_badge(d, 48, 16, 22, color=ACCENT_AMBER, ss=SS)
+
+    return downsample(img, 64)
+
+
+def write_scalable_svg(path):
+    """Generates layered SVG file with backdrop soundwaves and studio microphone."""
+    svg = """<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
+  <defs>
+    <!-- Adwaita Surface Gradient -->
+    <linearGradient id="adwaita_bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#62a0ea"/>
+      <stop offset="45%" stop-color="#3584e4"/>
+      <stop offset="100%" stop-color="#6244c5"/>
+    </linearGradient>
+
+    <!-- Lower 3D Bevel -->
+    <linearGradient id="bevel_bg" x1="0%" y1="0%" x2="0%" y2="100%">
+      <stop offset="0%" stop-color="#1c71d8"/>
+      <stop offset="100%" stop-color="#104487"/>
+    </linearGradient>
+
+    <!-- Microphone Soft Shadow -->
+    <filter id="mic_shadow" x="-20%" y="-20%" width="140%" height="140%">
+      <feDropShadow dx="0" dy="6" stdDeviation="8" flood-color="#000000" flood-opacity="0.30"/>
+    </filter>
+
+    <!-- Base Shadow -->
+    <filter id="plate_shadow" x="-10%" y="-10%" width="120%" height="120%">
+      <feDropShadow dx="0" dy="12" stdDeviation="14" flood-color="#050a14" flood-opacity="0.30"/>
+    </filter>
+  </defs>
+
+  <!-- 1. Adwaita Squircle Base -->
+  <rect x="36" y="48" width="440" height="440" rx="99" fill="url(#bevel_bg)" filter="url(#plate_shadow)"/>
+  <rect x="36" y="36" width="440" height="440" rx="99" fill="url(#adwaita_bg)"/>
+  <rect x="38" y="38" width="436" height="436" rx="97" fill="none" stroke="#ffffff" stroke-width="2" opacity="0.25"/>
+
+  <!-- 2. Background Soundwaves Spectrum -->
+  <g fill="#ffffff" opacity="0.20">
+    <rect x="74"  y="227" width="18" height="58"  rx="9"/>
+    <rect x="110" y="203" width="18" height="106" rx="9"/>
+    <rect x="146" y="170" width="18" height="172" rx="9"/>
+    <rect x="182" y="139" width="18" height="234" rx="9"/>
+    <rect x="218" y="187" width="18" height="138" rx="9"/>
+    <rect x="254" y="130" width="18" height="252" rx="9"/>
+    <rect x="290" y="187" width="18" height="138" rx="9"/>
+    <rect x="326" y="139" width="18" height="234" rx="9"/>
+    <rect x="362" y="170" width="18" height="172" rx="9"/>
+    <rect x="398" y="203" width="18" height="106" rx="9"/>
+    <rect x="434" y="227" width="18" height="58"  rx="9"/>
+  </g>
+
+  <!-- 3. Foreground Studio Microphone (with Shadow) -->
+  <g filter="url(#mic_shadow)" fill="#ffffff" stroke="#ffffff" stroke-linecap="round" stroke-linejoin="round">
+    <!-- Central Capsule -->
+    <rect x="212" y="142" width="88" height="134" rx="44" stroke-width="0"/>
+    <!-- Grill Detail -->
+    <line x1="220" y1="198" x2="292" y2="198" stroke="#000000" stroke-width="2.5" opacity="0.2"/>
+
+    <!-- U-Arc Holder -->
+    <path d="M 190 232 A 66 66 0 0 0 322 232" fill="none" stroke-width="20"/>
+
+    <!-- Stem and Base -->
+    <line x1="256" y1="298" x2="256" y2="326" stroke-width="20"/>
+    <line x1="210" y1="336" x2="302" y2="336" stroke-width="20"/>
+  </g>
+</svg>
+"""
+    with open(path, "w", encoding="utf-8") as f:
+        f.write(svg)
+
+
+# ==============================================================================
+# Execution
+# ==============================================================================
 def main():
-    os.makedirs(OUT, exist_ok=True)
+    os.makedirs(OUT_DIR, exist_ok=True)
 
-    app_icon(512).save(os.path.join(OUT, "otush.png"))
-    app_icon(128).save(os.path.join(OUT, "otush-128.png"))
+    # 1. Main App Icons
+    make_app_icon(512).save(os.path.join(OUT_DIR, "otush.png"))
+    make_app_icon(128).save(os.path.join(OUT_DIR, "otush-128.png"))
+    write_scalable_svg(os.path.join(OUT_DIR, "otush-icon.svg"))
 
-    # Tray: dark-panel variants (light glyphs)
-    tray_icon(LIGHT_GRAY, filled=False).save(os.path.join(OUT, "tray_idle.png"))
-    tray_icon(LIGHT_GRAY, filled=True, dot=True).save(os.path.join(OUT, "tray_recording.png"))
-    tray_icon(LIGHT_GRAY, filled=False, bars=[9, 15, 11]).save(os.path.join(OUT, "tray_transcribing.png"))
-    tray_icon(LIGHT_GRAY, filled=False, warning=True).save(os.path.join(OUT, "tray_idle_warning.png"))
+    # 2. Symbolic Tray Icons (Dark Panel)
+    make_tray_symbolic(DARK_PANEL_TRAY).save(os.path.join(OUT_DIR, "tray_idle.png"))
+    make_tray_symbolic(DARK_PANEL_TRAY, recording=True).save(os.path.join(OUT_DIR, "tray_recording.png"))
+    make_tray_symbolic(DARK_PANEL_TRAY, transcribing=True).save(os.path.join(OUT_DIR, "tray_transcribing.png"))
+    make_tray_symbolic(DARK_PANEL_TRAY, warning=True).save(os.path.join(OUT_DIR, "tray_idle_warning.png"))
 
-    # Tray: light-panel variants (dark glyphs)
-    tray_icon(DARK_GRAY, filled=False).save(os.path.join(OUT, "tray_idle_dark.png"))
-    tray_icon(DARK_GRAY, filled=True, dot=True).save(os.path.join(OUT, "tray_recording_dark.png"))
-    tray_icon(DARK_GRAY, filled=False, bars=[9, 15, 11]).save(os.path.join(OUT, "tray_transcribing_dark.png"))
-    tray_icon(DARK_GRAY, filled=False, warning=True).save(os.path.join(OUT, "tray_idle_warning_dark.png"))
+    # 3. Symbolic Tray Icons (Light Panel)
+    make_tray_symbolic(LIGHT_PANEL_TRAY).save(os.path.join(OUT_DIR, "tray_idle_dark.png"))
+    make_tray_symbolic(LIGHT_PANEL_TRAY, recording=True).save(os.path.join(OUT_DIR, "tray_recording_dark.png"))
+    make_tray_symbolic(LIGHT_PANEL_TRAY, transcribing=True).save(os.path.join(OUT_DIR, "tray_transcribing_dark.png"))
+    make_tray_symbolic(LIGHT_PANEL_TRAY, warning=True).save(os.path.join(OUT_DIR, "tray_idle_warning_dark.png"))
 
-    # Tray: colored (Linux) variants
-    gradient_mic(bars=None, dot=True).save(os.path.join(OUT, "recording.png"))
-    gradient_mic(bars=[9, 15, 11]).save(os.path.join(OUT, "transcribing.png"))
+    # 4. Colored Status Badges (Overlay / UI) - without lower bevel for symmetric shape
+    make_app_icon(64, is_recording=True, has_bevel=False).save(os.path.join(OUT_DIR, "recording.png"))
+    make_app_icon(64, is_recording=False, has_bevel=False).save(os.path.join(OUT_DIR, "transcribing.png"))
 
-    print("icons written to", os.path.abspath(OUT))
+    print(f"✓ Otush resources generated successfully in: {os.path.abspath(OUT_DIR)}")
 
 
 if __name__ == "__main__":

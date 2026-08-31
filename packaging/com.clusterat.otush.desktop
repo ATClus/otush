@@ -3,9 +3,13 @@ Type=Application
 Name=Otush
 GenericName=Speech to Text
 Comment=A free, open source, offline speech-to-text application
-Exec=otush
+Exec=/usr/bin/otush
+Path=/usr/bin
 Icon=com.clusterat.otush
 Terminal=false
 Categories=Utility;AudioVideo;Accessibility;
 Keywords=speech;text;transcription;dictation;whisper;voice;
 StartupNotify=true
+StartupWMClass=com.clusterat.otush
+X-GNOME-UsesNotifications=true
+

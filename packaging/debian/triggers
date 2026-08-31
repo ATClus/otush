@@ -1,0 +1,4 @@
+# System triggers for cache updates on install/upgrade/removal
+activate-noawait update-desktop-database
+activate-noawait gtk-update-icon-cache
+activate-noawait update-mime-database

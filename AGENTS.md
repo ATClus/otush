@@ -8,7 +8,7 @@ This file provides guidance to AI coding assistants working with code in this re
 
 - [Rust](https://rustup.rs/) (latest stable)
 - Ubuntu 24.04+ native libraries (see [BUILD.md](BUILD.md)):
-  `libgtk-4-dev libadwaita-1-dev libgtk-4-layer-shell-dev libasound2-dev libssl-dev libvulkan-dev libopenblas-dev`
+  `libgtk-4-dev libadwaita-1-dev libasound2-dev libssl-dev libvulkan-dev libopenblas-dev`
 
 **Core Development:**
 
@@ -52,7 +52,7 @@ Otush is a **native GNOME application** (GTK4 + libadwaita on Wayland) with a Ru
 - `context.rs` — the host abstraction: `AppContext` (paths + managers + `EventBus`), `AppPaths` (portable-aware dirs), `EventBus` (backend → UI fan-out) and `AppEvent` (the single event enum).
 - `app.rs` — GTK shell: `adw::Application`, single-instance + remote CLI via GApplication's `command-line` signal, event-bus → toast/theme wiring.
 - `ui/` — GTK4 widgets: `window.rs` (navigation shell), `pages/` (General, Models, Post-Processing, History, Advanced, Debug, About), all `AdwPreferencesPage`s.
-- `overlay.rs` — recording overlay as a `gtk4-layer-shell` Wayland layer surface (state pill, mic level, streaming text).
+- `overlay.rs` — recording overlay: a fullscreen transparent, click-through surface (GNOME/Mutter lacks the wlr-layer-shell protocol) with a Cairo-painted pill at the bottom/top screen edge (state, pulsing record button, mic waveform, streaming text).
 - `tray.rs` — StatusNotifierItem via `ksni`.
 - `managers/` — core business logic:
   - `audio.rs` — audio recording and device management (cpal)
@@ -77,9 +77,9 @@ Otush is a **native GNOME application** (GTK4 + libadwaita on Wayland) with a Ru
 
 ### Technology Stack
 
-**Core libraries:** transcribe-cpp (GGML/GGUF), transcribe-rs (ONNX), cpal, vad-rs, rdev, rubato, rodio, rusqlite, hf-hub, reqwest, tokio.
+**Core libraries:** transcribe-cpp (GGML/GGUF), transcribe-rs (ONNX), cpal, vad-rs, evdev, rubato, rodio, rusqlite, reqwest, tokio.
 
-**UI:** gtk4, libadwaita (version features `v1_3`/`v1_4` for Ubuntu 24.04 compatibility), gtk4-layer-shell, glib, ashpd (GlobalShortcuts portal), ksni (tray), arboard (clipboard), image (icon decoding).
+**UI:** gtk4, libadwaita (version features `v1_3`/`v1_4` for Ubuntu 24.04 compatibility), glib, ashpd (GlobalShortcuts portal), ksni (tray), arboard (clipboard), image (icon decoding).
 
 ### Application Flow
 
@@ -139,9 +139,8 @@ flag. Debug mode enables the verbose file log level and the live log viewer
 ## Platform Notes
 
 - **Linux (GNOME/Wayland)** is the target platform. OpenBLAS + Vulkan
-  acceleration; the overlay is a `gtk4-layer-shell` surface; global shortcuts
-  use the XDG GlobalShortcuts portal (ashpd) with an evdev fallback
-  (handy-keys crate).
+  acceleration; the recording overlay is a fullscreen transparent surface (input region makes it click-through); global shortcuts
+  use the XDG GlobalShortcuts portal (ashpd) with an evdev fallback.
 - macOS/Windows support was removed in the native conversion; the Rust core
   remains portable.
 
@@ -157,6 +156,5 @@ See the [Troubleshooting](README.md#troubleshooting) section in README.md.
 **Branding:** This project is Otush (`com.clusterat.otush`). Do not reintroduce
 the upstream "Handy" name in user-facing strings, packaging or identifiers —
 except where it is a functional reference (the `handy-computer` Hugging Face
-org / `blob.handy.computer` model hosting, and the `handy-keys` crate, which is
-aliased as `evdev-keys` in `Cargo.toml`). The upstream Handy project is credited
+org / `blob.handy.computer` model hosting). The upstream Handy project is credited
 in [README.md](README.md).
