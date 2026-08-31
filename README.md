@@ -32,7 +32,7 @@ backend in the same process. No webview, no Electron, no XWayland.
 
 - Ubuntu 24.04 LTS or newer (GNOME 46+, Wayland recommended)
 - For building, the native libraries:
-  `libgtk-4-dev libadwaita-1-dev libgtk-4-layer-shell-dev libasound2-dev
+  `libgtk-4-dev libadwaita-1-dev libasound2-dev
   libssl-dev libvulkan-dev libopenblas-dev`
 
 See [BUILD.md](BUILD.md) for the full build guide and [QA.md](QA.md) for the
@@ -110,11 +110,8 @@ Settings → General → Shortcuts offers two engines:
 
 ## Troubleshooting
 
-- **Overlay doesn't show**: the recording overlay is a `gtk4-layer-shell`
-  surface. If the compositor lacks layer-shell support, Otush falls back to a
-  plain undecorated window. Make sure the session is Wayland
-  (`GDK_BACKEND=wayland` is forced when `WAYLAND_DISPLAY` is set) and that
-  `libgtk-4-layer-shell1` is installed.
+- **Overlay doesn't show**: the recording overlay is a transparent, click-through
+  surface. Make sure the session is Wayland (`GDK_BACKEND=wayland` is set).
 - **Overlay steals focus / paste fails**: keep `Overlay → Style` at
   `None`/`Minimal` on compositors that treat layer surfaces as the active
   window; the overlay is hidden before pasting, which avoids focus loss.
