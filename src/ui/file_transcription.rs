@@ -63,7 +63,7 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
             .as_ref()
             .and_then(|p| p.file_name())
             .and_then(|n| n.to_str())
-            .unwrap_or("No file selected — drag & drop or browse below"),
+            .unwrap_or("No file selected — drag and drop or browse below"),
     );
 
     let browse_button = gtk4::Button::from_icon_name("document-open-symbolic");
