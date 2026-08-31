@@ -35,8 +35,10 @@ jobs:
 
       - name: Stage bundled transcribe shared libraries
         run: |
+          OUT_LIB=$(ls -td target/release/build/transcribe-cpp-sys-*/out/lib | head -n 1)
+          rm -rf resources/transcribe-libs
           mkdir -p resources/transcribe-libs
-          find target/release/build/ -type f -name "*.so*" -exec cp -u {} resources/transcribe-libs/ \;
+          cp -d "$OUT_LIB"/*.so* resources/transcribe-libs/
 
       - name: Build Debian package (.deb)
         run: |
