@@ -80,7 +80,7 @@ fn play_sound_blocking(ctx: &AppContext, path: &Path) {
 fn play_sound_at_path(ctx: &AppContext, path: &Path) -> Result<(), Box<dyn std::error::Error>> {
     let settings = settings::get_settings(ctx);
     let volume = settings.audio_feedback_volume;
-    let selected_device = settings.selected_output_device.clone();
+    let selected_device = settings.selected_output_device;
     play_audio_file(path, selected_device, volume)
 }
 

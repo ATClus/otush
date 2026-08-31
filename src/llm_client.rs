@@ -1,5 +1,5 @@
-use crate::settings::PostProcessProvider;
-use log::{debug, error, info};
+use crate::settings::{PostProcessProvider, ReasoningEffort};
+use log::{debug, info};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -35,9 +35,7 @@ struct ReasoningConfig {
     exclude: Option<bool>,
 }
 
-/// Request fields used to ask an endpoint to skip reasoning/thinking.
-/// Providers disagree on the field name and accepted values, so at most one of
-/// these is set per request (see `reasoning_disable_params`).
+/// Request fields used for reasoning / thinking configuration across providers.
 #[derive(Debug, Serialize, Clone, Default, PartialEq)]
 struct ReasoningParams {
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -54,39 +52,75 @@ impl ReasoningParams {
     }
 }
 
-/// Pick the reasoning-disable request fields an endpoint understands.
-/// Unknown endpoints get the common OpenAI-style field; if they reject it,
-/// the request is retried without it (see `send_chat_completion_with_schema`).
-fn reasoning_disable_params(provider: &PostProcessProvider) -> ReasoningParams {
+/// Pick the reasoning request fields according to provider and user configuration.
+fn build_reasoning_params(
+    provider: &PostProcessProvider,
+    disable_reasoning: bool,
+) -> ReasoningParams {
     let base_url = provider.base_url.to_lowercase();
-    if base_url.contains("api.deepseek.com") {
-        // DeepSeek rejects reasoning_effort "none" and uses its own field:
-        // https://api-docs.deepseek.com/guides/thinking_mode
-        ReasoningParams {
-            thinking: Some(serde_json::json!({ "type": "disabled" })),
-            ..Default::default()
-        }
-    } else if provider.id == "openrouter" {
-        // OpenRouter nested object; exclude:true also keeps reasoning text out
-        // of the response so it can't pollute structured-output JSON parsing
-        ReasoningParams {
-            reasoning: Some(ReasoningConfig {
-                effort: Some("none".to_string()),
-                exclude: Some(true),
-            }),
-            ..Default::default()
+    let effort = provider.reasoning.effort;
+
+    if disable_reasoning || effort == ReasoningEffort::None {
+        if base_url.contains("api.deepseek.com") || provider.id == "deepseek" {
+            ReasoningParams {
+                thinking: Some(serde_json::json!({ "type": "disabled" })),
+                ..Default::default()
+            }
+        } else if provider.id == "openrouter" {
+            ReasoningParams {
+                reasoning: Some(ReasoningConfig {
+                    effort: Some("none".to_string()),
+                    exclude: Some(true),
+                }),
+                ..Default::default()
+            }
+        } else {
+            ReasoningParams {
+                reasoning_effort: Some("none".to_string()),
+                ..Default::default()
+            }
         }
     } else {
-        ReasoningParams {
-            reasoning_effort: Some("none".to_string()),
-            ..Default::default()
+        let effort_str = match effort {
+            ReasoningEffort::Low => "low",
+            ReasoningEffort::Medium => "medium",
+            ReasoningEffort::High => "high",
+            ReasoningEffort::None => "none",
+        };
+
+        if provider.id == "anthropic" || base_url.contains("anthropic.com") {
+            let budget = provider.reasoning.budget_tokens.unwrap_or(match effort {
+                ReasoningEffort::Low => 1024,
+                ReasoningEffort::Medium => 2048,
+                ReasoningEffort::High => 4096,
+                ReasoningEffort::None => 0,
+            });
+            ReasoningParams {
+                thinking: Some(serde_json::json!({
+                    "type": "enabled",
+                    "budget_tokens": budget
+                })),
+                ..Default::default()
+            }
+        } else if provider.id == "openrouter" {
+            ReasoningParams {
+                reasoning: Some(ReasoningConfig {
+                    effort: Some(effort_str.to_string()),
+                    exclude: Some(true),
+                }),
+                ..Default::default()
+            }
+        } else {
+            ReasoningParams {
+                reasoning_effort: Some(effort_str.to_string()),
+                ..Default::default()
+            }
         }
     }
 }
 
 /// Endpoints (base_url|model) that rejected the reasoning-disable fields with a
-/// 4xx. Remembered for the lifetime of the process so every dictation after the
-/// first skips the doomed attempt and goes straight to a plain request.
+/// 4xx. Remembered for the lifetime of the process.
 fn reasoning_rejections() -> &'static Mutex<HashSet<String>> {
     static REJECTED: OnceLock<Mutex<HashSet<String>>> = OnceLock::new();
     REJECTED.get_or_init(|| Mutex::new(HashSet::new()))
@@ -135,7 +169,7 @@ struct ChatMessageResponse {
     content: Option<String>,
 }
 
-/// Build headers for API requests based on provider type
+/// Build headers for API requests based on provider type and custom headers
 fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
 
@@ -151,15 +185,36 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
     );
     headers.insert("X-Title", HeaderValue::from_static("Otush"));
 
+    // User-configured custom headers
+    for (key, val) in &provider.custom_headers {
+        if let (Ok(header_name), Ok(header_val)) = (
+            reqwest::header::HeaderName::from_bytes(key.as_bytes()),
+            HeaderValue::from_str(val),
+        ) {
+            headers.insert(header_name, header_val);
+        }
+    }
+
     // Provider-specific auth headers
     if !api_key.is_empty() {
-        if provider.id == "anthropic" {
+        if provider.id == "anthropic" || provider.base_url.contains("anthropic.com") {
             headers.insert(
                 "x-api-key",
                 HeaderValue::from_str(api_key)
                     .map_err(|e| format!("Invalid API key header value: {}", e))?,
             );
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
+        } else if provider.id == "gemini" || provider.base_url.contains("googleapis.com") {
+            headers.insert(
+                AUTHORIZATION,
+                HeaderValue::from_str(&format!("Bearer {}", api_key))
+                    .map_err(|e| format!("Invalid authorization header value: {}", e))?,
+            );
+            headers.insert(
+                "x-goog-api-key",
+                HeaderValue::from_str(api_key)
+                    .map_err(|e| format!("Invalid API key header value: {}", e))?,
+            );
         } else {
             headers.insert(
                 AUTHORIZATION,
@@ -172,11 +227,17 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
     Ok(headers)
 }
 
-/// Create an HTTP client with provider-specific headers
+/// Create an HTTP client with provider-specific headers and timeout
 fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
     let headers = build_headers(provider, api_key)?;
+    let timeout_secs = if provider.timeout_seconds > 0 {
+        provider.timeout_seconds
+    } else {
+        10
+    };
     reqwest::Client::builder()
         .default_headers(headers)
+        .timeout(std::time::Duration::from_secs(timeout_secs as u64))
         .build()
         .map_err(|e| report_reqwest_error("Failed to build HTTP client", &e))
 }
@@ -290,7 +351,7 @@ fn report_reqwest_error(context: &str, error: &reqwest::Error) -> String {
     };
 
     let details = format!("{context} (kind: {kinds}{url}){cause_details}");
-    error!("{details}");
+    debug!("{details}");
     details
 }
 
@@ -373,8 +434,8 @@ pub async fn send_chat_completion_with_schema(
     });
 
     let key = endpoint_key(provider, model);
-    let reasoning = if disable_reasoning && !is_known_rejected(&key) {
-        reasoning_disable_params(provider)
+    let reasoning = if !is_known_rejected(&key) {
+        build_reasoning_params(provider, disable_reasoning)
     } else {
         ReasoningParams::default()
     };
@@ -386,6 +447,15 @@ pub async fn send_chat_completion_with_schema(
         response_format,
         reasoning,
     };
+
+    info!(
+        "Sending LLM chat completion to {} (model: '{}', structured: {}):\n--- System Prompt ---\n{:?}\n--- User Content ---\n{:?}",
+        sanitized_url_for_log(&url),
+        model,
+        request_body.response_format.is_some(),
+        request_body.messages.iter().find(|m| m.role == "system").map(|m| &m.content),
+        request_body.messages.iter().find(|m| m.role == "user").map(|m| &m.content)
+    );
 
     let mut response = client
         .post(&url)
@@ -401,8 +471,7 @@ pub async fn send_chat_completion_with_schema(
         sanitized_url(response.url())
     );
 
-    // A 400/422 on a request carrying reasoning-disable fields is almost always
-    // the endpoint rejecting those fields — retry once without them.
+    // A 400/422 on a request carrying reasoning fields might be the endpoint rejecting those fields — retry once without them.
     if !status.is_success()
         && matches!(status.as_u16(), 400 | 422)
         && !request_body.reasoning.is_empty()
@@ -411,7 +480,7 @@ pub async fn send_chat_completion_with_schema(
             report_reqwest_error("Failed to read reasoning rejection response", &e)
         });
         info!(
-            "Endpoint rejected request with reasoning disabled (status {}): {}. Retrying without reasoning fields",
+            "Endpoint rejected request with reasoning fields (status {}): {}. Retrying without reasoning fields",
             status, error_text
         );
 
@@ -444,31 +513,50 @@ pub async fn send_chat_completion_with_schema(
             .text()
             .await
             .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
+        info!(
+            "LLM API request failed with status {}: {}",
+            status, error_text
+        );
         return Err(format!(
             "API request failed with status {}: {}",
             status, error_text
         ));
     }
 
-    let completion: ChatCompletionResponse = response
-        .json()
+    let raw_response = response
+        .text()
         .await
-        .map_err(|e| report_reqwest_error("Failed to parse API response", &e))?;
+        .map_err(|e| report_reqwest_error("Failed to read API response body", &e))?;
 
-    Ok(completion
+    info!(
+        "LLM HTTP response received from {} (status {}):\n{}",
+        sanitized_url_for_log(&url),
+        status,
+        raw_response
+    );
+
+    let completion: ChatCompletionResponse = serde_json::from_str(&raw_response)
+        .map_err(|e| format!("Failed to parse API response JSON: {e}"))?;
+
+    let content = completion
         .choices
         .first()
-        .and_then(|choice| choice.message.content.clone()))
+        .and_then(|choice| choice.message.content.clone());
+
+    info!("LLM parsed content from first choice: {:?}", content);
+
+    Ok(content)
 }
 
-/// Fetch available models from an OpenAI-compatible API
-/// Returns a list of model IDs
+/// Fetch available models dynamically from an LLM provider API.
+/// Returns a list of clean model IDs suitable for chat completion.
 pub async fn fetch_models(
     provider: &PostProcessProvider,
     api_key: String,
 ) -> Result<Vec<String>, String> {
     let base_url = provider.base_url.trim_end_matches('/');
-    let url = format!("{}/models", base_url);
+    let endpoint = provider.models_endpoint.as_deref().unwrap_or("/models");
+    let url = format!("{}{}", base_url, endpoint);
 
     debug!("Fetching models from: {}", sanitized_url_for_log(&url));
 
@@ -505,7 +593,7 @@ pub async fn fetch_models(
 
     let mut models = Vec::new();
 
-    // Handle OpenAI format: { data: [ { id: "..." }, ... ] }
+    // 1. OpenAI/Anthropic/Groq/Mistral/OpenRouter/Z.AI/Cerebras format: { data: [ { id: "..." }, ... ] }
     if let Some(data) = parsed.get("data").and_then(|d| d.as_array()) {
         for entry in data {
             if let Some(id) = entry.get("id").and_then(|i| i.as_str()) {
@@ -515,7 +603,18 @@ pub async fn fetch_models(
             }
         }
     }
-    // Handle array format: [ "model1", "model2", ... ]
+    // 2. Google Gemini / Ollama format: { models: [ { name: "models/gemini-2.0-flash" or "name": "..." }, ... ] }
+    else if let Some(models_list) = parsed.get("models").and_then(|m| m.as_array()) {
+        for entry in models_list {
+            if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
+                let clean_name = name.strip_prefix("models/").unwrap_or(name);
+                models.push(clean_name.to_string());
+            } else if let Some(model) = entry.get("model").and_then(|m| m.as_str()) {
+                models.push(model.to_string());
+            }
+        }
+    }
+    // 3. Direct array format: [ "model1", "model2", ... ]
     else if let Some(array) = parsed.as_array() {
         for entry in array {
             if let Some(model) = entry.as_str() {
@@ -524,7 +623,38 @@ pub async fn fetch_models(
         }
     }
 
+    // Filter out non-chat models (embeddings, tts, image generation)
+    models.retain(|m| {
+        let lower = m.to_lowercase();
+        !lower.starts_with("text-embedding")
+            && !lower.starts_with("dall-e")
+            && !lower.starts_with("tts-")
+            && !lower.starts_with("whisper-")
+            && !lower.contains("embed")
+    });
+
+    models.sort();
+    models.dedup();
+
     Ok(models)
+}
+
+/// Test connection to an LLM provider and measure latency in milliseconds.
+pub async fn test_provider_connection(
+    provider: &PostProcessProvider,
+    api_key: String,
+    model: &str,
+) -> Result<(String, u128), String> {
+    let start = std::time::Instant::now();
+    let test_prompt = "Hello! Reply with 'Connected successfully' and nothing else.".to_string();
+
+    let result = send_chat_completion(provider, api_key, model, test_prompt, false).await?;
+
+    let elapsed = start.elapsed().as_millis();
+    match result {
+        Some(text) => Ok((text.trim().to_string(), elapsed)),
+        None => Err("Provider returned an empty response".to_string()),
+    }
 }
 
 #[cfg(test)]
@@ -561,6 +691,10 @@ mod tests {
             allow_base_url_edit: true,
             models_endpoint: None,
             supports_structured_output: false,
+            reasoning: Default::default(),
+            enabled: true,
+            custom_headers: std::collections::HashMap::new(),
+            timeout_seconds: 10,
         }
     }
 
@@ -678,7 +812,7 @@ mod tests {
 
     #[test]
     fn custom_provider_uses_top_level_reasoning_effort() {
-        let params = reasoning_disable_params(&provider("custom", "http://localhost:11434/v1"));
+        let params = build_reasoning_params(&provider("custom", "http://localhost:11434/v1"), true);
         let json = request_json(params);
         assert_eq!(json["reasoning_effort"], "none");
         assert!(json.get("reasoning").is_none());
@@ -687,8 +821,10 @@ mod tests {
 
     #[test]
     fn openrouter_uses_nested_reasoning_object() {
-        let params =
-            reasoning_disable_params(&provider("openrouter", "https://openrouter.ai/api/v1"));
+        let params = build_reasoning_params(
+            &provider("openrouter", "https://openrouter.ai/api/v1"),
+            true,
+        );
         let json = request_json(params);
         assert!(json.get("reasoning_effort").is_none());
         assert_eq!(json["reasoning"]["effort"], "none");
@@ -698,11 +834,22 @@ mod tests {
 
     #[test]
     fn deepseek_base_url_uses_thinking_disabled() {
-        let params = reasoning_disable_params(&provider("custom", "https://api.deepseek.com"));
+        let params = build_reasoning_params(&provider("custom", "https://api.deepseek.com"), true);
         let json = request_json(params);
         assert!(json.get("reasoning_effort").is_none());
         assert!(json.get("reasoning").is_none());
         assert_eq!(json["thinking"]["type"], "disabled");
+    }
+
+    #[test]
+    fn anthropic_reasoning_generates_budget_tokens() {
+        let mut prov = provider("anthropic", "https://api.anthropic.com/v1");
+        prov.reasoning.effort = ReasoningEffort::High;
+        prov.reasoning.budget_tokens = Some(4096);
+        let params = build_reasoning_params(&prov, false);
+        let json = request_json(params);
+        assert_eq!(json["thinking"]["type"], "enabled");
+        assert_eq!(json["thinking"]["budget_tokens"], 4096);
     }
 
     #[test]
