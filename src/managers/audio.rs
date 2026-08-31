@@ -20,128 +20,43 @@ const SILERO_VAD_THRESHOLD: f32 = 0.3;
 const EARSHOT_VAD_THRESHOLD: f32 = 0.5;
 
 fn set_mute(mute: bool) {
-    // Expected behavior:
-    // - Windows: works on most systems using standard audio drivers.
-    // - Linux: works on many systems (PipeWire, PulseAudio, ALSA),
-    //   but some distros may lack the tools used.
-    // - macOS: works on most standard setups via AppleScript.
-    // If unsupported, fails silently.
+    use std::process::Command;
 
-    #[cfg(target_os = "windows")]
+    let mute_val = if mute { "1" } else { "0" };
+    let amixer_state = if mute { "mute" } else { "unmute" };
+
+    // Try multiple Linux audio backends in order of preference:
+    // 1. PipeWire (wpctl)
+    if Command::new("wpctl")
+        .args(["set-mute", "@DEFAULT_AUDIO_SINK@", mute_val])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
     {
-        unsafe {
-            use windows::Win32::{
-                Media::Audio::{
-                    eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
-                    MMDeviceEnumerator,
-                },
-                System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
-            };
-
-            macro_rules! unwrap_or_return {
-                ($expr:expr) => {
-                    match $expr {
-                        Ok(val) => val,
-                        Err(_) => return,
-                    }
-                };
-            }
-
-            // Initialize the COM library for this thread.
-            // If already initialized (e.g., by another library like Tauri), this does nothing.
-            let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
-            let all_devices: IMMDeviceEnumerator =
-                unwrap_or_return!(CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL));
-            let default_device =
-                unwrap_or_return!(all_devices.GetDefaultAudioEndpoint(eRender, eMultimedia));
-            let volume_interface = unwrap_or_return!(
-                default_device.Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-            );
-
-            let _ = volume_interface.SetMute(mute, std::ptr::null());
-        }
+        return;
     }
 
-    #[cfg(target_os = "linux")]
+    // 2. PulseAudio (pactl)
+    if Command::new("pactl")
+        .args(["set-sink-mute", "@DEFAULT_SINK@", mute_val])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
     {
-        use std::process::Command;
-
-        let mute_val = if mute { "1" } else { "0" };
-        let amixer_state = if mute { "mute" } else { "unmute" };
-
-        // Try multiple backends to increase compatibility
-        // 1. PipeWire (wpctl)
-        if Command::new("wpctl")
-            .args(["set-mute", "@DEFAULT_AUDIO_SINK@", mute_val])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
-
-        // 2. PulseAudio (pactl)
-        if Command::new("pactl")
-            .args(["set-sink-mute", "@DEFAULT_SINK@", mute_val])
-            .output()
-            .map(|o| o.status.success())
-            .unwrap_or(false)
-        {
-            return;
-        }
-
-        // 3. ALSA (amixer)
-        let _ = Command::new("amixer")
-            .args(["set", "Master", amixer_state])
-            .output();
+        return;
     }
 
-    #[cfg(target_os = "macos")]
-    {
-        use std::process::Command;
-        let script = format!(
-            "set volume output muted {}",
-            if mute { "true" } else { "false" }
-        );
-        let _ = Command::new("osascript").args(["-e", &script]).output();
-    }
+    // 3. ALSA (amixer)
+    let _ = Command::new("amixer")
+        .args(["set", "Master", amixer_state])
+        .output();
 }
 
-/// Reads the current system output mute state, mirroring `set_mute`'s backends.
+/// Reads the current system output mute state on Linux.
 ///
 /// Returns `Some(true)`/`Some(false)` when the state could be determined, or
-/// `None` when it couldn't (unsupported platform, missing CLI tools, or an
-/// error). Callers treat `None` as "unknown" and fall back to unmuting on stop,
-/// so we never strand the user's audio muted.
-#[cfg(target_os = "windows")]
-fn get_mute() -> Option<bool> {
-    unsafe {
-        use windows::Win32::{
-            Media::Audio::{
-                eMultimedia, eRender, Endpoints::IAudioEndpointVolume, IMMDeviceEnumerator,
-                MMDeviceEnumerator,
-            },
-            System::Com::{CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED},
-        };
-
-        // Matches set_mute: no-op if COM is already initialized on this thread.
-        let _ = CoInitializeEx(None, COINIT_MULTITHREADED);
-
-        let all_devices: IMMDeviceEnumerator =
-            CoCreateInstance(&MMDeviceEnumerator, None, CLSCTX_ALL).ok()?;
-        let default_device = all_devices
-            .GetDefaultAudioEndpoint(eRender, eMultimedia)
-            .ok()?;
-        let volume_interface = default_device
-            .Activate::<IAudioEndpointVolume>(CLSCTX_ALL, None)
-            .ok()?;
-
-        Some(volume_interface.GetMute().ok()?.as_bool())
-    }
-}
-
-#[cfg(target_os = "linux")]
+/// `None` when it couldn't (missing CLI tools or error). Callers treat `None`
+/// as "unknown" and fall back to unmuting on stop, so audio is never left muted.
 fn get_mute() -> Option<bool> {
     use std::process::Command;
 
@@ -156,26 +71,24 @@ fn get_mute() -> Option<bool> {
     }
 
     // 2. PulseAudio (pactl): prints "Mute: yes" / "Mute: no".
-    // Force LC_ALL=C so a localized system still emits the parseable English
-    // "yes"/"no" instead of e.g. "ja"/"nein".
+    // Force LC_ALL=C so a localized system still emits parseable English.
     if let Ok(out) = Command::new("pactl")
         .env("LC_ALL", "C")
         .args(["get-sink-mute", "@DEFAULT_SINK@"])
         .output()
     {
         if out.status.success() {
-            let s = String::from_utf8_lossy(&out.stdout).to_lowercase();
-            if s.contains("yes") {
+            let s = String::from_utf8_lossy(&out.stdout);
+            if s.contains("Mute: yes") {
                 return Some(true);
             }
-            if s.contains("no") {
+            if s.contains("Mute: no") {
                 return Some(false);
             }
         }
     }
 
-    // 3. ALSA (amixer): prints "[off]" for muted channels, "[on]" otherwise.
-    // LC_ALL=C keeps the "[on]"/"[off]" tokens stable across locales.
+    // 3. ALSA (amixer): look for "[off]" in the Master playback switch line.
     if let Ok(out) = Command::new("amixer")
         .env("LC_ALL", "C")
         .args(["get", "Master"])
@@ -192,29 +105,6 @@ fn get_mute() -> Option<bool> {
         }
     }
 
-    None
-}
-
-#[cfg(target_os = "macos")]
-fn get_mute() -> Option<bool> {
-    use std::process::Command;
-
-    let out = Command::new("osascript")
-        .args(["-e", "output muted of (get volume settings)"])
-        .output()
-        .ok()?;
-    if !out.status.success() {
-        return None;
-    }
-    match String::from_utf8_lossy(&out.stdout).trim() {
-        "true" => Some(true),
-        "false" => Some(false),
-        _ => None,
-    }
-}
-
-#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
-fn get_mute() -> Option<bool> {
     None
 }
 
@@ -327,7 +217,6 @@ fn create_audio_recorder(
         )
         .with_selected_channel(selected_channel)
         .with_level_callback({
-            let bus = bus.clone();
             move |levels| {
                 utils::emit_levels(&bus, &levels);
             }

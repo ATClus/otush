@@ -7,7 +7,7 @@
 
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::{HistoryManager, HistoryUpdatePayload};
-use crate::managers::model::{DownloadProgress, ModelManager};
+use crate::managers::model::ModelManager;
 use crate::managers::transcription::{
     ModelStateEvent, StreamPhaseEvent, StreamTextEvent, TranscriptionManager,
 };
@@ -71,6 +71,25 @@ pub struct RecordingErrorEvent {
     pub detail: Option<String>,
 }
 
+/// Model download progress event surfaced to the UI.
+#[derive(Clone, Debug)]
+pub struct ModelDownloadProgressEvent {
+    pub url: String,
+    pub filename: String,
+    pub downloaded_bytes: u64,
+    pub total_bytes: Option<u64>,
+    pub percentage: f64,
+    pub speed_mb_s: f64,
+}
+
+/// Model download completion event surfaced to the UI.
+#[derive(Clone, Debug)]
+pub struct ModelDownloadFinishedEvent {
+    pub filename: String,
+    pub success: bool,
+    pub error: Option<String>,
+}
+
 /// One backend → UI event. The GTK shell subscribes via [`EventBus::subscribe`].
 #[derive(Clone, Debug)]
 pub enum AppEvent {
@@ -85,22 +104,9 @@ pub enum AppEvent {
     // --- model lifecycle ---
     ModelStateChanged(ModelStateEvent),
     ModelsUpdated,
-    ModelDownloadProgress(DownloadProgress),
-    ModelDownloadComplete(String),
-    ModelDownloadCancelled(String),
-    ModelDownloadFailed {
-        model_id: String,
-        error: String,
-    },
     ModelDeleted(String),
-    ModelVerificationStarted(String),
-    ModelVerificationCompleted(String),
-    ModelExtractionStarted(String),
-    ModelExtractionCompleted(String),
-    ModelExtractionFailed {
-        model_id: String,
-        error: String,
-    },
+    ModelDownloadProgress(ModelDownloadProgressEvent),
+    ModelDownloadFinished(ModelDownloadFinishedEvent),
     // --- transcription / streaming ---
     StreamText(StreamTextEvent),
     StreamPhase(StreamPhaseEvent),
@@ -113,8 +119,6 @@ pub enum AppEvent {
     HideOverlay,
     // --- clipboard / paste ---
     PasteError,
-    // --- input capture (evdev-keys) ---
-    EvdevKeysEvent(serde_json::Value),
     // --- history ---
     HistoryUpdated(HistoryUpdatePayload),
     // --- debug ---
@@ -151,10 +155,20 @@ impl EventBus {
     pub fn send(&self, event: AppEvent) {
         let subscribers = {
             let guard = self.subscribers.lock().unwrap();
+            if guard.is_empty() {
+                return;
+            }
             guard.clone()
         };
-        for callback in &subscribers {
-            callback(event.clone());
+
+        let count = subscribers.len();
+        for (i, callback) in subscribers.iter().enumerate() {
+            if i + 1 == count {
+                callback(event);
+                break;
+            } else {
+                callback(event.clone());
+            }
         }
     }
 }

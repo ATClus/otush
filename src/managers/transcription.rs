@@ -96,7 +96,7 @@ pub struct StreamPhaseEvent {
 /// Commands sent to the streaming worker thread. Audio frames and the finalize
 /// request travel the same channel so FIFO ordering guarantees every fed frame
 /// is processed before finalize runs.
-enum StreamCmd {
+pub(crate) enum StreamCmd {
     Feed(Vec<f32>),
     /// Flush the stream and reply with the final text, or `None` if no stream
     /// was ever active (caller should fall back to batch transcription).
@@ -104,11 +104,11 @@ enum StreamCmd {
     Cancel,
 }
 
-struct FinalizedStreamText {
-    text: String,
-    output_language: OutputLanguageEvidence,
+pub(crate) struct FinalizedStreamText {
+    pub(crate) text: String,
+    pub(crate) output_language: OutputLanguageEvidence,
     /// The streaming model's supported languages, for text-based detection.
-    supported_languages: Vec<String>,
+    pub(crate) supported_languages: Vec<String>,
 }
 
 /// Routes real-time audio frames to the active streaming worker. Shared between
@@ -516,7 +516,7 @@ impl TranscriptionManager {
             self.bus.send(AppEvent::ModelStateChanged(ModelStateEvent {
                 event_type: "loading_failed".to_string(),
                 model_id: Some(model_id.to_string()),
-                model_name: Some(model_info.name.clone()),
+                model_name: Some(model_info.name),
                 error: Some(error_msg.to_string()),
             }));
             return Err(anyhow::anyhow!(error_msg));
@@ -771,9 +771,7 @@ impl TranscriptionManager {
     /// model is loaded.
     pub fn current_backend(&self) -> Option<String> {
         match self.lock_engine().as_ref() {
-            Some(LoadedEngine::TranscribeCpp(session)) => {
-                Some(session.model().backend().to_string())
-            }
+            Some(LoadedEngine::TranscribeCpp(session)) => Some(session.model().backend()),
             Some(_) => Some("onnx".to_string()),
             None => None,
         }
@@ -828,6 +826,45 @@ impl TranscriptionManager {
             active_engine_lease: Arc::clone(&self.active_engine_lease),
             stream_active: Arc::clone(&self.stream_active),
         };
+
+        let settings = read_settings_from(&self.paths.settings_store_path());
+        if !settings.local_transcription_enabled {
+            if settings.is_deepgram_streaming_active() {
+                if let Some(provider) = settings.first_enabled_transcription_provider() {
+                    let api_key = settings
+                        .transcription_api_keys
+                        .get("deepgram")
+                        .cloned()
+                        .unwrap_or_default();
+                    let model = settings
+                        .transcription_models
+                        .get("deepgram")
+                        .cloned()
+                        .unwrap_or_else(|| provider.model.clone());
+                    let language = settings.selected_language.clone();
+                    let bus = self.bus.clone();
+                    let stream_active = Arc::clone(&self.stream_active);
+                    let provider_clone = provider.clone();
+
+                    crate::runtime::block_on(async move {
+                        crate::stt_client::run_deepgram_websocket_stream(
+                            &provider_clone,
+                            &api_key,
+                            &model,
+                            &language,
+                            rx,
+                            bus,
+                            stream_active,
+                        )
+                        .await;
+                    });
+                    return;
+                }
+            }
+            self.router.clear();
+            drain_until_finalize(rx);
+            return;
+        }
 
         // Wait for any in-progress model load to finish (start_stream races the
         // background load kicked off when recording starts).
@@ -1029,7 +1066,7 @@ impl TranscriptionManager {
                                 Some(FinalizedStreamText {
                                     text: stream.text().full,
                                     output_language,
-                                    supported_languages: languages.clone(),
+                                    supported_languages: languages,
                                 })
                             }
                             Err(e) => {
@@ -1876,12 +1913,6 @@ pub fn init_transcribe_backend() {
     transcribe_cpp::init_logging();
     match transcribe_cpp::init_backends_default() {
         Ok(()) => {
-            if transcribe_gpu_disabled_for_host() {
-                warn!(
-                    "Windows x64 build is running under emulation on an ARM64 host; \
-                     disabling transcribe.cpp GPU acceleration and using CPU"
-                );
-            }
             let devices = transcribe_compute_devices();
             info!(
                 "transcribe-cpp initialized with {} compute device(s): [{}]",
@@ -1955,8 +1986,7 @@ fn resolve_device_index(index: usize) -> Result<(Backend, Option<transcribe_cpp:
 /// `Auto` lets the library pick the best device (with CPU fallback), while
 /// `Cpu` forces strict CPU. `Gpu` only remains as the companion setting for an
 /// exact device; without a valid exact device it has the retired generic GPU
-/// state's new Auto semantics. An emulated x64 process on Windows ARM64 forces
-/// strict CPU for every setting.
+/// state's new Auto semantics.
 fn select_transcribe_backend(setting: TranscribeAcceleratorSetting) -> Backend {
     select_transcribe_backend_for_host(setting, transcribe_gpu_disabled_for_host())
 }
@@ -2057,7 +2087,7 @@ pub struct GpuDeviceOption {
 static GPU_DEVICES: OnceLock<Vec<GpuDeviceOption>> = OnceLock::new();
 
 fn transcribe_gpu_disabled_for_host() -> bool {
-    crate::utils::is_windows_x64_emulated_on_arm64()
+    false
 }
 
 fn effective_transcribe_accelerator(

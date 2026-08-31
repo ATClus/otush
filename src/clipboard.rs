@@ -1,17 +1,13 @@
 use crate::context::AppContext;
 use crate::input;
-#[cfg(target_os = "linux")]
 use crate::settings::TypingTool;
 use crate::settings::{get_settings, AutoSubmitKey, ClipboardHandling, PasteMethod};
+use crate::utils::{is_gnome_wayland, is_kde_wayland, is_wayland};
 use enigo::{Direction, Enigo, Key, Keyboard};
 use log::info;
 use std::process::Command;
-#[cfg(target_os = "linux")]
 use std::sync::OnceLock;
 use std::time::Duration;
-
-#[cfg(target_os = "linux")]
-use crate::utils::{is_gnome_wayland, is_kde_wayland, is_wayland};
 
 /// Shared clipboard handle (arboard), initialized on first use. Holding the
 /// lock for the duration of a read/write keeps the platform clipboard state
@@ -42,7 +38,6 @@ fn with_enigo<T>(f: impl FnOnce(&mut Enigo) -> Result<T, String>) -> Result<T, S
 }
 
 fn write_text_to_clipboard(_ctx: &AppContext, text: &str) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
     if is_wayland() && is_wl_copy_available() {
         info!("Using wl-copy for clipboard write on Wayland");
         return write_clipboard_via_wl_copy(text);
@@ -52,6 +47,127 @@ fn write_text_to_clipboard(_ctx: &AppContext, text: &str) -> Result<(), String> 
         cb.set_text(text.to_string())
             .map_err(|e| format!("Failed to write to clipboard: {}", e))
     })
+}
+
+/// Check if wl-paste is available (Wayland clipboard tool).
+fn is_wl_paste_available() -> bool {
+    Command::new("which")
+        .arg("wl-paste")
+        .output()
+        .map(|output| output.status.success())
+        .unwrap_or(false)
+}
+
+/// Read text from the system clipboard.
+pub fn read_clipboard_text() -> Result<String, String> {
+    if is_wayland() && is_wl_paste_available() {
+        if let Ok(output) = Command::new("wl-paste").arg("--no-newline").output() {
+            if output.status.success() {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    if !text.is_empty() {
+                        return Ok(text);
+                    }
+                }
+            }
+        }
+    }
+
+    with_clipboard(|cb| {
+        cb.get_text()
+            .map_err(|e| format!("Failed to read clipboard: {}", e))
+    })
+}
+
+/// Attempts to send Ctrl+C using Linux-native tools.
+fn try_send_copy_linux() -> Result<bool, String> {
+    if is_wayland() {
+        if !is_kde_wayland() && !is_gnome_wayland() && is_wtype_available() {
+            let output = Command::new("wtype")
+                .args(["-M", "ctrl", "-k", "c", "-m", "ctrl"])
+                .output();
+            if output.map(|o| o.status.success()).unwrap_or(false) {
+                return Ok(true);
+            }
+        }
+        if is_dotool_available() {
+            let status = Command::new("sh")
+                .arg("-c")
+                .arg("echo key ctrl+c | dotool")
+                .status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                return Ok(true);
+            }
+        }
+        if is_ydotool_available() {
+            let status = Command::new("ydotool")
+                .args(["key", "29:1", "46:1", "46:0", "29:0"])
+                .status();
+            if status.map(|s| s.success()).unwrap_or(false) {
+                return Ok(true);
+            }
+        }
+    } else if is_xdotool_available() {
+        let status = Command::new("xdotool")
+            .args(["key", "--clearmodifiers", "ctrl+c"])
+            .status();
+        if status.map(|s| s.success()).unwrap_or(false) {
+            return Ok(true);
+        }
+    }
+
+    with_enigo(|enigo| {
+        enigo
+            .key(Key::Control, Direction::Press)
+            .map_err(|e| e.to_string())?;
+        enigo
+            .key(Key::Unicode('c'), Direction::Click)
+            .map_err(|e| e.to_string())?;
+        enigo
+            .key(Key::Control, Direction::Release)
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    })?;
+    Ok(true)
+}
+
+/// Capture the currently selected text in the active window.
+/// Tries Primary Selection first; if empty, sends Ctrl+C and reads clipboard.
+pub fn capture_selected_text() -> Result<String, String> {
+    if is_wayland() && is_wl_paste_available() {
+        if let Ok(output) = Command::new("wl-paste")
+            .arg("--primary")
+            .arg("--no-newline")
+            .output()
+        {
+            if output.status.success() {
+                if let Ok(text) = String::from_utf8(output.stdout) {
+                    let trimmed = text.trim();
+                    if !trimmed.is_empty() {
+                        return Ok(text);
+                    }
+                }
+            }
+        }
+    } else if let Ok(output) = Command::new("xclip")
+        .arg("-o")
+        .arg("-selection")
+        .arg("primary")
+        .output()
+    {
+        if output.status.success() {
+            if let Ok(text) = String::from_utf8(output.stdout) {
+                let trimmed = text.trim();
+                if !trimmed.is_empty() {
+                    return Ok(text);
+                }
+            }
+        }
+    }
+
+    let _ = try_send_copy_linux();
+
+    std::thread::sleep(Duration::from_millis(60));
+    read_clipboard_text()
 }
 
 /// Write text to the system clipboard (used by the tray "copy last transcript").
@@ -102,11 +218,7 @@ fn paste_via_clipboard(
     // propagating them to the caller.
     let paste_result = (|| -> Result<(), String> {
         // Send paste key combo
-        #[cfg(target_os = "linux")]
         let key_combo_sent = try_send_key_combo_linux(paste_method)?;
-
-        #[cfg(not(target_os = "linux"))]
-        let key_combo_sent = false;
 
         // Fall back to enigo if no native tool handled it
         if !key_combo_sent {
@@ -152,7 +264,6 @@ fn paste_via_clipboard(
 
 /// Attempts to send a key combination using Linux-native tools.
 /// Returns `Ok(true)` if a native tool handled it, `Ok(false)` to fall back to enigo.
-#[cfg(target_os = "linux")]
 fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, String> {
     if is_wayland() {
         // Wayland: prefer wtype (but not on KDE or GNOME), then dotool, then ydotool
@@ -193,7 +304,6 @@ fn try_send_key_combo_linux(paste_method: &PasteMethod) -> Result<bool, String> 
 
 /// Attempts to type text directly using Linux-native tools.
 /// Returns `Ok(true)` if a native tool handled it, `Ok(false)` to fall back to enigo.
-#[cfg(target_os = "linux")]
 fn try_direct_typing_linux(text: &str, preferred_tool: TypingTool) -> Result<bool, String> {
     // If user specified a tool, try only that one
     if preferred_tool != TypingTool::Auto {
@@ -276,7 +386,6 @@ fn try_direct_typing_linux(text: &str, preferred_tool: TypingTool) -> Result<boo
 
 /// Returns the list of available typing tools on this system.
 /// Always includes "auto" as the first entry.
-#[cfg(target_os = "linux")]
 pub fn get_available_typing_tools() -> Vec<String> {
     let mut tools = vec!["auto".to_string()];
     if is_wtype_available() {
@@ -298,7 +407,6 @@ pub fn get_available_typing_tools() -> Vec<String> {
 }
 
 /// Check if wtype is available (Wayland text input tool)
-#[cfg(target_os = "linux")]
 fn is_wtype_available() -> bool {
     Command::new("which")
         .arg("wtype")
@@ -308,7 +416,6 @@ fn is_wtype_available() -> bool {
 }
 
 /// Check if dotool is available (another Wayland text input tool)
-#[cfg(target_os = "linux")]
 fn is_dotool_available() -> bool {
     Command::new("which")
         .arg("dotool")
@@ -317,21 +424,17 @@ fn is_dotool_available() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(target_os = "linux")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum YdotoolKeySyntax {
     Symbolic,
     RawKeycodes,
 }
 
-#[cfg(target_os = "linux")]
 const YDOTOOL_UNKNOWN_HELP_FALLBACK: YdotoolKeySyntax = YdotoolKeySyntax::RawKeycodes;
 
-#[cfg(target_os = "linux")]
 static YDOTOOL_KEY_SYNTAX: OnceLock<YdotoolKeySyntax> = OnceLock::new();
 
 /// Classifies `ydotool key --help` output without relying on version or distro metadata.
-#[cfg(target_os = "linux")]
 fn classify_ydotool_key_syntax(help: &str) -> Option<YdotoolKeySyntax> {
     let help = help.to_ascii_lowercase();
 
@@ -352,7 +455,6 @@ fn classify_ydotool_key_syntax(help: &str) -> Option<YdotoolKeySyntax> {
 
 /// Detects and caches a recognized ydotool key syntax. Unknown or failed probes are not cached,
 /// allowing a transient daemon or PATH problem to recover on a later paste attempt.
-#[cfg(target_os = "linux")]
 fn detect_ydotool_key_syntax() -> YdotoolKeySyntax {
     if let Some(syntax) = YDOTOOL_KEY_SYNTAX.get() {
         return *syntax;
@@ -392,7 +494,6 @@ fn detect_ydotool_key_syntax() -> YdotoolKeySyntax {
 }
 
 /// Check if ydotool is available (uinput-based, works on both Wayland and X11)
-#[cfg(target_os = "linux")]
 fn is_ydotool_available() -> bool {
     Command::new("which")
         .arg("ydotool")
@@ -401,7 +502,6 @@ fn is_ydotool_available() -> bool {
         .unwrap_or(false)
 }
 
-#[cfg(target_os = "linux")]
 fn is_xdotool_available() -> bool {
     Command::new("which")
         .arg("xdotool")
@@ -411,7 +511,6 @@ fn is_xdotool_available() -> bool {
 }
 
 /// Check if kwtype is available (KDE Wayland virtual keyboard input tool)
-#[cfg(target_os = "linux")]
 fn is_kwtype_available() -> bool {
     Command::new("which")
         .arg("kwtype")
@@ -421,7 +520,6 @@ fn is_kwtype_available() -> bool {
 }
 
 /// Check if wl-copy is available (Wayland clipboard tool)
-#[cfg(target_os = "linux")]
 fn is_wl_copy_available() -> bool {
     Command::new("which")
         .arg("wl-copy")
@@ -431,7 +529,6 @@ fn is_wl_copy_available() -> bool {
 }
 
 /// Type text directly via wtype on Wayland.
-#[cfg(target_os = "linux")]
 fn type_text_via_wtype(text: &str) -> Result<(), String> {
     let output = Command::new("wtype")
         .arg("--") // Protect against text starting with -
@@ -448,7 +545,6 @@ fn type_text_via_wtype(text: &str) -> Result<(), String> {
 }
 
 /// Type text directly via xdotool on X11.
-#[cfg(target_os = "linux")]
 fn type_text_via_xdotool(text: &str) -> Result<(), String> {
     let output = Command::new("xdotool")
         .arg("type")
@@ -508,7 +604,6 @@ fn type_text_via_xdotool(text: &str) -> Result<(), String> {
 }
 
 /// Type text directly via dotool (works on both Wayland and X11 via uinput).
-#[cfg(target_os = "linux")]
 fn type_text_via_dotool(text: &str) -> Result<(), String> {
     use std::io::Write;
     use std::process::Stdio;
@@ -537,8 +632,29 @@ fn type_text_via_dotool(text: &str) -> Result<(), String> {
 }
 
 /// Type text directly via ydotool (uinput-based, requires ydotoold daemon).
-#[cfg(target_os = "linux")]
 fn type_text_via_ydotool(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    use std::process::Stdio;
+
+    // Try passing text via stdin (-f -) first to avoid argument escaping issues
+    if let Ok(mut child) = Command::new("ydotool")
+        .args(["type", "-f", "-"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .spawn()
+    {
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        if let Ok(output) = child.wait_with_output() {
+            if output.status.success() {
+                return Ok(());
+            }
+        }
+    }
+
+    // Fallback to argument passing
     let output = Command::new("ydotool")
         .arg("type")
         .arg("--")
@@ -555,7 +671,6 @@ fn type_text_via_ydotool(text: &str) -> Result<(), String> {
 }
 
 /// Type text directly via kwtype (KDE Wayland virtual keyboard, uses KDE Fake Input protocol).
-#[cfg(target_os = "linux")]
 fn type_text_via_kwtype(text: &str) -> Result<(), String> {
     let output = Command::new("kwtype")
         .arg("--")
@@ -574,7 +689,6 @@ fn type_text_via_kwtype(text: &str) -> Result<(), String> {
 /// Write text to clipboard via wl-copy (Wayland clipboard tool).
 /// Uses Stdio::null() to avoid blocking on repeated calls — wl-copy forks a
 /// daemon that inherits piped fds, causing read_to_end to hang indefinitely.
-#[cfg(target_os = "linux")]
 fn write_clipboard_via_wl_copy(text: &str) -> Result<(), String> {
     use std::process::Stdio;
     let status = Command::new("wl-copy")
@@ -593,7 +707,6 @@ fn write_clipboard_via_wl_copy(text: &str) -> Result<(), String> {
 }
 
 /// Send a key combination (e.g., Ctrl+V) via wtype on Wayland.
-#[cfg(target_os = "linux")]
 fn send_key_combo_via_wtype(paste_method: &PasteMethod) -> Result<(), String> {
     let args: Vec<&str> = match paste_method {
         PasteMethod::CtrlV => vec!["-M", "ctrl", "-k", "v", "-m", "ctrl"],
@@ -618,7 +731,6 @@ fn send_key_combo_via_wtype(paste_method: &PasteMethod) -> Result<(), String> {
 }
 
 /// Send a key combination (e.g., Ctrl+V) via dotool.
-#[cfg(target_os = "linux")]
 fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
     let command = match paste_method {
         PasteMethod::CtrlV => "echo key ctrl+v | dotool",
@@ -641,7 +753,6 @@ fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
     Ok(())
 }
 
-#[cfg(target_os = "linux")]
 fn ydotool_key_args(
     paste_method: &PasteMethod,
     syntax: YdotoolKeySyntax,
@@ -666,7 +777,6 @@ fn ydotool_key_args(
 }
 
 /// Send a key combination (e.g., Ctrl+V) via ydotool (requires ydotoold daemon).
-#[cfg(target_os = "linux")]
 fn send_key_combo_via_ydotool(paste_method: &PasteMethod) -> Result<(), String> {
     let syntax = detect_ydotool_key_syntax();
     let args = ydotool_key_args(paste_method, syntax)?;
@@ -685,7 +795,6 @@ fn send_key_combo_via_ydotool(paste_method: &PasteMethod) -> Result<(), String> 
 }
 
 /// Send a key combination (e.g., Ctrl+V) via xdotool on X11.
-#[cfg(target_os = "linux")]
 fn send_key_combo_via_xdotool(paste_method: &PasteMethod) -> Result<(), String> {
     let key_combo = match paste_method {
         PasteMethod::CtrlV => "ctrl+v",
@@ -740,18 +849,23 @@ fn paste_via_external_script(text: &str, script_path: &str) -> Result<(), String
 }
 
 /// Types text directly by simulating individual key presses.
-fn paste_direct(
-    text: &str,
-    _ctx: &AppContext,
-    #[cfg(target_os = "linux")] typing_tool: TypingTool,
-) -> Result<(), String> {
-    #[cfg(target_os = "linux")]
+fn paste_direct(text: &str, ctx: &AppContext, typing_tool: TypingTool) -> Result<(), String> {
+    // ydotool (and kernel uinput without composite layout mappings) drops all non-ASCII characters.
+    // If text contains non-ASCII characters (e.g., accents, umlauts, cedillas, emojis, non-Latin scripts),
+    // automatically fall back to clipboard paste (Ctrl+V) so Unicode text is never corrupted.
+    if !text.is_ascii()
+        && (typing_tool == TypingTool::Auto
+            || typing_tool == TypingTool::Ydotool
+            || (is_gnome_wayland() && typing_tool == TypingTool::Auto))
     {
-        if try_direct_typing_linux(text, typing_tool)? {
-            return Ok(());
-        }
-        info!("Falling back to enigo for direct text input");
+        info!("Text contains non-ASCII Unicode characters; falling back to clipboard paste (Ctrl+V) for 100% Unicode fidelity");
+        return paste_via_clipboard(text, ctx, &PasteMethod::CtrlV, 0, 0);
     }
+
+    if try_direct_typing_linux(text, typing_tool)? {
+        return Ok(());
+    }
+    info!("Falling back to enigo for direct text input");
 
     with_enigo(|enigo| input::paste_text_direct(enigo, text))
 }
@@ -827,38 +941,15 @@ pub fn paste(ctx: &AppContext, text: String) -> Result<(), String> {
             info!("PasteMethod::None selected - skipping paste action");
         }
         PasteMethod::Direct => {
-            paste_direct(
-                &text,
-                ctx,
-                #[cfg(target_os = "linux")]
-                settings.typing_tool,
-            )?;
+            if paste_delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(paste_delay_ms));
+            }
+            paste_direct(&text, ctx, settings.typing_tool)?;
+            if paste_delay_after_ms > 0 {
+                std::thread::sleep(Duration::from_millis(paste_delay_after_ms));
+            }
         }
         PasteMethod::CtrlV | PasteMethod::CtrlShiftV | PasteMethod::ShiftInsert => {
-            // Debug-gated receipt-sequenced paste (#502): restore the clipboard
-            // after the target actually reads the transcript, not on a timer.
-            // On success it fully handles the paste (including auto-submit and
-            // clipboard handling) asynchronously; on failure fall through to
-            // the legacy path untouched. macOS/Windows only.
-            #[cfg(any(target_os = "macos", target_os = "windows"))]
-            if settings.reliable_paste {
-                let reliable_result = with_enigo(|enigo| {
-                    crate::paste_tx::try_reliable_paste(
-                        &text,
-                        &paste_method,
-                        enigo,
-                        settings.auto_submit,
-                        settings.auto_submit_key,
-                        settings.clipboard_handling,
-                    )
-                });
-                match reliable_result {
-                    Ok(()) => return Ok(()),
-                    Err(e) => {
-                        log::warn!("Reliable paste unavailable ({e}); falling back to legacy paste")
-                    }
-                }
-            }
             paste_via_clipboard(
                 &text,
                 ctx,
@@ -868,12 +959,18 @@ pub fn paste(ctx: &AppContext, text: String) -> Result<(), String> {
             )?
         }
         PasteMethod::ExternalScript => {
+            if paste_delay_ms > 0 {
+                std::thread::sleep(Duration::from_millis(paste_delay_ms));
+            }
             let script_path = settings
                 .external_script_path
                 .as_ref()
                 .filter(|p| !p.is_empty())
                 .ok_or("External script path is not configured")?;
             paste_via_external_script(&text, script_path)?;
+            if paste_delay_after_ms > 0 {
+                std::thread::sleep(Duration::from_millis(paste_delay_after_ms));
+            }
         }
     }
 
@@ -897,14 +994,12 @@ mod tests {
     use super::*;
     use std::cell::Cell;
 
-    #[cfg(target_os = "linux")]
     const YDOTOOL_0_1_8_HELP: &str = r#"
 Usage: key [--delay <ms>] [--key-delay <ms>] [--repeat <times>] [--repeat-delay <ms>] <key sequence> ...
 Each key sequence can be any number of modifiers and keys, separated by plus (+)
 For example: alt+r Alt+F4 CTRL+alt+f3 aLT+1+2+3 ctrl+Backspace
 "#;
 
-    #[cfg(target_os = "linux")]
     const YDOTOOL_1_0_4_HELP: &str = r#"
 Usage: key [OPTION]... [KEYCODES]...
 Since there's no way to know how many keyboard layouts are there in the world,
@@ -913,7 +1008,6 @@ Syntax: <keycode>:<pressed>
 e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
 "#;
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn classifies_ydotool_0_1_8_symbolic_help() {
         assert_eq!(
@@ -922,7 +1016,6 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn classifies_ydotool_1_0_4_raw_keycode_help() {
         assert_eq!(
@@ -931,7 +1024,6 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn unknown_ydotool_help_falls_back_to_raw_keycodes() {
         let syntax = classify_ydotool_key_syntax("unrecognized help output")
@@ -940,7 +1032,6 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
         assert_eq!(syntax, YdotoolKeySyntax::RawKeycodes);
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn generates_symbolic_ydotool_arguments_for_all_paste_methods() {
         assert_eq!(
@@ -957,7 +1048,6 @@ e.g. 28:1 28:0 means pressing on the Enter button on a standard US keyboard.
         );
     }
 
-    #[cfg(target_os = "linux")]
     #[test]
     fn generates_raw_ydotool_arguments_for_all_paste_methods() {
         assert_eq!(

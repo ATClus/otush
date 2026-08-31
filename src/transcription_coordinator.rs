@@ -331,8 +331,8 @@ impl CoordinatorState {
 /// Serialises all transcription lifecycle events through a single thread
 /// to eliminate race conditions between keyboard shortcuts, signals, and
 /// the async transcribe-paste pipeline. The thread is a thin shell: it
-/// transports commands to the pure [`CoordinatorState`] and executes the
-/// returned [`Effect`]s.
+/// transports commands to the pure `CoordinatorState` and executes the
+/// returned `Effect`s.
 pub struct TranscriptionCoordinator {
     tx: Sender<Command>,
     /// Late-bound application context (the coordinator thread starts before
@@ -448,7 +448,7 @@ impl TranscriptionCoordinator {
     }
 
     /// Send an external trigger (SIGUSR2, CLI flag). Always a toggle press,
-    /// always exempt from debounce — see [`InputEvent::external`].
+    /// always exempt from debounce — see `InputEvent::external`.
     pub fn send_external_input(&self, binding_id: &str, source: &str) {
         self.send(binding_id, source, true, false, true);
     }

@@ -2,18 +2,17 @@ use crate::audio_feedback::{play_feedback_sound, play_feedback_sound_blocking, S
 use crate::audio_toolkit::{is_microphone_access_denied, is_no_input_device_error, VadPolicy};
 use crate::context::{AppContext, AppEvent};
 use crate::managers::transcription::StreamWorkKind;
-use crate::settings::{get_settings, AppSettings, OverlayStyle, APPLE_INTELLIGENCE_PROVIDER_ID};
+use crate::settings::{get_settings, AppSettings, OverlayStyle};
 use crate::shortcut;
 use crate::tray::{set_tray_state, TrayIconState};
 use crate::utils::{
     self, show_processing_overlay, show_recording_overlay, show_transcribing_overlay,
 };
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
-use log::{debug, error, warn};
-use once_cell::sync::Lazy;
+use log::{debug, error, info, warn};
 use std::collections::HashMap;
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::time::{Duration, Instant};
 
 const CANCELLATION_POLL_INTERVAL: Duration = Duration::from_millis(25);
@@ -102,230 +101,241 @@ fn should_use_streaming_overlay(style: OverlayStyle, is_streaming: bool) -> bool
     style == OverlayStyle::Live && is_streaming
 }
 
-async fn post_process_transcription(settings: &AppSettings, transcription: &str) -> Option<String> {
+pub(crate) async fn post_process_transcription(
+    settings: &crate::settings::AppSettings,
+    transcription: &str,
+) -> Option<String> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
         return None;
     }
 
-    let provider = match settings.active_post_process_provider().cloned() {
-        Some(provider) => provider,
+    // 1. Resolve prompt
+    let prompt_obj = if let Some(selected_id) = &settings.post_process_selected_prompt_id {
+        settings
+            .post_process_prompts
+            .iter()
+            .find(|p| &p.id == selected_id)
+            .or_else(|| settings.post_process_prompts.first())
+    } else {
+        settings.post_process_prompts.first()
+    };
+
+    let prompt_obj = match prompt_obj {
+        Some(p) => p,
         None => {
-            debug!("Post-processing enabled but no provider is selected");
+            debug!("Post-processing skipped because no prompts are available");
             return None;
         }
     };
 
-    let model = settings
-        .post_process_models
-        .get(&provider.id)
-        .cloned()
-        .unwrap_or_default();
+    post_process_text_with_prompt(settings, transcription, prompt_obj).await
+}
 
-    if model.trim().is_empty() {
-        debug!(
-            "Post-processing skipped because provider '{}' has no model configured",
-            provider.id
-        );
+pub(crate) async fn post_process_text_with_prompt(
+    settings: &crate::settings::AppSettings,
+    transcription: &str,
+    prompt_obj: &crate::settings::LLMPrompt,
+) -> Option<String> {
+    if is_blank_transcription(transcription) {
+        debug!("Post-processing skipped because input text is empty");
         return None;
     }
 
-    let selected_prompt_id = match &settings.post_process_selected_prompt_id {
-        Some(id) => id.clone(),
-        None => {
-            debug!("Post-processing skipped because no prompt is selected");
-            return None;
-        }
-    };
-
-    let prompt = match settings
-        .post_process_prompts
-        .iter()
-        .find(|prompt| prompt.id == selected_prompt_id)
-    {
-        Some(prompt) => prompt.prompt.clone(),
-        None => {
-            debug!(
-                "Post-processing skipped because prompt '{}' was not found",
-                selected_prompt_id
-            );
-            return None;
-        }
-    };
-
+    let prompt = &prompt_obj.prompt;
     if prompt.trim().is_empty() {
         debug!("Post-processing skipped because the selected prompt is empty");
         return None;
     }
 
-    debug!(
-        "Starting LLM post-processing with provider '{}' (model: {})",
-        provider.id, model
+    info!(
+        "Starting LLM post-processing for prompt '{}' (id: '{}') with input text ({} chars):\n{}",
+        prompt_obj.name,
+        prompt_obj.id,
+        transcription.len(),
+        transcription
     );
 
-    let api_key = settings
-        .post_process_api_keys
-        .get(&provider.id)
-        .cloned()
-        .unwrap_or_default();
+    // 2. Build ordered candidate providers
+    let mut candidate_providers: Vec<&crate::settings::PostProcessProvider> = Vec::new();
 
-    // Ask these providers to skip reasoning/thinking — post-processing rarely
-    // benefits from it and it adds seconds of latency. llm_client picks the
-    // field the endpoint understands and retries without it if rejected.
-    let disable_reasoning = matches!(provider.id.as_str(), "custom" | "openrouter");
+    // Check if prompt has a preferred provider bound to it
+    if let Some(preferred_id) = &prompt_obj.preferred_provider_id {
+        if let Some(pref) = settings
+            .post_process_providers
+            .iter()
+            .find(|p| &p.id == preferred_id && p.enabled)
+        {
+            candidate_providers.push(pref);
+        }
+    }
 
-    if provider.supports_structured_output {
-        debug!("Using structured outputs for provider '{}'", provider.id);
+    // Add remaining enabled providers in priority order
+    for provider in &settings.post_process_providers {
+        if provider.enabled && !candidate_providers.iter().any(|p| p.id == provider.id) {
+            candidate_providers.push(provider);
+        }
+    }
 
-        let system_prompt = build_system_prompt(&prompt);
+    if candidate_providers.is_empty() {
+        warn!("Post-processing skipped because no enabled providers were found");
+        return None;
+    }
+
+    // 3. Fallback chain loop
+    for provider in candidate_providers {
+        let model = settings
+            .post_process_models
+            .get(&provider.id)
+            .cloned()
+            .unwrap_or_default();
+
+        let api_key = settings
+            .post_process_api_keys
+            .get(&provider.id)
+            .cloned()
+            .unwrap_or_default();
+
+        // If provider requires an API key and none is set, skip
+        if api_key.trim().is_empty() && provider.id != "custom" && provider.id != "ollama" {
+            debug!("Skipping provider '{}': missing API key", provider.id);
+            continue;
+        }
+
+        let effective_model = if model.trim().is_empty() {
+            crate::settings::default_model_for_provider(&provider.id)
+        } else {
+            model
+        };
+
+        if effective_model.trim().is_empty() {
+            debug!("Skipping provider '{}': no model configured", provider.id);
+            continue;
+        }
+
+        info!(
+            "Attempting LLM post-processing with provider '{}' (model: {}, structured: {})",
+            provider.id, effective_model, provider.supports_structured_output
+        );
+
+        let system_prompt = build_system_prompt(prompt);
         let user_content = transcription.to_string();
 
-        // Handle Apple Intelligence separately since it uses native Swift APIs
-        if provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
-            #[cfg(all(target_os = "macos", target_arch = "aarch64"))]
-            {
-                if !apple_intelligence::check_apple_intelligence_availability() {
-                    debug!(
-                        "Apple Intelligence selected but not currently available on this device"
-                    );
-                    return None;
-                }
+        info!(
+            "Post-processing payload:\n--- System Prompt ---\n{}\n--- User Content ---\n{}",
+            system_prompt, user_content
+        );
 
-                let token_limit = model.trim().parse::<i32>().unwrap_or(0);
-                return match apple_intelligence::process_text_with_system_prompt(
-                    &system_prompt,
-                    &user_content,
-                    token_limit,
-                ) {
-                    Ok(result) => {
-                        if result.trim().is_empty() {
-                            debug!("Apple Intelligence returned an empty response");
-                            None
-                        } else {
-                            let result = strip_invisible_chars(&result);
-                            debug!(
-                                "Apple Intelligence post-processing succeeded. Output length: {} chars",
-                                result.len()
+        if provider.supports_structured_output {
+            let json_schema = serde_json::json!({
+                "type": "object",
+                "properties": {
+                    (TRANSCRIPTION_FIELD): {
+                        "type": "string",
+                        "description": "The cleaned and processed transcription text"
+                    }
+                },
+                "required": [TRANSCRIPTION_FIELD],
+                "additionalProperties": false
+            });
+
+            match crate::llm_client::send_chat_completion_with_schema(
+                provider,
+                api_key.clone(),
+                &effective_model,
+                user_content.clone(),
+                Some(system_prompt.clone()),
+                Some(json_schema),
+                false,
+            )
+            .await
+            {
+                Ok(Some(content)) => {
+                    info!("LLM message content (structured output):\n{}", content);
+                    let content = strip_think_block(&content);
+                    if let Ok(json) = serde_json::from_str::<serde_json::Value>(content) {
+                        if let Some(transcription_val) =
+                            json.get(TRANSCRIPTION_FIELD).and_then(|t| t.as_str())
+                        {
+                            let result = strip_invisible_chars(transcription_val);
+                            info!(
+                                "Post-processing succeeded via provider '{}' (model: {}). Extracted '{}' field:\n{}",
+                                provider.id, effective_model, TRANSCRIPTION_FIELD, result
                             );
-                            Some(result)
+                            return Some(result);
+                        } else {
+                            warn!(
+                                "Structured JSON parsed, but '{}' field was missing: {:?}",
+                                TRANSCRIPTION_FIELD, json
+                            );
                         }
+                    } else {
+                        warn!("Content was not valid JSON, falling back to cleaned raw content.");
                     }
-                    Err(err) => {
-                        error!("Apple Intelligence post-processing failed: {}", err);
-                        None
-                    }
-                };
-            }
-
-            #[cfg(not(all(target_os = "macos", target_arch = "aarch64")))]
-            {
-                debug!("Apple Intelligence provider selected on unsupported platform");
-                return None;
+                    let cleaned = strip_invisible_chars(content);
+                    info!(
+                        "Post-processing succeeded via provider '{}' (model: {}). Final text:\n{}",
+                        provider.id, effective_model, cleaned
+                    );
+                    return Some(cleaned);
+                }
+                Ok(None) => {
+                    warn!(
+                        "Provider '{}' returned empty response. Trying next candidate...",
+                        provider.id
+                    );
+                    continue;
+                }
+                Err(e) => {
+                    warn!(
+                        "Provider '{}' structured request failed: {e}. Trying standard fallback...",
+                        provider.id
+                    );
+                }
             }
         }
 
-        // Define JSON schema for transcription output
-        let json_schema = serde_json::json!({
-            "type": "object",
-            "properties": {
-                (TRANSCRIPTION_FIELD): {
-                    "type": "string",
-                    "description": "The cleaned and processed transcription text"
-                }
-            },
-            "required": [TRANSCRIPTION_FIELD],
-            "additionalProperties": false
-        });
-
-        match crate::llm_client::send_chat_completion_with_schema(
-            &provider,
-            api_key.clone(),
-            &model,
-            user_content,
-            Some(system_prompt),
-            Some(json_schema),
-            disable_reasoning,
+        // Standard completion attempt
+        let processed_prompt = prompt.replace("${output}", transcription);
+        info!(
+            "Standard completion prompt for provider '{}' (model: {}):\n{}",
+            provider.id, effective_model, processed_prompt
+        );
+        match crate::llm_client::send_chat_completion(
+            provider,
+            api_key,
+            &effective_model,
+            processed_prompt,
+            false,
         )
         .await
         {
             Ok(Some(content)) => {
-                // Parse the JSON response to extract the transcription field
-                let content = strip_think_block(&content);
-                match serde_json::from_str::<serde_json::Value>(content) {
-                    Ok(json) => {
-                        if let Some(transcription_value) =
-                            json.get(TRANSCRIPTION_FIELD).and_then(|t| t.as_str())
-                        {
-                            let result = strip_invisible_chars(transcription_value);
-                            debug!(
-                                "Structured output post-processing succeeded for provider '{}'. Output length: {} chars",
-                                provider.id,
-                                result.len()
-                            );
-                            return Some(result);
-                        } else {
-                            error!("Structured output response missing 'transcription' field");
-                            return Some(strip_invisible_chars(content));
-                        }
-                    }
-                    Err(e) => {
-                        error!(
-                            "Failed to parse structured output JSON: {}. Returning raw content.",
-                            e
-                        );
-                        return Some(strip_invisible_chars(content));
-                    }
-                }
+                info!("LLM message content (standard completion):\n{}", content);
+                let cleaned = strip_invisible_chars(strip_think_block(&content));
+                info!(
+                    "Post-processing succeeded via provider '{}' (model: {}). Final text:\n{}",
+                    provider.id, effective_model, cleaned
+                );
+                return Some(cleaned);
             }
             Ok(None) => {
-                error!("LLM API response has no content");
-                return None;
+                warn!(
+                    "Provider '{}' returned empty response. Trying next candidate...",
+                    provider.id
+                );
             }
             Err(e) => {
                 warn!(
-                    "Structured output failed for provider '{}': {}. Falling back to legacy mode.",
-                    provider.id, e
+                    "Provider '{}' failed: {e}. Trying next candidate...",
+                    provider.id
                 );
-                // Fall through to legacy mode below
             }
         }
     }
 
-    // Legacy mode: Replace ${output} variable in the prompt with the actual text
-    let processed_prompt = prompt.replace("${output}", transcription);
-    debug!("Processed prompt length: {} chars", processed_prompt.len());
-
-    match crate::llm_client::send_chat_completion(
-        &provider,
-        api_key,
-        &model,
-        processed_prompt,
-        disable_reasoning,
-    )
-    .await
-    {
-        Ok(Some(content)) => {
-            let content = strip_invisible_chars(strip_think_block(&content));
-            debug!(
-                "LLM post-processing succeeded for provider '{}'. Output length: {} chars",
-                provider.id,
-                content.len()
-            );
-            Some(content)
-        }
-        Ok(None) => {
-            error!("LLM API response has no content");
-            None
-        }
-        Err(e) => {
-            error!(
-                "LLM post-processing failed for provider '{}': {}. Falling back to original transcription.",
-                provider.id,
-                e
-            );
-            None
-        }
-    }
+    warn!("All configured post-processing providers failed. Falling back to raw transcription.");
+    None
 }
 
 async fn maybe_convert_chinese_variant(
@@ -454,13 +464,19 @@ impl ShortcutAction for TranscribeAction {
         let start_time = Instant::now();
         debug!("TranscribeAction::start called for binding: {}", binding_id);
 
-        // Load model in the background
+        // Load model in the background if local mode is enabled
         let tm = &ctx.transcription;
         let rm = &ctx.audio;
+        let mut recording_error: Option<String> = None;
 
-        // Load ASR model and VAD model in parallel
+        let settings = get_settings(ctx);
+        let is_always_on = settings.always_on_microphone;
+
+        // Load ASR model (if local mode is active) and VAD model in parallel
         let kickoff_started = Instant::now();
-        tm.initiate_model_load();
+        if settings.local_transcription_enabled {
+            tm.initiate_model_load();
+        }
         let rm_clone = Arc::clone(rm);
         std::thread::spawn(move || {
             if let Err(e) = rm_clone.preload_vad() {
@@ -476,18 +492,32 @@ impl ShortcutAction for TranscribeAction {
 
         // Get the microphone mode to determine audio feedback timing
         let plan_started = Instant::now();
-        let settings = get_settings(ctx);
-        let is_always_on = settings.always_on_microphone;
+        let selected_model_info = if settings.local_transcription_enabled {
+            ctx.model.get_model_info(&settings.selected_model)
+        } else {
+            None
+        };
 
-        let selected_model_info = ctx.model.get_model_info(&settings.selected_model);
+        if settings.local_transcription_enabled && selected_model_info.is_none() {
+            warn!(
+                "No speech-to-text model selected or found on disk: '{}'",
+                settings.selected_model
+            );
+            recording_error =
+                Some("No model selected. Please choose a model in Settings -> Models, or enable Cloud Providers in Settings -> Providers.".to_string());
+        }
 
         // Use the app-facing model capability as the single pre-recording source
         // for live streaming decisions. Unknown support is represented as false
         // until the model registry is updated by discovery or runtime load.
-        let model_supports_streaming = selected_model_info
-            .as_ref()
-            .map(|m| m.supports_streaming)
-            .unwrap_or(false);
+        let model_supports_streaming = if settings.local_transcription_enabled {
+            selected_model_info
+                .as_ref()
+                .map(|m| m.supports_streaming)
+                .unwrap_or(false)
+        } else {
+            settings.is_deepgram_streaming_active()
+        };
         let vad_policy = if !settings.vad_enabled {
             VadPolicy::Disabled
         } else if model_supports_streaming {
@@ -495,7 +525,7 @@ impl ShortcutAction for TranscribeAction {
         } else {
             VadPolicy::Offline
         };
-        if model_supports_streaming {
+        if recording_error.is_none() && model_supports_streaming {
             tm.start_stream();
         }
         let plan_elapsed = plan_started.elapsed();
@@ -504,10 +534,14 @@ impl ShortcutAction for TranscribeAction {
         // doesn't stream (or whose capability is not known yet) gets the compact
         // pill instead of an oversized transparent live window.
         let overlay_started = Instant::now();
-        match settings.overlay_style {
-            OverlayStyle::Live if model_supports_streaming => utils::show_streaming_overlay(ctx),
-            OverlayStyle::Live | OverlayStyle::Minimal => show_recording_overlay(ctx),
-            OverlayStyle::None => {} // show_overlay_state no-ops on None anyway
+        if recording_error.is_none() {
+            match settings.overlay_style {
+                OverlayStyle::Live if model_supports_streaming => {
+                    utils::show_streaming_overlay(ctx)
+                }
+                OverlayStyle::Live | OverlayStyle::Minimal => show_recording_overlay(ctx),
+                OverlayStyle::None => {} // show_overlay_state no-ops on None anyway
+            }
         }
         // Everything above runs before capture can begin, so each span here is
         // added keypress->capture latency.
@@ -520,61 +554,64 @@ impl ShortcutAction for TranscribeAction {
         );
         debug!("Microphone mode - always_on: {}", is_always_on);
 
-        let mut recording_error: Option<String> = None;
         let recording_start_time = Instant::now();
-        match rm.try_start_recording(&binding_id, vad_policy) {
-            Ok(readiness) => {
-                debug!(
-                    "Recording request accepted in {:?}; waiting for first microphone samples",
-                    recording_start_time.elapsed()
-                );
-                let generation = readiness.generation();
-                let app_clone = ctx.clone();
-                let rm_clone = Arc::clone(rm);
-                std::thread::spawn(move || {
-                    if !readiness.wait() {
-                        debug!("Microphone readiness wait ended without receiving samples");
-                        return;
-                    }
-
-                    // Development-only preview hook for evaluating the brief
-                    // arming animation on hardware that normally starts too fast
-                    // to make it visible.
-                    #[cfg(debug_assertions)]
-                    if let Ok(delay_ms) = std::env::var("OTUSH_DEBUG_MIC_READY_DELAY_MS")
-                        .unwrap_or_default()
-                        .parse::<u64>()
-                    {
-                        let delay_ms = delay_ms.min(10_000);
-                        if delay_ms > 0 {
-                            debug!("Delaying microphone-ready cue by {delay_ms}ms for UI preview");
-                            std::thread::sleep(Duration::from_millis(delay_ms));
+        if recording_error.is_none() {
+            match rm.try_start_recording(&binding_id, vad_policy) {
+                Ok(readiness) => {
+                    debug!(
+                        "Recording request accepted in {:?}; waiting for first microphone samples",
+                        recording_start_time.elapsed()
+                    );
+                    let generation = readiness.generation();
+                    let app_clone = ctx.clone();
+                    let rm_clone = Arc::clone(rm);
+                    std::thread::spawn(move || {
+                        if !readiness.wait() {
+                            debug!("Microphone readiness wait ended without receiving samples");
+                            return;
                         }
-                    }
 
-                    if !rm_clone.is_recording_readiness_current(generation) {
-                        debug!("Microphone became ready for an inactive recording");
-                        return;
-                    }
+                        // Development-only preview hook for evaluating the brief
+                        // arming animation on hardware that normally starts too fast
+                        // to make it visible.
+                        #[cfg(debug_assertions)]
+                        if let Ok(delay_ms) = std::env::var("OTUSH_DEBUG_MIC_READY_DELAY_MS")
+                            .unwrap_or_default()
+                            .parse::<u64>()
+                        {
+                            let delay_ms = delay_ms.min(10_000);
+                            if delay_ms > 0 {
+                                debug!(
+                                    "Delaying microphone-ready cue by {delay_ms}ms for UI preview"
+                                );
+                                std::thread::sleep(Duration::from_millis(delay_ms));
+                            }
+                        }
 
-                    debug!("Microphone is receiving samples; recording is ready");
-                    utils::emit_recording_ready(&app_clone);
+                        if !rm_clone.is_recording_readiness_current(generation) {
+                            debug!("Microphone became ready for an inactive recording");
+                            return;
+                        }
 
-                    // The start chime is a readiness cue, so it must follow the
-                    // first real input callback rather than Stream::play() or a
-                    // fixed delay. The helper returns immediately when feedback
-                    // is disabled; mute still follows the same readiness point.
-                    if rm_clone.is_recording_readiness_current(generation) {
-                        play_feedback_sound_blocking(&app_clone, SoundType::Start);
-                    }
-                    if rm_clone.is_recording_readiness_current(generation) {
-                        rm_clone.apply_mute();
-                    }
-                });
-            }
-            Err(e) => {
-                debug!("Failed to start recording: {}", e);
-                recording_error = Some(e);
+                        debug!("Microphone is receiving samples; recording is ready");
+                        utils::emit_recording_ready(&app_clone);
+
+                        // The start chime is a readiness cue, so it must follow the
+                        // first real input callback rather than Stream::play() or a
+                        // fixed delay. The helper returns immediately when feedback
+                        // is disabled; mute still follows the same readiness point.
+                        if rm_clone.is_recording_readiness_current(generation) {
+                            play_feedback_sound_blocking(&app_clone, SoundType::Start);
+                        }
+                        if rm_clone.is_recording_readiness_current(generation) {
+                            rm_clone.apply_mute();
+                        }
+                    });
+                }
+                Err(e) => {
+                    debug!("Failed to start recording: {}", e);
+                    recording_error = Some(e);
+                }
             }
         }
 
@@ -582,11 +619,12 @@ impl ShortcutAction for TranscribeAction {
             // Dynamically register the cancel shortcut in a separate task to avoid deadlock
             shortcut::register_cancel_shortcut(ctx);
         } else {
-            // Starting failed (for example due to blocked microphone permissions).
-            // Revert UI state so we don't stay stuck in the recording overlay.
+            // Starting failed (for example due to missing model or blocked microphone permissions).
+            // Revert UI and coordinator state so we don't stay stuck in recording mode.
             tm.cancel_stream();
             utils::hide_recording_overlay(ctx);
             set_tray_state(ctx, TrayIconState::Idle);
+            ctx.coordinator.notify_cancel(false);
             if let Some(err) = recording_error {
                 let error_type = if is_microphone_access_denied(&err) {
                     "microphone_permission_denied"
@@ -598,9 +636,10 @@ impl ShortcutAction for TranscribeAction {
                 ctx.bus.send(AppEvent::RecordingError(
                     crate::context::RecordingErrorEvent {
                         error_type: error_type.to_string(),
-                        detail: Some(err),
+                        detail: Some(err.clone()),
                     },
                 ));
+                ctx.bus.send(AppEvent::TranscriptionError(err));
             }
         }
 
@@ -611,6 +650,9 @@ impl ShortcutAction for TranscribeAction {
     }
 
     fn stop(&self, ctx: &AppContext, binding_id: &str, _shortcut_str: &str) {
+        // Stop any pending Push-to-Talk release polling
+        crate::shortcut::ptt::cancel_ptt_release_watcher();
+
         // Prevent a slow microphone from emitting a ready event or start chime
         // after the user has already requested stop.
         ctx.audio.invalidate_recording_readiness();
@@ -682,7 +724,23 @@ impl ShortcutAction for TranscribeAction {
                     utils::hide_recording_overlay(&ah);
                     set_tray_state(&ah, TrayIconState::Idle);
                 } else {
-                    // Save WAV concurrently with transcription
+                    let settings = get_settings(&ah);
+
+                    // Apply voice enhancement DSP (software gain, 80Hz rumble filter, noise gate, AGC normalization)
+                    let mut samples = samples;
+                    let dsp_config = crate::audio_toolkit::audio::VoiceEnhancerConfig {
+                        input_gain: settings.audio_input_gain,
+                        high_pass_filter: settings.audio_high_pass_filter_enabled,
+                        noise_reduction: settings.audio_noise_reduction_enabled,
+                        noise_gate_threshold_db: settings.audio_noise_gate_threshold_db,
+                        normalization: settings.audio_normalization_enabled,
+                    };
+                    crate::audio_toolkit::audio::VoiceEnhancer::process_with_config(
+                        &mut samples,
+                        &dsp_config,
+                    );
+
+                    // Save enhanced WAV concurrently with transcription
                     let sample_count = samples.len();
                     let file_name = format!("Otush-{}.wav", chrono::Utc::now().timestamp());
                     let wav_path = hm.recordings_dir().join(&file_name);
@@ -696,16 +754,36 @@ impl ShortcutAction for TranscribeAction {
                     // running, finalize it and use its text (all audio was already
                     // fed to the stream); otherwise batch-transcribe the samples.
                     let transcription_time = Instant::now();
-                    let transcription_result = match tm.finalize_stream() {
-                        // A finalized stream with usable text wins. An empty result
-                        // (no active stream, produced nothing, or a finalize error
-                        // after the engine was returned) falls back to a full batch
-                        // transcription of the same audio. A finalize timeout is
-                        // surfaced instead — the worker may still hold the engine,
-                        // so a batch fallback would contend with it.
-                        Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
-                        Ok(_) => tm.transcribe(samples),
-                        Err(err) => Err(err),
+                    let settings = get_settings(&ah);
+                    let transcription_result = if settings.local_transcription_enabled {
+                        match tm.finalize_stream() {
+                            Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
+                            Ok(_) => match tm.transcribe(samples.clone()) {
+                                Ok(text) => Ok(text),
+                                Err(err) => {
+                                    warn!("Local transcription error: {err}. Attempting cloud fallback...");
+                                    crate::stt_client::transcribe_with_fallback(&settings, &samples)
+                                        .await
+                                }
+                            },
+                            Err(err) => {
+                                warn!("Local streaming finalize error: {err}. Attempting cloud fallback...");
+                                crate::stt_client::transcribe_with_fallback(&settings, &samples)
+                                    .await
+                            }
+                        }
+                    } else if settings.is_deepgram_streaming_active() {
+                        match tm.finalize_stream() {
+                            Ok(Some(text)) if !text.trim().is_empty() => Ok(text),
+                            Ok(_) | Err(_) => {
+                                warn!("Deepgram streaming finalize was empty or errored; falling back to batch...");
+                                crate::stt_client::transcribe_with_fallback(&settings, &samples)
+                                    .await
+                            }
+                        }
+                    } else {
+                        tm.cancel_stream();
+                        crate::stt_client::transcribe_with_fallback(&settings, &samples).await
                     };
 
                     // Await WAV save and verify
@@ -830,7 +908,7 @@ impl ShortcutAction for TranscribeAction {
                             error!("Transcription failed: {}", err);
                             // Surface the failure to the UI (toast). The full
                             // message is also in otush.log via the line above.
-                            ah.bus.send(AppEvent::TranscriptionError(err.to_string()));
+                            ah.bus.send(AppEvent::TranscriptionError(err));
                             // Save entry with empty text so user can retry
                             if wav_saved {
                                 if let Err(save_err) = hm.save_entry(
@@ -898,8 +976,20 @@ impl ShortcutAction for TestAction {
     }
 }
 
+#[derive(Debug)]
+pub struct TransformSelectionAction;
+
+impl ShortcutAction for TransformSelectionAction {
+    fn start(&self, ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {
+        log::info!("TransformSelectionAction triggered");
+        crate::ui::prompt_palette::show_prompt_palette(ctx);
+    }
+
+    fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
+}
+
 // Static Action Map
-pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::new(|| {
+pub static ACTION_MAP: LazyLock<HashMap<String, Arc<dyn ShortcutAction>>> = LazyLock::new(|| {
     let mut map = HashMap::new();
     map.insert(
         "transcribe".to_string(),
@@ -910,6 +1000,10 @@ pub static ACTION_MAP: Lazy<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy::ne
     map.insert(
         "transcribe_with_post_process".to_string(),
         Arc::new(TranscribeAction { post_process: true }) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "transform_selection".to_string(),
+        Arc::new(TransformSelectionAction) as Arc<dyn ShortcutAction>,
     );
     map.insert(
         "cancel".to_string(),

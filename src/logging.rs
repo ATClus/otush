@@ -19,7 +19,10 @@ pub static FILE_LOG_LEVEL: AtomicU8 = AtomicU8::new(LevelFilter::Debug as u8);
 /// debug mode — the live log viewer is its only consumer and only exists in
 /// debug mode — so normal runs never broadcast log records (which can include
 /// file paths or transcribed text) onto the UI event bus.
-pub static WEBVIEW_LOG_STREAMING: AtomicBool = AtomicBool::new(false);
+pub static UI_LOG_STREAMING: AtomicBool = AtomicBool::new(false);
+
+/// Deprecated alias for [`UI_LOG_STREAMING`].
+pub static WEBVIEW_LOG_STREAMING: &AtomicBool = &UI_LOG_STREAMING;
 
 fn level_filter_from_u8(value: u8) -> LevelFilter {
     match value {
@@ -55,8 +58,7 @@ fn build_console_filter() -> env_filter::Filter {
     builder.build()
 }
 
-/// Global logger: console (stderr, RUST_LOG-filtered) + file + optional UI
-/// streaming. Mirrors the old tauri-plugin-log target configuration.
+/// Global logger: console (stderr, RUST_LOG-filtered) + file + optional UI streaming.
 struct OtushLogger {
     console_filter: env_filter::Filter,
     file: Mutex<Option<File>>,
@@ -65,7 +67,7 @@ struct OtushLogger {
 
 impl log::Log for OtushLogger {
     fn enabled(&self, metadata: &Metadata) -> bool {
-        let ui_streaming = WEBVIEW_LOG_STREAMING.load(Ordering::Relaxed)
+        let ui_streaming = UI_LOG_STREAMING.load(Ordering::Relaxed)
             && metadata.level() <= level_filter_from_u8(FILE_LOG_LEVEL.load(Ordering::Relaxed));
         self.console_filter.enabled(metadata) || ui_streaming
     }
@@ -93,7 +95,7 @@ impl log::Log for OtushLogger {
         }
 
         // UI streaming (debug live log viewer).
-        if WEBVIEW_LOG_STREAMING.load(Ordering::Relaxed) && record.level() <= file_level {
+        if UI_LOG_STREAMING.load(Ordering::Relaxed) && record.level() <= file_level {
             if let Some(bus) = &self.bus {
                 bus.send(AppEvent::LogRecord(format!(
                     "[{:<5}] {}",
@@ -138,5 +140,5 @@ pub fn apply_log_level(ctx: &AppContext) {
     };
     FILE_LOG_LEVEL.store(level.to_level_filter() as u8, Ordering::Relaxed);
     // Only forward logs to the UI while debug mode is on.
-    WEBVIEW_LOG_STREAMING.store(settings.debug_mode, Ordering::Relaxed);
+    UI_LOG_STREAMING.store(settings.debug_mode, Ordering::Relaxed);
 }

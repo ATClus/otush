@@ -20,6 +20,7 @@ use ashpd::desktop::Session;
 use futures_util::StreamExt;
 use log::{debug, warn};
 use std::collections::HashMap;
+use std::str::FromStr;
 use std::sync::atomic::AtomicBool;
 use std::sync::{Arc, Mutex, OnceLock};
 
@@ -42,21 +43,42 @@ pub fn is_initialized() -> bool {
     PORTAL_READY.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// The portal could not be used (no app id in dev launches, unsupported
-/// session, bind rejected). Fall back to the evdev-keys (evdev) engine and
-/// persist the choice so later launches go straight there.
-fn fallback_to_evdev(ctx: &AppContext, reason: &str) {
-    warn!("{reason}; falling back to the evdev-keys shortcut engine");
-    let mut settings = crate::settings::get_settings(ctx);
-    if settings.keyboard_implementation == crate::settings::KeyboardImplementation::Portal {
-        settings.keyboard_implementation = crate::settings::KeyboardImplementation::Evdev;
-        crate::settings::write_settings(ctx, settings);
-    }
-    let _ = crate::shortcut::evdev::init_shortcuts(ctx);
-}
-
 fn desired_map() -> Arc<Mutex<HashMap<String, ShortcutBinding>>> {
     Arc::clone(DESIRED.get_or_init(|| Arc::new(Mutex::new(HashMap::new()))))
+}
+
+fn format_portal_trigger(binding: &str) -> String {
+    let parts: Vec<String> = binding
+        .split('+')
+        .map(|token| match token.trim().to_lowercase().as_str() {
+            "ctrl" | "control" => "Ctrl".to_string(),
+            "alt" | "opt" | "option" => "Alt".to_string(),
+            "shift" => "Shift".to_string(),
+            "super" | "win" | "meta" | "cmd" | "command" => "Super".to_string(),
+            "space" => "Space".to_string(),
+            "esc" | "escape" => "Escape".to_string(),
+            "enter" | "return" => "Return".to_string(),
+            "tab" => "Tab".to_string(),
+            "backspace" => "BackSpace".to_string(),
+            "delete" => "Delete".to_string(),
+            "insert" => "Insert".to_string(),
+            "pause" => "Pause".to_string(),
+            "home" => "Home".to_string(),
+            "end" => "End".to_string(),
+            "pageup" | "prior" => "Page_Up".to_string(),
+            "pagedown" | "next" => "Page_Down".to_string(),
+            "scroll_lock" | "scrolllock" => "Scroll_Lock".to_string(),
+            other if other.len() == 1 => other.to_uppercase(),
+            other => {
+                let mut c = other.chars();
+                match c.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                    None => other.to_string(),
+                }
+            }
+        })
+        .collect();
+    parts.join("+")
 }
 
 /// Send the current desired list to the portal.
@@ -64,15 +86,26 @@ async fn rebind(
     handle: &PortalHandle,
     desired: &Arc<Mutex<HashMap<String, ShortcutBinding>>>,
 ) -> Result<usize, String> {
-    let shortcuts: Vec<NewShortcut> = {
+    let formatted_triggers: Vec<(String, String, String)> = {
         let map = desired.lock().unwrap();
         map.values()
             .map(|b| {
-                NewShortcut::new(b.id.clone(), b.name.clone())
-                    .preferred_trigger(Some(b.current_binding.as_str()))
+                (
+                    b.id.clone(),
+                    b.name.clone(),
+                    format_portal_trigger(&b.current_binding),
+                )
             })
             .collect()
     };
+
+    let shortcuts: Vec<NewShortcut> = formatted_triggers
+        .iter()
+        .map(|(id, name, trigger)| {
+            NewShortcut::new(id.clone(), name.clone()).preferred_trigger(Some(trigger.as_str()))
+        })
+        .collect();
+
     let request = handle
         .proxy
         .bind_shortcuts(
@@ -83,8 +116,14 @@ async fn rebind(
         )
         .await
         .map_err(|e| e.to_string())?;
-    let response = request.response().map_err(|e| e.to_string())?;
-    Ok(response.shortcuts().len())
+
+    match request.response() {
+        Ok(response) => Ok(response.shortcuts().len()),
+        Err(e) => {
+            debug!("Portal bind_shortcuts status: {e}");
+            Ok(0)
+        }
+    }
 }
 
 /// Initialize the portal engine: establish a session, bind the current
@@ -111,6 +150,19 @@ pub fn init_shortcuts(ctx: &AppContext) {
 
     let ctx = ctx.clone();
     crate::runtime::spawn(async move {
+        // Ensure desktop entry and prgname are registered for XDG Desktop Portal
+        glib::set_prgname(Some("com.clusterat.otush"));
+        crate::autostart::ensure_desktop_entry_registered();
+
+        // Modern xdg-desktop-portal (GNOME 46+) requires host apps to register their App ID
+        if let Ok(app_id) = ashpd::AppID::from_str("com.clusterat.otush") {
+            if !ashpd::is_sandboxed() {
+                if let Err(e) = ashpd::register_host_app(app_id).await {
+                    debug!("Host app registration note: {e}");
+                }
+            }
+        }
+
         // Establish the portal session and bind the current shortcuts.
         let setup = async {
             let proxy = GlobalShortcuts::new().await.map_err(|e| e.to_string())?;
@@ -153,7 +205,9 @@ pub fn init_shortcuts(ctx: &AppContext) {
                     }
                 }
             }
-            Err(e) => fallback_to_evdev(&ctx, &e),
+            Err(e) => {
+                warn!("Global shortcuts portal could not be initialized: {e}");
+            }
         }
     });
 }
@@ -196,13 +250,15 @@ pub fn unregister_cancel_shortcut(_ctx: &AppContext) {
     let _ = REBIND_TX.get().map(|tx| tx.try_send(()));
 }
 
-/// Validate a shortcut string for the portal engine. Accepts the same
-/// modifier+key grammar as the evdev-keys engine.
+/// Validate a shortcut string for the portal engine (e.g. "Ctrl+Space", "Super+Shift+R").
 pub fn validate_shortcut(raw: &str) -> Result<(), String> {
-    if raw.trim().is_empty() {
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
         return Err("Shortcut cannot be empty".into());
     }
-    raw.parse::<evdev_keys::Hotkey>()
-        .map(|_| ())
-        .map_err(|e| format!("Invalid shortcut: {}", e))
+    let parts: Vec<&str> = trimmed.split('+').map(str::trim).collect();
+    if parts.is_empty() || parts.iter().any(|p| p.is_empty()) {
+        return Err("Invalid shortcut format".into());
+    }
+    Ok(())
 }

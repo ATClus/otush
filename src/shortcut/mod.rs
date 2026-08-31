@@ -1,90 +1,48 @@
 #![allow(dead_code)]
 //! Keyboard shortcut management module
 //!
-//! Unified interface for keyboard shortcuts with multiple backend
-//! implementations:
-//!
-//! - `portal`: XDG Desktop Portal GlobalShortcuts (Wayland-native; GNOME) —
-//!   see [`portal`]
-//! - `evdev`: uses the evdev-keys library (evdev) for more control
-//!
-//! The active implementation is determined by the `keyboard_implementation`
-//! setting and can be changed at runtime.
+//! Native GNOME/Wayland keyboard shortcuts via XDG Desktop Portal GlobalShortcuts
+//! (see [`portal`]).
 
 pub mod evdev;
 mod handler;
 mod portal;
+pub mod ptt;
 
 use crate::context::{AppContext, AppEvent};
 use crate::settings::{
     self, get_settings, AutoSubmitKey, ClipboardHandling, KeyboardImplementation, LLMPrompt,
     OverlayPosition, OverlayStyle, PasteMethod, ShortcutBinding, SoundTheme, Theme, TypingTool,
-    VadBackend, APPLE_INTELLIGENCE_PROVIDER_ID,
+    VadBackend,
 };
 use crate::tray;
-use log::{debug, error, info, warn};
+use log::{debug, error, warn};
 use serde::Serialize;
 
-/// Initialize shortcuts using the configured implementation
+/// Initialize shortcuts using XDG Desktop Portal and Direct Evdev Keyboard Listener
 pub fn init_shortcuts(ctx: &AppContext) {
-    let user_settings = settings::load_or_create_app_settings(ctx);
-
-    // Check which implementation to use
-    match user_settings.keyboard_implementation {
-        KeyboardImplementation::Portal => {
-            portal::init_shortcuts(ctx);
-        }
-        KeyboardImplementation::Evdev => {
-            if let Err(e) = evdev::init_shortcuts(ctx) {
-                error!("Failed to initialize evdev-keys shortcuts: {}", e);
-                // Fall back to the portal implementation and persist this fallback
-                warn!("Falling back to portal global shortcut implementation and saving fallback to settings");
-
-                // Update settings to persist the fallback so we don't retry Evdev on next launch
-                let mut settings = settings::get_settings(ctx);
-                settings.keyboard_implementation = KeyboardImplementation::Portal;
-                settings::write_settings(ctx, settings);
-
-                portal::init_shortcuts(ctx);
-            }
-        }
-    }
+    portal::init_shortcuts(ctx);
+    evdev::init_shortcuts(ctx);
 }
 
 /// Register the cancel shortcut (called when recording starts)
 pub fn register_cancel_shortcut(ctx: &AppContext) {
-    let settings = get_settings(ctx);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Portal => portal::register_cancel_shortcut(ctx),
-        KeyboardImplementation::Evdev => evdev::register_cancel_shortcut(ctx),
-    }
+    portal::register_cancel_shortcut(ctx);
 }
 
 /// Unregister the cancel shortcut (called when recording stops)
 pub fn unregister_cancel_shortcut(ctx: &AppContext) {
-    let settings = get_settings(ctx);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Portal => portal::unregister_cancel_shortcut(ctx),
-        KeyboardImplementation::Evdev => evdev::unregister_cancel_shortcut(ctx),
-    }
+    portal::unregister_cancel_shortcut(ctx);
 }
 
-/// Register a shortcut using the appropriate implementation
+/// Register a shortcut
 pub fn register_shortcut(ctx: &AppContext, binding: ShortcutBinding) -> Result<(), String> {
-    let settings = get_settings(ctx);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Portal => portal::register_shortcut(ctx, binding),
-        KeyboardImplementation::Evdev => evdev::register_shortcut(ctx, binding),
-    }
+    portal::register_shortcut(ctx, binding)
 }
 
-/// Unregister a shortcut using the appropriate implementation
+/// Unregister a shortcut
 pub fn unregister_shortcut(ctx: &AppContext, binding: ShortcutBinding) -> Result<(), String> {
-    let settings = get_settings(ctx);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Portal => portal::unregister_shortcut(ctx, binding),
-        KeyboardImplementation::Evdev => evdev::unregister_shortcut(ctx, binding),
-    }
+    portal::unregister_shortcut(ctx, binding)
 }
 
 // ============================================================================
@@ -147,7 +105,7 @@ pub fn change_binding(
             settings::write_settings(ctx, settings);
             return Ok(BindingResponse {
                 success: true,
-                binding: Some(b.clone()),
+                binding: Some(b),
                 error: None,
             });
         }
@@ -214,6 +172,58 @@ pub fn reset_binding(ctx: &AppContext, id: String) -> Result<BindingResponse, St
     change_binding(ctx, id, binding.default_binding)
 }
 
+pub fn add_custom_binding(
+    ctx: &AppContext,
+    id: String,
+    name: String,
+    description: String,
+    binding: String,
+) -> Result<BindingResponse, String> {
+    if binding.trim().is_empty() {
+        return Err("Binding cannot be empty".to_string());
+    }
+
+    let mut settings = settings::get_settings(ctx);
+
+    validate_shortcut_for_implementation(&binding, settings.keyboard_implementation)?;
+
+    let shortcut_binding = ShortcutBinding {
+        id: id.clone(),
+        name,
+        description,
+        default_binding: binding.clone(),
+        current_binding: binding,
+    };
+
+    if let Err(e) = register_shortcut(ctx, shortcut_binding.clone()) {
+        return Ok(BindingResponse {
+            success: false,
+            binding: None,
+            error: Some(format!("Failed to register shortcut: {e}")),
+        });
+    }
+
+    settings.bindings.insert(id, shortcut_binding.clone());
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("bindings", serde_json::json!(&shortcut_binding));
+
+    Ok(BindingResponse {
+        success: true,
+        binding: Some(shortcut_binding),
+        error: None,
+    })
+}
+
+pub fn remove_custom_binding(ctx: &AppContext, id: &str) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(binding) = settings.bindings.remove(id) {
+        let _ = unregister_shortcut(ctx, binding);
+        ctx.notify_setting_changed("bindings", serde_json::json!(&settings.bindings));
+        settings::write_settings(ctx, settings);
+    }
+    Ok(())
+}
+
 /// Unregister every binding while the user is recording a new shortcut in
 /// the UI, so no existing shortcut can fire — or swallow the keystrokes —
 /// mid-capture. The "cancel" binding is untouched: it is managed dynamically
@@ -264,228 +274,73 @@ pub fn resume_all_bindings(ctx: &AppContext) -> Result<(), String> {
 }
 
 // ============================================================================
-// Keyboard Implementation Switching
+// Keyboard Implementation (Portal)
 // ============================================================================
 
 /// Result of changing keyboard implementation
 #[derive(Serialize)]
 pub struct ImplementationChangeResult {
     pub success: bool,
-    /// List of binding IDs that were reset to defaults due to incompatibility
     pub reset_bindings: Vec<String>,
 }
 
-/// Change the keyboard implementation with runtime switching.
-/// This will unregister all shortcuts from the old implementation,
-/// validate shortcuts for the new implementation (resetting invalid ones to defaults),
-/// and register them with the new implementation.
 pub fn change_keyboard_implementation_setting(
-    ctx: &AppContext,
-    implementation: String,
+    _ctx: &AppContext,
+    _implementation: String,
 ) -> Result<ImplementationChangeResult, String> {
-    let current_settings = settings::get_settings(ctx);
-    let current_impl = current_settings.keyboard_implementation;
-    let new_impl = parse_keyboard_implementation(&implementation);
-
-    // If same implementation, nothing to do
-    if current_impl == new_impl {
-        return Ok(ImplementationChangeResult {
-            success: true,
-            reset_bindings: vec![],
-        });
-    }
-
-    info!(
-        "Switching keyboard implementation from {:?} to {:?}",
-        current_impl, new_impl
-    );
-
-    // Unregister all shortcuts from the current implementation
-    unregister_all_shortcuts(ctx, current_impl);
-
-    // Update the setting
-    let mut settings = settings::get_settings(ctx);
-    settings.keyboard_implementation = new_impl;
-    settings::write_settings(ctx, settings);
-
-    // Initialize new implementation if needed (Evdev needs state)
-    if new_impl == KeyboardImplementation::Evdev && initialize_evdev_with_rollback(ctx)? {
-        // Shortcuts already registered during init.
-        return Ok(ImplementationChangeResult {
-            success: true,
-            reset_bindings: vec![],
-        });
-    }
-
-    // Register all shortcuts with new implementation, resetting invalid ones
-    let reset_bindings = register_all_shortcuts_for_implementation(ctx, new_impl);
-
-    // Emit event to notify the UI of the change
-    ctx.bus.send(AppEvent::SettingsChanged {
-        setting: "keyboard_implementation".to_string(),
-        value: serde_json::json!({
-            "value": implementation,
-            "reset_bindings": reset_bindings
-        }),
-    });
-
-    info!("Keyboard implementation switched to {:?}", new_impl);
-
     Ok(ImplementationChangeResult {
         success: true,
-        reset_bindings,
+        reset_bindings: vec![],
     })
 }
 
-/// Get the current keyboard implementation
-pub fn get_keyboard_implementation(ctx: &AppContext) -> String {
-    let settings = settings::get_settings(ctx);
-    match settings.keyboard_implementation {
-        KeyboardImplementation::Portal => "portal".to_string(),
-        KeyboardImplementation::Evdev => "evdev".to_string(),
-    }
+pub fn get_keyboard_implementation(_ctx: &AppContext) -> String {
+    "portal".to_string()
 }
 
-// ============================================================================
-// Validation Helpers
-// ============================================================================
-
-/// Validate a shortcut for a specific implementation
 fn validate_shortcut_for_implementation(
     raw: &str,
-    implementation: KeyboardImplementation,
+    _implementation: KeyboardImplementation,
 ) -> Result<(), String> {
-    match implementation {
-        KeyboardImplementation::Portal => portal::validate_shortcut(raw),
-        KeyboardImplementation::Evdev => evdev::validate_shortcut(raw),
-    }
+    portal::validate_shortcut(raw)
 }
 
-/// Parse a keyboard implementation string into the enum
-fn parse_keyboard_implementation(s: &str) -> KeyboardImplementation {
-    match s {
-        "portal" => KeyboardImplementation::Portal,
-        "evdev" => KeyboardImplementation::Evdev,
-        other => {
-            warn!(
-                "Invalid keyboard implementation '{}', defaulting to portal",
-                other
-            );
-            KeyboardImplementation::Portal
-        }
-    }
+fn parse_keyboard_implementation(_s: &str) -> KeyboardImplementation {
+    KeyboardImplementation::Portal
 }
 
-/// Unregister all shortcuts for the current implementation
-fn unregister_all_shortcuts(ctx: &AppContext, implementation: KeyboardImplementation) {
+fn unregister_all_shortcuts(ctx: &AppContext, _implementation: KeyboardImplementation) {
     let bindings = settings::get_bindings(ctx);
-
     for (id, binding) in bindings {
-        // Skip cancel shortcut as it's dynamically registered
         if id == "cancel" {
             continue;
         }
-
-        let result = match implementation {
-            KeyboardImplementation::Portal => portal::unregister_shortcut(ctx, binding),
-            KeyboardImplementation::Evdev => evdev::unregister_shortcut(ctx, binding),
-        };
-
-        if let Err(e) = result {
-            warn!(
-                "Failed to unregister shortcut '{}' during switch: {}",
-                id, e
-            );
-        }
+        let _ = portal::unregister_shortcut(ctx, binding);
     }
 }
 
-/// Register all shortcuts for a specific implementation, validating and resetting invalid ones
 fn register_all_shortcuts_for_implementation(
     ctx: &AppContext,
-    implementation: KeyboardImplementation,
+    _implementation: KeyboardImplementation,
 ) -> Vec<String> {
-    let mut reset_bindings = Vec::new();
     let default_bindings = settings::get_default_settings().bindings;
-    let mut current_settings = settings::get_settings(ctx);
+    let current_settings = settings::get_settings(ctx);
 
     for (id, default_binding) in &default_bindings {
-        // Skip cancel shortcut as it's dynamically registered
         if id == "cancel" {
             continue;
         }
-
-        // Skip post-processing shortcut when the feature is disabled
         if id == "transcribe_with_post_process" && !current_settings.post_process_enabled {
             continue;
         }
-
-        let mut binding = current_settings
+        let binding = current_settings
             .bindings
             .get(id)
             .cloned()
             .unwrap_or_else(|| default_binding.clone());
-
-        // Validate the shortcut for the target implementation
-        if let Err(e) =
-            validate_shortcut_for_implementation(&binding.current_binding, implementation)
-        {
-            info!(
-                "Shortcut '{}' ({}) is invalid for {:?}: {}. Resetting to default.",
-                id, binding.current_binding, implementation, e
-            );
-
-            // Reset to default
-            binding.current_binding = default_binding.current_binding.clone();
-            current_settings
-                .bindings
-                .insert(id.clone(), binding.clone());
-            reset_bindings.push(id.clone());
-        }
-
-        // Register with the appropriate implementation
-        let result = match implementation {
-            KeyboardImplementation::Portal => portal::register_shortcut(ctx, binding),
-            KeyboardImplementation::Evdev => evdev::register_shortcut(ctx, binding),
-        };
-
-        if let Err(e) = result {
-            error!(
-                "Failed to register shortcut '{}' for {:?}: {}",
-                id, implementation, e
-            );
-        }
+        let _ = portal::register_shortcut(ctx, binding);
     }
-
-    // Save settings if any bindings were reset
-    if !reset_bindings.is_empty() {
-        settings::write_settings(ctx, current_settings);
-    }
-
-    reset_bindings
-}
-
-/// Initialize Evdev if not already initialized, with rollback on failure
-fn initialize_evdev_with_rollback(ctx: &AppContext) -> Result<bool, String> {
-    if evdev::is_initialized() {
-        return Ok(false); // Already initialized, caller should continue
-    }
-
-    if let Err(e) = evdev::init_shortcuts(ctx) {
-        error!("Failed to initialize Evdev: {}", e);
-        // Rollback to portal
-        let mut settings = settings::get_settings(ctx);
-        settings.keyboard_implementation = KeyboardImplementation::Portal;
-        settings::write_settings(ctx, settings);
-        portal::init_shortcuts(ctx);
-        return Err(format!(
-            "Failed to initialize Evdev: {}. Reverted to portal.",
-            e
-        ));
-    }
-
-    // init_shortcuts already registered shortcuts
-    Ok(true)
+    Vec::new()
 }
 
 // ============================================================================
@@ -952,14 +807,15 @@ pub fn add_post_process_prompt(
     let id = format!("prompt_{}", chrono::Utc::now().timestamp_millis());
 
     let new_prompt = LLMPrompt {
-        id: id.clone(),
+        id,
         name,
         prompt,
+        preferred_provider_id: None,
     };
 
     settings.post_process_prompts.push(new_prompt.clone());
     ctx.notify_setting_changed(
-        "post_process_prompts",
+        "post_process_prompts_structure",
         serde_json::json!(&settings.post_process_prompts),
     );
     settings::write_settings(ctx, settings);
@@ -982,10 +838,7 @@ pub fn update_post_process_prompt(
     {
         existing_prompt.name = name;
         existing_prompt.prompt = prompt;
-        ctx.notify_setting_changed(
-            "post_process_prompts",
-            serde_json::json!(&settings.post_process_prompts),
-        );
+        ctx.notify_setting_changed("post_process_prompt_content", serde_json::json!(&id));
         settings::write_settings(ctx, settings);
         Ok(())
     } else {
@@ -1016,11 +869,15 @@ pub fn delete_post_process_prompt(ctx: &AppContext, id: String) -> Result<(), St
     }
 
     ctx.notify_setting_changed(
-        "post_process_prompts",
+        "post_process_prompts_structure",
         serde_json::json!(&settings.post_process_prompts),
     );
     settings::write_settings(ctx, settings);
     Ok(())
+}
+
+pub fn remove_post_process_prompt(ctx: &AppContext, id: String) -> Result<(), String> {
+    delete_post_process_prompt(ctx, id)
 }
 
 pub async fn fetch_post_process_models(
@@ -1035,13 +892,6 @@ pub async fn fetch_post_process_models(
         .iter()
         .find(|p| p.id == provider_id)
         .ok_or_else(|| format!("Provider '{}' not found", provider_id))?;
-
-    if provider.id == APPLE_INTELLIGENCE_PROVIDER_ID {
-        return Err(
-            "Apple Intelligence is only available on Apple silicon Macs running macOS 15 or later."
-                .to_string(),
-        );
-    }
 
     // Get API key
     let api_key = settings
@@ -1076,6 +926,136 @@ pub fn set_post_process_selected_prompt(ctx: &AppContext, id: String) -> Result<
     );
     settings::write_settings(ctx, settings);
     Ok(())
+}
+
+pub fn set_post_process_prompt_preferred_provider(
+    ctx: &AppContext,
+    prompt_id: String,
+    preferred_provider_id: Option<String>,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+
+    if let Some(prompt) = settings
+        .post_process_prompts
+        .iter_mut()
+        .find(|p| p.id == prompt_id)
+    {
+        prompt.preferred_provider_id = preferred_provider_id;
+        ctx.notify_setting_changed(
+            "post_process_prompts",
+            serde_json::json!(&settings.post_process_prompts),
+        );
+        settings::write_settings(ctx, settings);
+        Ok(())
+    } else {
+        Err(format!("Prompt with id '{}' not found", prompt_id))
+    }
+}
+
+pub fn move_post_process_provider_priority(
+    ctx: &AppContext,
+    provider_id: &str,
+    up: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    let len = settings.post_process_providers.len();
+    if len <= 1 {
+        return Ok(());
+    }
+
+    let Some(index) = settings
+        .post_process_providers
+        .iter()
+        .position(|p| p.id == provider_id)
+    else {
+        return Err(format!("Provider '{}' not found", provider_id));
+    };
+
+    if up && index > 0 {
+        settings.post_process_providers.swap(index, index - 1);
+    } else if !up && index + 1 < len {
+        settings.post_process_providers.swap(index, index + 1);
+    } else {
+        return Ok(());
+    }
+
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("post_process_providers", serde_json::json!("reordered"));
+    Ok(())
+}
+
+pub fn toggle_post_process_provider_enabled(
+    ctx: &AppContext,
+    provider_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings
+        .post_process_providers
+        .iter_mut()
+        .find(|p| p.id == provider_id)
+    {
+        p.enabled = enabled;
+        settings::write_settings(ctx, settings);
+        ctx.notify_setting_changed("post_process_providers", serde_json::json!(provider_id));
+        Ok(())
+    } else {
+        Err(format!("Provider '{}' not found", provider_id))
+    }
+}
+
+pub fn set_post_process_provider_reasoning(
+    ctx: &AppContext,
+    provider_id: String,
+    effort: crate::settings::ReasoningEffort,
+    budget_tokens: Option<u32>,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings
+        .post_process_providers
+        .iter_mut()
+        .find(|p| p.id == provider_id)
+    {
+        p.reasoning = crate::settings::ProviderReasoningConfig {
+            effort,
+            budget_tokens,
+        };
+        settings::write_settings(ctx, settings);
+        ctx.notify_setting_changed("post_process_providers", serde_json::json!(provider_id));
+        Ok(())
+    } else {
+        Err(format!("Provider '{}' not found", provider_id))
+    }
+}
+
+pub async fn test_post_process_provider_connection(
+    ctx: &AppContext,
+    provider_id: String,
+) -> Result<(String, u128), String> {
+    let settings = settings::get_settings(ctx);
+    let provider = settings
+        .post_process_providers
+        .iter()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| format!("Provider '{}' not found", provider_id))?;
+
+    let api_key = settings
+        .post_process_api_keys
+        .get(&provider_id)
+        .cloned()
+        .unwrap_or_default();
+
+    let model = settings
+        .post_process_models
+        .get(&provider_id)
+        .cloned()
+        .unwrap_or_else(|| crate::settings::default_model_for_provider(&provider_id));
+
+    if model.is_empty() {
+        return Err("No model selected for this provider".to_string());
+    }
+
+    crate::llm_client::test_provider_connection(provider, api_key, &model).await
 }
 
 pub fn change_mute_while_recording_setting(ctx: &AppContext, enabled: bool) -> Result<(), String> {
@@ -1219,4 +1199,212 @@ pub async fn get_available_accelerators() -> crate::managers::transcription::Ava
     crate::runtime::spawn_blocking(crate::managers::transcription::get_available_accelerators)
         .await
         .expect("get_available_accelerators panicked")
+}
+
+pub fn toggle_local_transcription_setting(ctx: &AppContext, enabled: bool) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    settings.local_transcription_enabled = enabled;
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("local_transcription_enabled", serde_json::json!(enabled));
+    Ok(())
+}
+
+pub fn move_transcription_provider_priority(
+    ctx: &AppContext,
+    provider_id: &str,
+    up: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    let len = settings.transcription_providers.len();
+    if len <= 1 {
+        return Ok(());
+    }
+
+    let Some(index) = settings
+        .transcription_providers
+        .iter()
+        .position(|p| p.id == provider_id)
+    else {
+        return Err(format!("Provider '{}' not found", provider_id));
+    };
+
+    if (up && index == 0) || (!up && index + 1 >= len) {
+        return Ok(());
+    }
+
+    let target_index = if up { index - 1 } else { index + 1 };
+    settings.transcription_providers.swap(index, target_index);
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed(
+        "transcription_providers_reordered",
+        serde_json::json!(provider_id),
+    );
+    Ok(())
+}
+
+pub fn toggle_transcription_provider_enabled(
+    ctx: &AppContext,
+    provider_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings.transcription_provider_mut(&provider_id) {
+        p.enabled = enabled;
+        ctx.notify_setting_changed(
+            "transcription_provider_enabled",
+            serde_json::json!(&provider_id),
+        );
+        settings::write_settings(ctx, settings);
+        Ok(())
+    } else {
+        Err(format!(
+            "Transcription provider '{}' not found",
+            provider_id
+        ))
+    }
+}
+
+pub fn change_transcription_api_key_setting(
+    ctx: &AppContext,
+    provider_id: String,
+    key: String,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    settings
+        .transcription_api_keys
+        .insert(provider_id.clone(), key);
+    ctx.notify_setting_changed("transcription_api_keys", serde_json::json!(&provider_id));
+    settings::write_settings(ctx, settings);
+    Ok(())
+}
+
+pub fn change_transcription_model_setting(
+    ctx: &AppContext,
+    provider_id: String,
+    model: String,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings.transcription_provider_mut(&provider_id) {
+        p.model = model.clone();
+    }
+    settings
+        .transcription_models
+        .insert(provider_id.clone(), model);
+    ctx.notify_setting_changed("transcription_models", serde_json::json!(&provider_id));
+    settings::write_settings(ctx, settings);
+    Ok(())
+}
+
+pub fn change_transcription_base_url_setting(
+    ctx: &AppContext,
+    provider_id: String,
+    base_url: String,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings.transcription_provider_mut(&provider_id) {
+        p.base_url = base_url;
+        ctx.notify_setting_changed(
+            "transcription_provider_base_url",
+            serde_json::json!(&provider_id),
+        );
+        settings::write_settings(ctx, settings);
+        Ok(())
+    } else {
+        Err(format!(
+            "Transcription provider '{}' not found",
+            provider_id
+        ))
+    }
+}
+
+pub fn update_deepgram_config(
+    ctx: &AppContext,
+    update_fn: impl FnOnce(&mut settings::DeepgramConfig),
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings.transcription_provider_mut("deepgram") {
+        let mut cfg = p.deepgram.clone().unwrap_or_default();
+        update_fn(&mut cfg);
+        p.deepgram = Some(cfg);
+        ctx.notify_setting_changed("deepgram_config", serde_json::json!("deepgram"));
+        settings::write_settings(ctx, settings);
+        Ok(())
+    } else {
+        Err("Transcription provider 'deepgram' not found".to_string())
+    }
+}
+
+pub async fn test_transcription_provider_connection(
+    ctx: &AppContext,
+    provider_id: String,
+) -> Result<(String, u128), String> {
+    let settings = settings::get_settings(ctx);
+    let provider = settings
+        .transcription_provider(&provider_id)
+        .ok_or_else(|| format!("Provider '{}' not found", provider_id))?;
+
+    let api_key = settings
+        .transcription_api_keys
+        .get(&provider_id)
+        .cloned()
+        .unwrap_or_default();
+
+    let model = settings
+        .transcription_models
+        .get(&provider_id)
+        .cloned()
+        .unwrap_or_else(|| provider.model.clone());
+
+    let language = &settings.selected_language;
+
+    crate::stt_client::test_transcription_provider(provider, api_key, &model, language).await
+}
+
+pub fn change_audio_input_gain_setting(ctx: &AppContext, gain: f32) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    settings.audio_input_gain = gain;
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("audio_input_gain", serde_json::json!(gain));
+    Ok(())
+}
+
+pub fn change_audio_normalization_setting(ctx: &AppContext, enabled: bool) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    settings.audio_normalization_enabled = enabled;
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("audio_normalization_enabled", serde_json::json!(enabled));
+    Ok(())
+}
+
+pub fn change_audio_high_pass_filter_setting(
+    ctx: &AppContext,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    settings.audio_high_pass_filter_enabled = enabled;
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("audio_high_pass_filter_enabled", serde_json::json!(enabled));
+    Ok(())
+}
+
+pub fn change_audio_noise_reduction_setting(ctx: &AppContext, enabled: bool) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    settings.audio_noise_reduction_enabled = enabled;
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("audio_noise_reduction_enabled", serde_json::json!(enabled));
+    Ok(())
+}
+
+pub fn change_audio_noise_gate_threshold_setting(
+    ctx: &AppContext,
+    threshold_db: f32,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    settings.audio_noise_gate_threshold_db = threshold_db;
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed(
+        "audio_noise_gate_threshold_db",
+        serde_json::json!(threshold_db),
+    );
+    Ok(())
 }

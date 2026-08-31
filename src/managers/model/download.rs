@@ -1,384 +1,289 @@
-//! Shared direct-HTTP model download transport.
+//! Direct URL and Hugging Face model downloader.
 //!
-//! Both legacy URL models and Hugging Face mirror fallbacks use this module;
-//! source-specific orchestration and finalization remain in the parent module.
+//! Downloads GGUF, GGML, and ONNX models directly into the local models directory
+//! with streaming progress reporting and cancellation support.
 
-use super::{DownloadProgress, ModelManager};
-use crate::context::AppEvent;
-use anyhow::Result;
-use futures_util::StreamExt;
-use hf_hub::api::tokio::CancellationToken;
-use log::{info, warn};
-use sha2::{Digest, Sha256};
-use std::fs;
-use std::fs::File;
-use std::io::{Read, Write};
-use std::path::Path;
+use std::path::PathBuf;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-/// Bound on connection setup for direct HTTP downloads (mirror + URL models).
-const HTTP_CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+use futures_util::StreamExt;
+use log::{info, warn};
+use tokio::io::AsyncWriteExt;
 
-/// No headers, body bytes, or hf-hub progress for this long means the transfer
-/// is wedged, not slow: direct downloads error out (keeping the partial for
-/// resume) and HF attempts are cancelled by a watchdog — either way the retry
-/// loop and mirror fallback take over instead of hanging forever.
-pub(super) const DOWNLOAD_STALL_TIMEOUT: Duration = Duration::from_secs(60);
+use crate::context::{
+    AppContext, AppEvent, ModelDownloadFinishedEvent, ModelDownloadProgressEvent,
+};
+use std::sync::LazyLock;
 
-/// Start offset of a `Content-Range: bytes <start>-<end>/<total>` header.
-fn content_range_start(value: &str) -> Option<u64> {
-    let range = value.trim().strip_prefix("bytes")?.trim_start();
-    range.split('-').next()?.trim().parse().ok()
-}
+static CANCEL_DOWNLOAD: LazyLock<std::sync::Mutex<Option<Arc<AtomicBool>>>> =
+    LazyLock::new(|| std::sync::Mutex::new(None));
 
-/// How a [`ModelManager::download_http_resumable`] call ended, cancellation
-/// being an outcome (partial kept, no error surfaced) rather than a failure.
-#[derive(Debug)]
-pub(super) enum HttpDownloadOutcome {
-    Completed,
-    Cancelled,
-}
-
-/// Side-channel notifications from the resumable HTTP downloader, decoupled
-/// from Tauri (the production wrapper maps them onto app events) so the
-/// transport logic is testable without an `AppHandle`.
-enum HttpDownloadEvent<'a> {
-    Progress(&'a DownloadProgress),
-    VerificationStarted,
-    VerificationCompleted,
-}
-
-impl ModelManager {
-    /// Verifies the SHA256 of `path` against `expected_sha256` (if provided).
-    /// On mismatch or read error the partial file is deleted and an error is returned,
-    /// so the next download attempt always starts from a clean state.
-    /// When `expected_sha256` is `None` (custom user models) verification is skipped.
-    fn verify_sha256(path: &Path, expected_sha256: Option<&str>, model_id: &str) -> Result<()> {
-        let Some(expected) = expected_sha256 else {
-            return Ok(());
-        };
-        match Self::compute_sha256(path) {
-            Ok(actual) if actual == expected => {
-                info!("SHA256 verified for model {}", model_id);
-                Ok(())
-            }
-            Ok(actual) => {
-                warn!(
-                    "SHA256 mismatch for model {}: expected {}, got {}",
-                    model_id, expected, actual
-                );
-                let _ = fs::remove_file(path);
-                Err(anyhow::anyhow!(
-                    "Download verification failed for model {}: file is corrupt. Please retry.",
-                    model_id
-                ))
-            }
-            Err(e) => {
-                let _ = fs::remove_file(path);
-                Err(anyhow::anyhow!(
-                    "Failed to verify download for model {}: {}. Please retry.",
-                    model_id,
-                    e
-                ))
-            }
-        }
+/// Parse and normalize user input into a direct download URL and suggested filename.
+pub fn normalize_model_url(input: &str) -> Result<(String, String), String> {
+    let raw = input.trim();
+    if raw.is_empty() {
+        return Err("Please enter a valid URL or Hugging Face repository link.".to_string());
     }
 
-    /// Computes the SHA256 hex digest of a file, reading in 64KB chunks to handle large models.
-    fn compute_sha256(path: &Path) -> Result<String> {
-        let mut file = File::open(path)?;
-        let mut hasher = Sha256::new();
-        let mut buffer = [0u8; 65536];
-        loop {
-            let n = file.read(&mut buffer)?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buffer[..n]);
-        }
-        Ok(format!("{:x}", hasher.finalize()))
-    }
-
-    /// Emit verification events around a blocking sha256 check of `path`.
-    /// On mismatch `verify_sha256` deletes the file, so the next attempt (or
-    /// next source) starts clean. A `None` hash skips checking (custom models).
-    async fn verify_file_with_events(
-        model_id: &str,
-        path: &Path,
-        expected_sha256: Option<&str>,
-        emit: &(dyn Fn(HttpDownloadEvent<'_>) + Send + Sync),
-    ) -> Result<()> {
-        emit(HttpDownloadEvent::VerificationStarted);
-        let path = path.to_path_buf();
-        let expected = expected_sha256.map(str::to_string);
-        let id = model_id.to_string();
-        tokio::task::spawn_blocking(move || Self::verify_sha256(&path, expected.as_deref(), &id))
-            .await
-            .map_err(|e| anyhow::anyhow!("SHA256 task panicked: {}", e))??;
-        emit(HttpDownloadEvent::VerificationCompleted);
-        Ok(())
-    }
-
-    /// [`Self::download_http_resumable_with_events`] wired to the app event
-    /// bus — the production entry point.
-    pub(super) async fn download_http_resumable(
-        &self,
-        model_id: &str,
-        url: &str,
-        partial_path: &Path,
-        expected_size: Option<u64>,
-        expected_sha256: Option<&str>,
-        cancel_token: &CancellationToken,
-    ) -> Result<HttpDownloadOutcome> {
-        let bus = self.bus.clone();
-        let id = model_id.to_string();
-        Self::download_http_resumable_with_events(
-            model_id,
-            url,
-            partial_path,
-            expected_size,
-            expected_sha256,
-            cancel_token,
-            &move |event| {
-                match event {
-                    HttpDownloadEvent::Progress(progress) => {
-                        bus.send(AppEvent::ModelDownloadProgress(progress.clone()))
-                    }
-                    HttpDownloadEvent::VerificationStarted => {
-                        bus.send(AppEvent::ModelVerificationStarted(id.clone()))
-                    }
-                    HttpDownloadEvent::VerificationCompleted => {
-                        bus.send(AppEvent::ModelVerificationCompleted(id.clone()))
-                    }
-                };
-            },
-        )
-        .await
-    }
-
-    /// The one resumable HTTP downloader, shared by the mirror fallback and
-    /// URL-sourced models: fetch `url` into `partial_path`, resuming what's
-    /// already there, and leave verified bytes in `partial_path` on success —
-    /// finalizing (rename / extract) is the caller's job. Takes progress and
-    /// verification notifications as a callback instead of touching Tauri, so
-    /// the failure-mode behavior below is exercised by tests against a local
-    /// socket server.
-    ///
-    /// Robustness properties, in the order the failure modes appear:
-    /// - a partial already at the expected size (crash between completion and
-    ///   finalize) is verified and accepted instead of asking the server for
-    ///   `Range: bytes=<EOF>-` and looping on 416 forever; an oversized one is
-    ///   deleted; a live 416 finishes the partial only when a hash can prove
-    ///   it, and otherwise clears it
-    /// - connection setup and every body chunk are bounded by
-    ///   [`HTTP_CONNECT_TIMEOUT`] / [`DOWNLOAD_STALL_TIMEOUT`] and race the
-    ///   cancel token, so a wedged transfer can neither hang the download
-    ///   forever nor ignore a cancel
-    /// - a 200 to a Range request (server ignored it) restarts from zero
-    ///   rather than appending the whole file to the partial; a 206 must start
-    ///   exactly at our offset or the partial is discarded
-    /// - a server claiming or sending more than the expected size is cut off
-    ///   at the first excess byte, not trusted until it closes the stream
-    /// - the final bytes are checked against `expected_size` (catalog, or
-    ///   content-length when unknown) and `expected_sha256` before returning
-    async fn download_http_resumable_with_events(
-        model_id: &str,
-        url: &str,
-        partial_path: &Path,
-        expected_size: Option<u64>,
-        expected_sha256: Option<&str>,
-        cancel_token: &CancellationToken,
-        emit: &(dyn Fn(HttpDownloadEvent<'_>) + Send + Sync),
-    ) -> Result<HttpDownloadOutcome> {
-        let mut resume_from = partial_path.metadata().map(|m| m.len()).unwrap_or(0);
-
-        if let Some(expected) = expected_size {
-            if resume_from > expected {
-                let _ = fs::remove_file(partial_path);
-                resume_from = 0;
-            } else if resume_from == expected && expected > 0 {
-                info!(
-                    "Partial download of {} is already full-size; verifying",
-                    model_id
-                );
-                Self::verify_file_with_events(model_id, partial_path, expected_sha256, emit)
-                    .await?;
-                return Ok(HttpDownloadOutcome::Completed);
-            }
-        }
-
-        if resume_from > 0 {
-            info!(
-                "Resuming download of {} from byte {}",
-                model_id, resume_from
+    // 1. Shorthand Hugging Face format: "org/repo/filename.ext" or "org/repo:filename.ext"
+    let is_http = raw.starts_with("http://") || raw.starts_with("https://");
+    if !is_http {
+        let parts: Vec<&str> = raw.split('/').collect();
+        if parts.len() == 3 {
+            let org = parts[0];
+            let repo = parts[1];
+            let file = parts[2];
+            let url = format!(
+                "https://huggingface.co/{}/{}/resolve/main/{}?download=true",
+                org, repo, file
             );
+            return Ok((url, file.to_string()));
         } else {
-            info!("Starting fresh download of {} from {}", model_id, url);
+            return Err(
+                "Invalid format. Provide a full URL (https://huggingface.co/...) or 'owner/repo/model.gguf'."
+                    .to_string(),
+            );
         }
+    }
 
-        let client = reqwest::Client::builder()
-            .connect_timeout(HTTP_CONNECT_TIMEOUT)
-            .build()?;
-        let mut request = client.get(url);
-        if resume_from > 0 {
-            request = request.header("Range", format!("bytes={}-", resume_from));
-        }
-        let response = tokio::select! {
-            r = tokio::time::timeout(DOWNLOAD_STALL_TIMEOUT, request.send()) => r
-                .map_err(|_| anyhow::anyhow!(
-                    "no response within {}s from {}",
-                    DOWNLOAD_STALL_TIMEOUT.as_secs(), url
-                ))??,
-            _ = cancel_token.cancelled() => return Ok(HttpDownloadOutcome::Cancelled),
-        };
+    let parsed_url = reqwest::Url::parse(raw).map_err(|e| format!("Invalid URL: {e}"))?;
 
-        // 416 to our Range request means its start is at or past the object's
-        // end. With a catalog size in hand that can only mean the server's
-        // object is *smaller* than expected (a full-size partial never issues
-        // a request — handled above), and with no hash there is no trusted
-        // signal to bless the partial: both restart clean. Only a hash can
-        // genuinely finish a partial here. Without a Range in flight a 416 is
-        // just a broken server, which the generic status check below rejects.
-        if resume_from > 0 && response.status() == reqwest::StatusCode::RANGE_NOT_SATISFIABLE {
-            if expected_size.is_some() || expected_sha256.is_none() {
-                let _ = fs::remove_file(partial_path);
-                return Err(anyhow::anyhow!(
-                    "server object ends before the expected size (HTTP 416)"
-                ));
+    // 2. Hugging Face web URLs: convert '/blob/' to '/resolve/' and ensure '?download=true'
+    if let Some(host) = parsed_url.host_str() {
+        if host.contains("huggingface.co") || host.contains("hf.co") {
+            let path = parsed_url.path();
+            let resolved_path = if path.contains("/blob/") {
+                path.replace("/blob/", "/resolve/")
+            } else {
+                path.to_string()
+            };
+
+            let filename = resolved_path
+                .split('/')
+                .next_back()
+                .unwrap_or("model.gguf")
+                .to_string();
+
+            let clean_filename = filename.split('?').next().unwrap_or(&filename).to_string();
+
+            let mut final_url = format!("https://huggingface.co{}", resolved_path);
+            if !final_url.contains("download=true") {
+                if final_url.contains('?') {
+                    final_url.push_str("&download=true");
+                } else {
+                    final_url.push_str("?download=true");
+                }
             }
-            Self::verify_file_with_events(model_id, partial_path, expected_sha256, emit).await?;
-            return Ok(HttpDownloadOutcome::Completed);
+            return Ok((final_url, clean_filename));
         }
-        // A 200 to a Range request means the server ignored it and is sending
-        // the whole file; appending it to the partial would corrupt the model.
-        if resume_from > 0 && response.status() == reqwest::StatusCode::OK {
-            let _ = fs::remove_file(partial_path);
-            resume_from = 0;
-        }
-        if !response.status().is_success() {
-            return Err(anyhow::anyhow!(
-                "server returned HTTP {}",
-                response.status()
+    }
+
+    // 3. Direct HTTP/HTTPS link to any file
+    let path = parsed_url.path();
+    let filename = path
+        .split('/')
+        .next_back()
+        .filter(|s| !s.is_empty())
+        .unwrap_or("model.gguf")
+        .to_string();
+
+    let clean_filename = filename.split('?').next().unwrap_or(&filename).to_string();
+
+    Ok((raw.to_string(), clean_filename))
+}
+
+/// Download a model from a URL or Hugging Face spec to the models directory.
+pub async fn download_model(ctx: &AppContext, url_or_spec: &str) -> Result<PathBuf, String> {
+    let (url, filename) = normalize_model_url(url_or_spec)?;
+
+    let models_dir = ctx.model.models_dir();
+    std::fs::create_dir_all(models_dir)
+        .map_err(|e| format!("Failed to create models folder: {e}"))?;
+
+    let target_file = models_dir.join(&filename);
+    let part_file = models_dir.join(format!("{}.part", filename));
+
+    info!(
+        "Starting model download from '{}' to '{:?}'",
+        url, target_file
+    );
+
+    let cancel_flag = Arc::new(AtomicBool::new(false));
+    {
+        let mut guard = CANCEL_DOWNLOAD.lock().unwrap();
+        *guard = Some(Arc::clone(&cancel_flag));
+    }
+
+    let client = reqwest::Client::builder()
+        .connect_timeout(Duration::from_secs(15))
+        .build()
+        .map_err(|e| format!("Failed to initialize HTTP client: {e}"))?;
+
+    let response = client
+        .get(&url)
+        .header("User-Agent", "Otush/1.0 (Linux)")
+        .send()
+        .await
+        .map_err(|e| format!("Network request failed: {e}"))?;
+
+    if !response.status().is_success() {
+        let err_msg = format!("HTTP error: {}", response.status());
+        ctx.bus.send(AppEvent::ModelDownloadFinished(
+            ModelDownloadFinishedEvent {
+                filename: filename.clone(),
+                success: false,
+                error: Some(err_msg.clone()),
+            },
+        ));
+        return Err(err_msg);
+    }
+
+    let total_bytes = response.content_length();
+    let mut stream = response.bytes_stream();
+
+    let mut out_file = tokio::fs::File::create(&part_file)
+        .await
+        .map_err(|e| format!("Failed to create local file '{:?}': {e}", part_file))?;
+
+    let mut downloaded_bytes: u64 = 0;
+    let start_time = Instant::now();
+    let mut last_ui_update = Instant::now();
+
+    while let Some(chunk_result) = stream.next().await {
+        if cancel_flag.load(Ordering::SeqCst) {
+            let _ = tokio::fs::remove_file(&part_file).await;
+            let err_msg = "Download cancelled by user".to_string();
+            ctx.bus.send(AppEvent::ModelDownloadFinished(
+                ModelDownloadFinishedEvent {
+                    filename: filename.clone(),
+                    success: false,
+                    error: Some(err_msg.clone()),
+                },
             ));
-        }
-        // On a 206, trust but verify the offset: a reply starting anywhere but
-        // exactly our partial's end would silently corrupt the file on append.
-        if resume_from > 0 && response.status() == reqwest::StatusCode::PARTIAL_CONTENT {
-            let starts_at = response
-                .headers()
-                .get(reqwest::header::CONTENT_RANGE)
-                .and_then(|v| v.to_str().ok())
-                .and_then(content_range_start);
-            if starts_at != Some(resume_from) {
-                let _ = fs::remove_file(partial_path);
-                return Err(anyhow::anyhow!(
-                    "server returned Content-Range starting at {:?}, expected {}",
-                    starts_at,
-                    resume_from
-                ));
-            }
-        }
-        // When the catalog pins the size, a server advertising a different
-        // total is already misbehaving — reject before writing anything.
-        if let (Some(expected), Some(len)) = (expected_size, response.content_length()) {
-            if resume_from + len != expected {
-                return Err(anyhow::anyhow!(
-                    "server advertises {} bytes, expected {}",
-                    resume_from + len,
-                    expected
-                ));
-            }
+            return Err(err_msg);
         }
 
-        let known_total =
-            expected_size.or_else(|| response.content_length().map(|l| resume_from + l));
-        let total_size = known_total.unwrap_or(0);
-        let mut downloaded = resume_from;
-        let mut file = if resume_from > 0 {
-            std::fs::OpenOptions::new()
-                .append(true)
-                .open(partial_path)?
-        } else {
-            std::fs::File::create(partial_path)?
-        };
+        let chunk = chunk_result.map_err(|e| format!("Download stream error: {e}"))?;
+        out_file
+            .write_all(&chunk)
+            .await
+            .map_err(|e| format!("Write to disk error: {e}"))?;
 
-        let emit_progress = |downloaded: u64| {
-            emit(HttpDownloadEvent::Progress(&DownloadProgress {
-                model_id: model_id.to_string(),
-                downloaded,
-                total: total_size,
-                percentage: if total_size > 0 {
-                    (downloaded as f64 / total_size as f64) * 100.0
+        downloaded_bytes += chunk.len() as u64;
+
+        if last_ui_update.elapsed() >= Duration::from_millis(150) {
+            let elapsed_secs = start_time.elapsed().as_secs_f64();
+            let speed_mb_s = if elapsed_secs > 0.0 {
+                (downloaded_bytes as f64 / (1024.0 * 1024.0)) / elapsed_secs
+            } else {
+                0.0
+            };
+
+            let percentage = if let Some(total) = total_bytes {
+                if total > 0 {
+                    (downloaded_bytes as f64 / total as f64) * 100.0
                 } else {
                     0.0
-                },
-            }));
-        };
-        emit_progress(downloaded);
-
-        // Throttle progress events to max 10/sec (100ms intervals)
-        let mut last_emit = Instant::now();
-        let throttle = Duration::from_millis(100);
-        let mut stream = response.bytes_stream();
-        loop {
-            let chunk = tokio::select! {
-                c = tokio::time::timeout(DOWNLOAD_STALL_TIMEOUT, stream.next()) => match c {
-                    // Stalled mid-body: keep the partial for resume.
-                    Err(_) => return Err(anyhow::anyhow!(
-                        "transfer stalled: no data for {}s",
-                        DOWNLOAD_STALL_TIMEOUT.as_secs()
-                    )),
-                    Ok(None) => break,
-                    Ok(Some(chunk)) => chunk?,
-                },
-                _ = cancel_token.cancelled() => {
-                    // Keep the partial for resume; caller handles state cleanup.
-                    return Ok(HttpDownloadOutcome::Cancelled);
                 }
+            } else {
+                0.0
             };
-            // An untrusted server must not be able to fill the disk: cut the
-            // transfer at the first byte past the known total instead of
-            // trusting it to eventually close the stream. Everything written
-            // so far is tainted by a provably-misbehaving server — clear it.
-            if let Some(cap) = known_total {
-                if downloaded + chunk.len() as u64 > cap {
-                    drop(file);
-                    let _ = fs::remove_file(partial_path);
-                    return Err(anyhow::anyhow!(
-                        "server sent more than the expected {} bytes",
-                        cap
-                    ));
-                }
-            }
-            file.write_all(&chunk)?;
-            downloaded += chunk.len() as u64;
-            if last_emit.elapsed() >= throttle {
-                emit_progress(downloaded);
-                last_emit = Instant::now();
-            }
-        }
-        file.flush()?;
-        drop(file);
-        emit_progress(downloaded);
 
-        if let Some(expected) = known_total {
-            let actual = partial_path.metadata()?.len();
-            if actual != expected {
-                let _ = fs::remove_file(partial_path);
-                return Err(anyhow::anyhow!(
-                    "download incomplete: expected {} bytes, got {}",
-                    expected,
-                    actual
-                ));
-            }
+            ctx.bus.send(AppEvent::ModelDownloadProgress(
+                ModelDownloadProgressEvent {
+                    url: url.clone(),
+                    filename: filename.clone(),
+                    downloaded_bytes,
+                    total_bytes,
+                    percentage,
+                    speed_mb_s,
+                },
+            ));
+            last_ui_update = Instant::now();
         }
+    }
 
-        // The catalog hash is the trust anchor: for a mirror (an untrusted
-        // host) this verification is what makes the fallback safe at all.
-        Self::verify_file_with_events(model_id, partial_path, expected_sha256, emit).await?;
-        Ok(HttpDownloadOutcome::Completed)
+    out_file
+        .flush()
+        .await
+        .map_err(|e| format!("Failed to flush file to disk: {e}"))?;
+    drop(out_file);
+
+    // Atomic move from part file to target file
+    std::fs::rename(&part_file, &target_file)
+        .map_err(|e| format!("Failed to finalize model file: {e}"))?;
+
+    info!(
+        "Model successfully downloaded: '{:?}' ({} bytes)",
+        target_file, downloaded_bytes
+    );
+
+    // Clean cancellation flag
+    {
+        let mut guard = CANCEL_DOWNLOAD.lock().unwrap();
+        *guard = None;
+    }
+
+    // Rescan local models and refresh UI
+    if let Err(e) = ctx.model.rescan_local_models() {
+        warn!("Failed to rescan models after download: {e}");
+    }
+
+    ctx.bus.send(AppEvent::ModelDownloadFinished(
+        ModelDownloadFinishedEvent {
+            filename: filename.clone(),
+            success: true,
+            error: None,
+        },
+    ));
+    ctx.bus.send(AppEvent::ModelsUpdated);
+
+    Ok(target_file)
+}
+
+/// Cancel any active model download.
+pub fn cancel_download() {
+    let mut guard = CANCEL_DOWNLOAD.lock().unwrap();
+    if let Some(flag) = guard.take() {
+        flag.store(true, Ordering::SeqCst);
     }
 }
 
 #[cfg(test)]
-mod tests;
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_normalize_huggingface_blob_url() {
+        let (url, filename) = normalize_model_url(
+            "https://huggingface.co/ggerganov/whisper.cpp/blob/main/ggml-small.bin",
+        )
+        .unwrap();
+        assert_eq!(filename, "ggml-small.bin");
+        assert_eq!(
+            url,
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-small.bin?download=true"
+        );
+    }
+
+    #[test]
+    fn test_normalize_huggingface_shorthand() {
+        let (url, filename) =
+            normalize_model_url("ggerganov/whisper.cpp/ggml-base.en.bin").unwrap();
+        assert_eq!(filename, "ggml-base.en.bin");
+        assert_eq!(
+            url,
+            "https://huggingface.co/ggerganov/whisper.cpp/resolve/main/ggml-base.en.bin?download=true"
+        );
+    }
+
+    #[test]
+    fn test_normalize_direct_url() {
+        let (url, filename) =
+            normalize_model_url("https://example.com/models/whisper-large.gguf").unwrap();
+        assert_eq!(filename, "whisper-large.gguf");
+        assert_eq!(url, "https://example.com/models/whisper-large.gguf");
+    }
+}

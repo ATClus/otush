@@ -47,18 +47,7 @@ pub fn cancel_current_operation(ctx: &AppContext) {
     info!("Operation cancellation completed - returned to idle state");
 }
 
-/// Whether this is the x64 Windows build running under emulation on Windows ARM64.
-///
-/// Only that exact process/host pairing disables the transcribe.cpp GPU path.
-/// Detection is deliberately fail-open: a native x64 host, an older Windows
-/// version without `IsWow64Process2`, or any API error leaves existing behavior
-/// unchanged. Always false on Linux.
-pub fn is_windows_x64_emulated_on_arm64() -> bool {
-    false
-}
-
-/// Check if using the Wayland display server protocol
-#[cfg(target_os = "linux")]
+/// Check if running on a Wayland display server session.
 pub fn is_wayland() -> bool {
     std::env::var("WAYLAND_DISPLAY").is_ok()
         || std::env::var("XDG_SESSION_TYPE")
@@ -66,8 +55,7 @@ pub fn is_wayland() -> bool {
             .unwrap_or(false)
 }
 
-/// Check if running on KDE Plasma desktop environment
-#[cfg(target_os = "linux")]
+/// Check if running on KDE Plasma desktop environment.
 pub fn is_kde_plasma() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .map(|v| v.to_uppercase().contains("KDE"))
@@ -75,22 +63,19 @@ pub fn is_kde_plasma() -> bool {
         || std::env::var("KDE_SESSION_VERSION").is_ok()
 }
 
-/// Check if running on KDE Plasma with Wayland
-#[cfg(target_os = "linux")]
+/// Check if running on KDE Plasma with Wayland.
 pub fn is_kde_wayland() -> bool {
     is_wayland() && is_kde_plasma()
 }
 
-/// Check if running on GNOME desktop environment
-#[cfg(target_os = "linux")]
+/// Check if running on GNOME desktop environment.
 pub fn is_gnome() -> bool {
     std::env::var("XDG_CURRENT_DESKTOP")
         .map(|v| v.to_uppercase().contains("GNOME"))
         .unwrap_or(false)
 }
 
-/// Check if running on GNOME with Wayland
-#[cfg(target_os = "linux")]
+/// Check if running on GNOME with Wayland.
 pub fn is_gnome_wayland() -> bool {
     is_wayland() && is_gnome()
 }
@@ -99,8 +84,6 @@ pub fn is_gnome_wayland() -> bool {
 mod tests {
     use super::*;
 
-    // Keep the windows-emulation detection logic tested even though it is
-    // compiled out on Linux; the helpers are pure.
     #[test]
     fn redact_text_keeps_text_in_debug_builds() {
         assert_eq!(redact_text("hello"), "hello");

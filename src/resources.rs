@@ -7,9 +7,17 @@ use std::path::PathBuf;
 ///
 /// - Development: `resources/` next to the crate manifest (embedded at compile
 ///   time via `CARGO_MANIFEST_DIR`).
-/// - Installed (deb): `/usr/share/otush/resources` (or a `resources` dir next
-///   to the executable, which also covers portable-style installs).
+/// - Installed (deb/flatpak): `/usr/share/otush/resources` (or a `resources`
+///   dir next to the executable, which also covers portable-style installs).
 pub fn resource_dir() -> PathBuf {
+    // Dev layout wins whenever the manifest-adjacent resources exist at
+    // runtime. Stale copies that end up next to build artifacts (e.g. an old
+    // `target/debug/resources` from a previous project generation) must never
+    // shadow the real resource set.
+    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+    if dev.is_dir() {
+        return dev;
+    }
     if let Ok(exe) = std::env::current_exe() {
         let exe_dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();
         for candidate in [
@@ -22,16 +30,6 @@ pub fn resource_dir() -> PathBuf {
             }
         }
     }
-    // Dev layout. Falls back to a bare `resources` relative to CWD.
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-    if dev.is_dir() {
-        dev
-    } else {
-        PathBuf::from("resources")
-    }
-}
-
-/// Convenience: resolve a resource file path relative to the resource dir.
-pub fn resource(path: &str) -> PathBuf {
-    resource_dir().join(path)
+    // Last resort: a bare `resources` relative to the CWD.
+    PathBuf::from("resources")
 }

@@ -44,3 +44,11 @@ where
         .expect("tokio runtime not initialized (call runtime::init first)")
         .spawn_blocking(f)
 }
+
+/// Run a future to completion on the runtime, blocking the current thread.
+pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
+    RUNTIME
+        .get()
+        .expect("tokio runtime not initialized (call runtime::init first)")
+        .block_on(future)
+}

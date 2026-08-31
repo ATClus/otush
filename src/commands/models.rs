@@ -1,15 +1,15 @@
-#![allow(dead_code)]
 use crate::context::{AppContext, AppEvent};
 use crate::managers::model::ModelInfo;
 use crate::managers::transcription::{ModelStateEvent, TranscriptionManager};
 use crate::settings::{get_settings, write_settings, ModelUnloadTimeout};
-use log::error;
 use std::sync::Arc;
 
+/// Retrieve the list of all cataloged and locally installed models.
 pub async fn get_available_models(ctx: &AppContext) -> Result<Vec<ModelInfo>, String> {
     Ok(ctx.model.get_available_models())
 }
 
+/// Retrieve model metadata for a specific model ID.
 pub async fn get_model_info(
     ctx: &AppContext,
     model_id: String,
@@ -17,8 +17,13 @@ pub async fn get_model_info(
     Ok(ctx.model.get_model_info(&model_id))
 }
 
-/// Re-scan local sources (custom models dir + shared HF cache) for models added
-/// since launch.
+/// Open the local models directory in the user's file manager (Nautilus).
+pub fn open_models_directory(ctx: &AppContext) -> Result<(), String> {
+    let dir = ctx.model.models_dir();
+    opener::open(dir).map_err(|e| format!("Failed to open models folder: {e}"))
+}
+
+/// Re-scan local sources for models added since launch.
 pub async fn rescan_local_models(ctx: &AppContext) -> Result<(), String> {
     let mm = ctx.model.clone();
     crate::runtime::spawn_blocking(move || mm.rescan_local_models())
@@ -27,26 +32,33 @@ pub async fn rescan_local_models(ctx: &AppContext) -> Result<(), String> {
         .map_err(|e| e.to_string())
 }
 
-pub async fn download_model(ctx: &AppContext, model_id: String) -> Result<(), String> {
-    let result = ctx
-        .model
-        .download_model(&model_id)
+/// Download a model from a URL or Hugging Face repository spec.
+pub async fn download_model_from_url(ctx: &AppContext, url: String) -> Result<String, String> {
+    crate::managers::model::download::download_model(ctx, &url)
         .await
-        .map_err(|e| e.to_string());
-
-    if let Err(ref error) = result {
-        // Log as well as emit: the toast is transient, and failed downloads have
-        // historically been undiagnosable because logs showed nothing (#1579).
-        error!("Model download failed for {}: {}", model_id, error);
-        ctx.bus.send(AppEvent::ModelDownloadFailed {
-            model_id: model_id.clone(),
-            error: error.clone(),
-        });
-    }
-
-    result
+        .map(|p| p.to_string_lossy().to_string())
 }
 
+/// Cancel an ongoing model download.
+pub fn cancel_download() {
+    crate::managers::model::download::cancel_download();
+}
+
+/// Explicitly load the currently selected model into memory.
+pub async fn load_selected_model(ctx: &AppContext) -> Result<(), String> {
+    let settings = get_settings(ctx);
+    if settings.selected_model.is_empty() {
+        return Err("No model is currently selected".to_string());
+    }
+    let tm = ctx.transcription.clone();
+    let model_id = settings.selected_model.clone();
+    crate::runtime::spawn_blocking(move || tm.load_model(&model_id))
+        .await
+        .map_err(|e| format!("Task failed: {e}"))?
+        .map_err(|e| e.to_string())
+}
+
+/// Delete a model's files from disk and unload it if active.
 pub async fn delete_model(ctx: &AppContext, model_id: String) -> Result<(), String> {
     // If deleting the active model, unload it and clear the setting
     let settings = get_settings(ctx);
@@ -110,7 +122,7 @@ pub fn switch_active_model(ctx: &AppContext, model_id: &str) -> Result<(), Strin
         ctx.bus.send(AppEvent::ModelStateChanged(ModelStateEvent {
             event_type: "selection_changed".to_string(),
             model_id: Some(model_id.to_string()),
-            model_name: Some(model_info.name.clone()),
+            model_name: Some(model_info.name),
             error: None,
         }));
         log::info!(
@@ -149,12 +161,6 @@ pub async fn is_model_loading(ctx: &AppContext) -> Result<bool, String> {
     // Check if transcription manager has a loaded model
     let current_model = ctx.transcription.get_current_model();
     Ok(current_model.is_none())
-}
-
-pub async fn cancel_download(ctx: &AppContext, model_id: String) -> Result<(), String> {
-    ctx.model
-        .cancel_download(&model_id)
-        .map_err(|e| e.to_string())
 }
 
 /// Keep the type alias used by callers that pass the transcription manager

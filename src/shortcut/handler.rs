@@ -7,7 +7,6 @@ use log::warn;
 
 use crate::actions::ACTION_MAP;
 use crate::context::AppContext;
-use crate::settings::get_settings;
 use crate::transcription_coordinator::is_transcribe_binding;
 
 /// Handle a shortcut event from either implementation.
@@ -23,12 +22,40 @@ pub fn handle_shortcut_event(
     hotkey_string: &str,
     is_pressed: bool,
 ) {
-    let settings = get_settings(ctx);
+    let settings = crate::settings::get_settings(ctx);
 
     // Transcribe bindings are handled by the coordinator.
     if is_transcribe_binding(binding_id) {
-        ctx.coordinator
-            .send_input(binding_id, hotkey_string, is_pressed, settings.push_to_talk);
+        if settings.push_to_talk {
+            let hotkey = if hotkey_string.is_empty() {
+                settings
+                    .bindings
+                    .get(binding_id)
+                    .map(|b| b.current_binding.as_str())
+                    .unwrap_or_default()
+            } else {
+                hotkey_string
+            };
+
+            // In Push-to-Talk mode, start recording on the first press and spawn the release watcher.
+            // Subsequent auto-repeat press events while recording are ignored until physical key release.
+            if !ctx.audio.is_recording() {
+                ctx.coordinator.send_input(binding_id, hotkey, true, true);
+                crate::shortcut::ptt::start_ptt_release_watcher(ctx, binding_id, hotkey);
+            }
+        } else {
+            ctx.coordinator.send_external_input(binding_id, "portal");
+        }
+        return;
+    }
+
+    if binding_id.starts_with("prompt_") || binding_id.starts_with("custom_prompt_") {
+        if is_pressed {
+            let prompt_id = binding_id
+                .strip_prefix("custom_prompt_")
+                .unwrap_or(binding_id);
+            crate::ui::prompt_palette::execute_prompt_by_id(ctx, prompt_id);
+        }
         return;
     }
 
