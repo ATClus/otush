@@ -1034,6 +1034,12 @@ fn default_post_process_prompts() -> Vec<LLMPrompt> {
             prompt: "<transcript>\n${output}\n</transcript>\n\nYou are an executive assistant. Generate structured meeting minutes from the transcript above:\n\n1. **Executive Summary**: 2-3 sentences summarizing the meeting purpose and outcome.\n2. **Key Discussion Points**: Grouped by topic.\n3. **Decisions Made**: Explicit list of agreed points.\n4. **Action Items**: Checklist of tasks with [Task | Assignee | Deadline].\n\nPreserve all important context and names. Return only formatted Markdown meeting notes.".to_string(),
             preferred_provider_id: None,
         },
+        LLMPrompt {
+            id: "default_professional_subtitles".to_string(),
+            name: "Professional Subtitle Formatting".to_string(),
+            prompt: "<transcript>\n${output}\n</transcript>\n\nYou are a professional subtitler and caption editor following Netflix/BBC subtitling standards.\n\nProcess the transcript above to make it ideal for video subtitles:\n1. Fix spelling, capitalization, and punctuation\n2. Split into concise, punchy sentences (maximum 8-12 words per sentence)\n3. Remove filler words and speech stumbles\n4. Maintain natural dialogue rhythm and grammatical completeness\n5. Keep the original language\n\nReturn only the clean, punctuated text formatted for subtitles.".to_string(),
+            preferred_provider_id: None,
+        },
     ]
 }
 

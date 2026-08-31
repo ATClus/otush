@@ -13,9 +13,10 @@ pub use audio::{
     CpalDeviceInfo, DecodedAudio, VadPolicy,
 };
 pub use export::{
-    export_to_json, export_to_markdown, export_to_srt, export_to_txt, export_to_vtt,
-    format_timestamp_human, format_timestamp_srt, format_timestamp_vtt, TranscriptDocument,
-    TranscriptSegment,
+    export_to_json, export_to_markdown, export_to_srt, export_to_srt_raw, export_to_txt,
+    export_to_vtt, export_to_vtt_raw, format_timestamp_human, format_timestamp_srt,
+    format_timestamp_vtt, to_professional_subtitles, wrap_subtitle_lines, SubtitleConfig,
+    TranscriptDocument, TranscriptSegment,
 };
 pub use lang_id::detect_output_language;
 pub use text::{
