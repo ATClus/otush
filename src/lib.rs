@@ -211,35 +211,15 @@ fn run_headless_transcription(ctx: &AppContext, args: &CliArgs) -> i32 {
         return 0;
     };
 
-    match hound::WavReader::open(&wav) {
-        Ok(reader) => {
-            let spec = reader.spec();
-            if spec.sample_rate != 16_000
-                || spec.channels != 1
-                || spec.bits_per_sample != 16
-                || spec.sample_format != hound::SampleFormat::Int
-            {
-                eprintln!(
-                    "error: expected 16 kHz mono 16-bit PCM WAV, got {} Hz / {} ch / {}-bit {:?}",
-                    spec.sample_rate, spec.channels, spec.bits_per_sample, spec.sample_format
-                );
-                return 2;
-            }
-        }
+    let decoded = match crate::audio_toolkit::decode_media_file(&wav, None) {
+        Ok(d) => d,
         Err(e) => {
-            eprintln!("error: cannot open {}: {}", wav.display(), e);
-            return 2;
-        }
-    }
-
-    let samples = match crate::audio_toolkit::read_wav_samples(&wav) {
-        Ok(s) => s,
-        Err(e) => {
-            eprintln!("error: failed to read {}: {}", wav.display(), e);
+            eprintln!("error: failed to read and decode {}: {}", wav.display(), e);
             return 2;
         }
     };
-    let audio_secs = samples.len() as f64 / 16_000.0;
+    let samples = decoded.samples;
+    let audio_secs = decoded.duration_secs;
 
     let tm = &ctx.transcription;
 
