@@ -50,3 +50,38 @@ pub fn list_output_devices() -> Result<Vec<CpalDeviceInfo>, Box<dyn std::error::
 
     Ok(out)
 }
+
+/// Check whether an input device name indicates a desktop/system audio monitor or loopback.
+pub fn is_monitor_device(name: &str) -> bool {
+    let lower = name.to_lowercase();
+    lower.contains("monitor")
+        || lower.contains("loopback")
+        || lower.contains("stereo mix")
+        || lower.contains("what u hear")
+}
+
+/// List all system audio / desktop output monitor devices for meeting participant capture.
+pub fn list_system_audio_sources() -> Result<Vec<CpalDeviceInfo>, Box<dyn std::error::Error>> {
+    let all_inputs = list_input_devices()?;
+    let mut monitors: Vec<CpalDeviceInfo> = all_inputs
+        .into_iter()
+        .filter(|d| is_monitor_device(&d.name))
+        .collect();
+
+    // If no explicit monitor device is listed by ALSA/Pulse, provide all output names as monitor hints
+    if monitors.is_empty() {
+        if let Ok(outputs) = list_output_devices() {
+            for out_dev in outputs {
+                monitors.push(CpalDeviceInfo {
+                    index: format!("mon_{}", out_dev.index),
+                    name: format!("Monitor of {}", out_dev.name),
+                    is_default: out_dev.is_default,
+                    device: out_dev.device,
+                });
+            }
+        }
+    }
+
+    Ok(monitors)
+}
+

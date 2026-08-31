@@ -26,6 +26,37 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         "Configure your primary recording device and capture behavior.",
     ));
 
+    // Audio Capture Source Mode (Microphone / System Audio / Meeting Mode)
+    let source_row = libadwaita::ComboRow::new();
+    source_row.set_title("Audio Capture Source");
+    source_row.set_subtitle("Capture microphone, system audio (Meet/Teams), or both");
+    let source_options = [
+        "Microphone Only (Standard)",
+        "System Audio Only (Live Meet / Video)",
+        "Meeting Mode (Mic + System Audio Mixed)",
+    ];
+    let source_model = gtk4::StringList::new(&source_options);
+    source_row.set_model(Some(&source_model));
+    let initial_source_idx = match settings.audio_capture_source {
+        crate::settings::AudioCaptureSource::MicrophoneOnly => 0,
+        crate::settings::AudioCaptureSource::SystemAudioOnly => 1,
+        crate::settings::AudioCaptureSource::Mixed => 2,
+    };
+    source_row.set_selected(initial_source_idx);
+    let src_ctx = ctx.clone();
+    source_row.connect_selected_notify(move |row| {
+        let mode = match row.selected() {
+            1 => crate::settings::AudioCaptureSource::SystemAudioOnly,
+            2 => crate::settings::AudioCaptureSource::Mixed,
+            _ => crate::settings::AudioCaptureSource::MicrophoneOnly,
+        };
+        let ctx = src_ctx.clone();
+        glib::spawn_future_local(async move {
+            let _ = commands::audio::set_audio_capture_source(&ctx, mode).await;
+        });
+    });
+    input_group.add(&source_row);
+
     // Microphone selection (combo, populated asynchronously)
     let mic_row = libadwaita::ComboRow::new();
     mic_row.set_title("Microphone Device");
@@ -38,6 +69,22 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     });
     input_group.add(&mic_row);
     populate_microphones(ctx, &mic_row);
+
+    // System Audio Loopback Device selection
+    let sys_audio_row = libadwaita::ComboRow::new();
+    sys_audio_row.set_title("System Audio Device");
+    sys_audio_row.set_subtitle("Select desktop output monitor source for meeting transcription");
+    let current_sys = settings
+        .selected_system_audio_device
+        .clone()
+        .unwrap_or_default();
+    sys_audio_row.set_subtitle(if current_sys.is_empty() {
+        "Default System Audio Monitor"
+    } else {
+        &current_sys
+    });
+    input_group.add(&sys_audio_row);
+    populate_system_audio_sources(ctx, &sys_audio_row);
 
     // Push-to-talk
     let ptt = libadwaita::SwitchRow::new();
@@ -403,6 +450,55 @@ fn populate_microphones(ctx: &AppContext, row: &libadwaita::ComboRow) {
                 }
                 Err(e) => {
                     log::warn!("Failed to enumerate microphones: {}", e);
+                }
+            }
+        });
+    });
+}
+
+/// Populate system audio monitor sources combo asynchronously.
+fn populate_system_audio_sources(ctx: &AppContext, row: &libadwaita::ComboRow) {
+    let ctx = ctx.clone();
+    let row_weak = glib::SendWeakRef::from(row.downgrade());
+    crate::runtime::spawn(async move {
+        let devices = commands::audio::get_available_system_audio_sources().await;
+        let row_weak = row_weak.clone();
+        let ctx = ctx.clone();
+        glib::MainContext::default().invoke(move || {
+            let Some(row) = row_weak.into_weak_ref().upgrade() else {
+                return;
+            };
+            match devices {
+                Ok(devices) => {
+                    let names: Vec<&str> = devices.iter().map(|d| d.name.as_str()).collect();
+                    let model = gtk4::StringList::new(&names);
+                    row.set_model(Some(&model));
+                    let current = ctx
+                        .settings()
+                        .selected_system_audio_device
+                        .unwrap_or_default();
+                    if let Some(i) = names.iter().position(|n| *n == current) {
+                        row.set_selected(i as u32);
+                    }
+                    let ctx_for_select = ctx.clone();
+                    row.connect_selected_notify(move |row| {
+                        if let Some(item) = row.selected_item() {
+                            let name = item
+                                .downcast_ref::<gtk4::StringObject>()
+                                .map(|s| s.string().to_string())
+                                .unwrap_or_default();
+                            let ctx = ctx_for_select.clone();
+                            glib::spawn_future_local(async move {
+                                let _ = commands::audio::set_selected_system_audio_device(
+                                    &ctx, name,
+                                )
+                                .await;
+                            });
+                        }
+                    });
+                }
+                Err(e) => {
+                    log::warn!("Failed to enumerate system audio sources: {}", e);
                 }
             }
         });

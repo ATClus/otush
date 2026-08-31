@@ -328,11 +328,27 @@ impl AudioRecordingManager {
 
     /* ---------- helper methods --------------------------------------------- */
 
-    /// The persisted microphone preference currently in effect.
+    /// The persisted microphone or system audio preference currently in effect.
     fn desired_microphone(&self, settings: &AppSettings) -> DesiredMicrophone {
-        match &settings.selected_microphone {
-            Some(name) => DesiredMicrophone::Selected(name.clone()),
-            None => DesiredMicrophone::Default,
+        match settings.audio_capture_source {
+            crate::settings::AudioCaptureSource::SystemAudioOnly => {
+                if let Some(ref name) = settings.selected_system_audio_device {
+                    DesiredMicrophone::Selected(name.clone())
+                } else if let Ok(monitors) = crate::audio_toolkit::list_system_audio_sources() {
+                    if let Some(first_mon) = monitors.into_iter().next() {
+                        DesiredMicrophone::Selected(first_mon.name)
+                    } else {
+                        DesiredMicrophone::Default
+                    }
+                } else {
+                    DesiredMicrophone::Default
+                }
+            }
+            crate::settings::AudioCaptureSource::MicrophoneOnly
+            | crate::settings::AudioCaptureSource::Mixed => match &settings.selected_microphone {
+                Some(name) => DesiredMicrophone::Selected(name.clone()),
+                None => DesiredMicrophone::Default,
+            },
         }
     }
 

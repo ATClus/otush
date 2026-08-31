@@ -10,7 +10,10 @@ pub use decoder::{
     decode_media_bytes, decode_media_file, resample_audio, DecodedAudio, ProgressCallback,
     TARGET_SAMPLE_RATE,
 };
-pub use device::{list_input_devices, list_output_devices, CpalDeviceInfo};
+pub use device::{
+    is_monitor_device, list_input_devices, list_output_devices, list_system_audio_sources,
+    CpalDeviceInfo,
+};
 pub use dsp::{HighPassFilter, NoiseGate, VoiceEnhancer, VoiceEnhancerConfig};
 pub use recorder::{
     is_microphone_access_denied, is_no_input_device_error, AudioRecorder, VadPolicy,

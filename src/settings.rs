@@ -259,6 +259,15 @@ pub enum AutoSubmitKey {
     CmdEnter,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioCaptureSource {
+    #[default]
+    MicrophoneOnly,
+    SystemAudioOnly,
+    Mixed,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingRetentionPeriod {
@@ -462,6 +471,10 @@ pub struct AppSettings {
     pub clamshell_microphone: Option<String>,
     #[serde(default)]
     pub selected_output_device: Option<String>,
+    #[serde(default = "default_audio_capture_source")]
+    pub audio_capture_source: AudioCaptureSource,
+    #[serde(default)]
+    pub selected_system_audio_device: Option<String>,
     #[serde(default = "default_translate_to_english")]
     pub translate_to_english: bool,
     #[serde(default = "default_selected_language")]
@@ -597,6 +610,10 @@ fn default_settings_schema_version() -> u32 {
 
 fn default_push_to_talk() -> bool {
     false
+}
+
+fn default_audio_capture_source() -> AudioCaptureSource {
+    AudioCaptureSource::MicrophoneOnly
 }
 
 fn default_always_on_microphone() -> bool {
@@ -1011,6 +1028,12 @@ fn default_post_process_prompts() -> Vec<LLMPrompt> {
             prompt: "<transcript>\n${output}\n</transcript>\n\nSummarize the key ideas and action items from the transcript above into concise, well-structured bullet points. Keep the language matching the source unless requested otherwise. Return only the bullet list.".to_string(),
             preferred_provider_id: None,
         },
+        LLMPrompt {
+            id: "default_meeting_minutes".to_string(),
+            name: "Meeting Minutes & Action Items".to_string(),
+            prompt: "<transcript>\n${output}\n</transcript>\n\nYou are an executive assistant. Generate structured meeting minutes from the transcript above:\n\n1. **Executive Summary**: 2-3 sentences summarizing the meeting purpose and outcome.\n2. **Key Discussion Points**: Grouped by topic.\n3. **Decisions Made**: Explicit list of agreed points.\n4. **Action Items**: Checklist of tasks with [Task | Assignee | Deadline].\n\nPreserve all important context and names. Return only formatted Markdown meeting notes.".to_string(),
+            preferred_provider_id: None,
+        },
     ]
 }
 
@@ -1211,6 +1234,8 @@ pub fn get_default_settings() -> AppSettings {
         selected_channel: None,
         clamshell_microphone: None,
         selected_output_device: None,
+        audio_capture_source: default_audio_capture_source(),
+        selected_system_audio_device: None,
         translate_to_english: false,
         selected_language: "auto".to_string(),
         overlay_position: default_overlay_position(),
