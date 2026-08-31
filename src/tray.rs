@@ -363,6 +363,21 @@ fn build_menu(ctx: &AppContext, icon_state: TrayIconState) -> Vec<ksni::MenuItem
         .into(),
     );
 
+    // Transcribe Media File
+    items.push(
+        StandardItem {
+            label: "Transcribe Media File…".to_string(),
+            activate: Box::new({
+                let ctx = ctx.clone();
+                move |_| {
+                    crate::ui::file_transcription::show_file_transcription_dialog(&ctx, None);
+                }
+            }),
+            ..Default::default()
+        }
+        .into(),
+    );
+
     items.push(MenuItem::Separator);
 
     if icon_state.is_busy() {

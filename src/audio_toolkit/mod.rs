@@ -9,8 +9,8 @@ pub mod vad;
 pub use audio::{
     decode_media_bytes, decode_media_file, is_microphone_access_denied, is_monitor_device,
     is_no_input_device_error, list_input_devices, list_output_devices, list_system_audio_sources,
-    read_wav_samples, resample_audio, save_wav_file, verify_wav_file, AudioRecorder, CpalDeviceInfo,
-    DecodedAudio, VadPolicy,
+    read_wav_samples, resample_audio, save_wav_file, verify_wav_file, AudioRecorder,
+    CpalDeviceInfo, DecodedAudio, VadPolicy,
 };
 pub use export::{
     export_to_json, export_to_markdown, export_to_srt, export_to_txt, export_to_vtt,

@@ -83,7 +83,10 @@ pub fn export_to_srt(segments: &[TranscriptSegment]) -> String {
         let end = format_timestamp_srt(seg.end_ms.max(seg.start_ms + 100));
         let text = seg.text.trim();
         if let Some(ref speaker) = seg.speaker {
-            out.push_str(&format!("{}\n{} --> {}\n[{}] {}\n\n", idx, start, end, speaker, text));
+            out.push_str(&format!(
+                "{}\n{} --> {}\n[{}] {}\n\n",
+                idx, start, end, speaker, text
+            ));
         } else {
             out.push_str(&format!("{}\n{} --> {}\n{}\n\n", idx, start, end, text));
         }
@@ -100,7 +103,10 @@ pub fn export_to_vtt(segments: &[TranscriptSegment]) -> String {
         let end = format_timestamp_vtt(seg.end_ms.max(seg.start_ms + 100));
         let text = seg.text.trim();
         if let Some(ref speaker) = seg.speaker {
-            out.push_str(&format!("{}\n{} --> {}\n<v {}>{}", idx, start, end, speaker, text));
+            out.push_str(&format!(
+                "{}\n{} --> {}\n<v {}>{}",
+                idx, start, end, speaker, text
+            ));
         } else {
             out.push_str(&format!("{}\n{} --> {}\n{}", idx, start, end, text));
         }

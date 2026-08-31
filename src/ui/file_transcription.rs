@@ -186,7 +186,9 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
         );
 
         let filter = gtk4::FileFilter::new();
-        filter.set_name(Some("Media Files (*.mp3, *.wav, *.m4a, *.mp4, *.flac, *.ogg, *.aac)"));
+        filter.set_name(Some(
+            "Media Files (*.mp3, *.wav, *.m4a, *.mp4, *.flac, *.ogg, *.aac)",
+        ));
         filter.add_mime_type("audio/*");
         filter.add_mime_type("video/*");
         filter.add_pattern("*.mp3");
@@ -417,71 +419,105 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
     });
 
     // Helper for export buttons
-    let setup_export_button = |btn: &gtk4::Button,
-                               ext: &'static str,
-                               doc_store: Arc<Mutex<Option<crate::audio_toolkit::TranscriptDocument>>>,
-                               parent_win: glib::SendWeakRef<libadwaita::Window>,
-                               toast: libadwaita::ToastOverlay| {
-        btn.connect_clicked(move |_| {
-            let doc_opt = doc_store.lock().unwrap().clone();
-            let Some(doc) = doc_opt else { return };
+    let setup_export_button =
+        |btn: &gtk4::Button,
+         ext: &'static str,
+         doc_store: Arc<Mutex<Option<crate::audio_toolkit::TranscriptDocument>>>,
+         parent_win: glib::SendWeakRef<libadwaita::Window>,
+         toast: libadwaita::ToastOverlay| {
+            btn.connect_clicked(move |_| {
+                let doc_opt = doc_store.lock().unwrap().clone();
+                let Some(doc) = doc_opt else { return };
 
-            let content = match ext {
-                "srt" => crate::audio_toolkit::export_to_srt(&doc.segments),
-                "vtt" => crate::audio_toolkit::export_to_vtt(&doc.segments),
-                "txt" => crate::audio_toolkit::export_to_txt(&doc.segments, true),
-                "json" => crate::audio_toolkit::export_to_json(&doc).unwrap_or_default(),
-                "md" => crate::audio_toolkit::export_to_markdown(&doc),
-                _ => String::new(),
-            };
+                let content = match ext {
+                    "srt" => crate::audio_toolkit::export_to_srt(&doc.segments),
+                    "vtt" => crate::audio_toolkit::export_to_vtt(&doc.segments),
+                    "txt" => crate::audio_toolkit::export_to_txt(&doc.segments, true),
+                    "json" => crate::audio_toolkit::export_to_json(&doc).unwrap_or_default(),
+                    "md" => crate::audio_toolkit::export_to_markdown(&doc),
+                    _ => String::new(),
+                };
 
-            let win = parent_win.clone().into_weak_ref().upgrade();
-            let chooser = gtk4::FileChooserNative::new(
-                Some(&format!("Save .{} Subtitles/Transcript", ext.to_uppercase())),
-                win.as_ref(),
-                gtk4::FileChooserAction::Save,
-                Some("Save"),
-                Some("Cancel"),
-            );
+                let win = parent_win.clone().into_weak_ref().upgrade();
+                let chooser = gtk4::FileChooserNative::new(
+                    Some(&format!(
+                        "Save .{} Subtitles/Transcript",
+                        ext.to_uppercase()
+                    )),
+                    win.as_ref(),
+                    gtk4::FileChooserAction::Save,
+                    Some("Save"),
+                    Some("Cancel"),
+                );
 
-            let base_name = Path::new(&doc.title)
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("transcript");
-            chooser.set_current_name(&format!("{}.{}", base_name, ext));
+                let base_name = Path::new(&doc.title)
+                    .file_stem()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("transcript");
+                chooser.set_current_name(&format!("{}.{}", base_name, ext));
 
-            let toast_clone = toast.clone();
-            chooser.connect_response(move |dialog, response| {
-                if response == gtk4::ResponseType::Accept {
-                    if let Some(file) = dialog.file() {
-                        if let Some(target_path) = file.path() {
-                            if let Err(e) = std::fs::write(&target_path, &content) {
-                                error!("Failed to write export file: {e}");
-                                toast_clone.add_toast(libadwaita::Toast::new(&format!(
-                                    "Failed to save file: {}",
-                                    e
-                                )));
-                            } else {
-                                toast_clone.add_toast(libadwaita::Toast::new(&format!(
-                                    "Saved to {}",
-                                    target_path.display()
-                                )));
+                let toast_clone = toast.clone();
+                chooser.connect_response(move |dialog, response| {
+                    if response == gtk4::ResponseType::Accept {
+                        if let Some(file) = dialog.file() {
+                            if let Some(target_path) = file.path() {
+                                if let Err(e) = std::fs::write(&target_path, &content) {
+                                    error!("Failed to write export file: {e}");
+                                    toast_clone.add_toast(libadwaita::Toast::new(&format!(
+                                        "Failed to save file: {}",
+                                        e
+                                    )));
+                                } else {
+                                    toast_clone.add_toast(libadwaita::Toast::new(&format!(
+                                        "Saved to {}",
+                                        target_path.display()
+                                    )));
+                                }
                             }
                         }
                     }
-                }
-            });
+                });
 
-            chooser.show();
-        });
-    };
+                chooser.show();
+            });
+        };
 
     let win_weak_export = glib::SendWeakRef::from(window.downgrade());
-    setup_export_button(&srt_btn, "srt", current_document.clone(), win_weak_export.clone(), toast_overlay.clone());
-    setup_export_button(&vtt_btn, "vtt", current_document.clone(), win_weak_export.clone(), toast_overlay.clone());
-    setup_export_button(&txt_btn, "txt", current_document.clone(), win_weak_export.clone(), toast_overlay.clone());
-    setup_export_button(&json_btn, "json", current_document.clone(), win_weak_export.clone(), toast_overlay.clone());
-    setup_export_button(&md_btn, "md", current_document.clone(), win_weak_export.clone(), toast_overlay.clone());
+    setup_export_button(
+        &srt_btn,
+        "srt",
+        current_document.clone(),
+        win_weak_export.clone(),
+        toast_overlay.clone(),
+    );
+    setup_export_button(
+        &vtt_btn,
+        "vtt",
+        current_document.clone(),
+        win_weak_export.clone(),
+        toast_overlay.clone(),
+    );
+    setup_export_button(
+        &txt_btn,
+        "txt",
+        current_document.clone(),
+        win_weak_export.clone(),
+        toast_overlay.clone(),
+    );
+    setup_export_button(
+        &json_btn,
+        "json",
+        current_document.clone(),
+        win_weak_export.clone(),
+        toast_overlay.clone(),
+    );
+    setup_export_button(
+        &md_btn,
+        "md",
+        current_document.clone(),
+        win_weak_export.clone(),
+        toast_overlay.clone(),
+    );
 
     window.present();
 }

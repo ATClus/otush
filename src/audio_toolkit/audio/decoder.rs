@@ -236,8 +236,11 @@ pub fn resample_audio(
         return Ok(Vec::new());
     }
 
-    let mut resampler =
-        crate::audio_toolkit::audio::FrameResampler::new(in_hz, out_hz, std::time::Duration::from_millis(30));
+    let mut resampler = crate::audio_toolkit::audio::FrameResampler::new(
+        in_hz,
+        out_hz,
+        std::time::Duration::from_millis(30),
+    );
 
     let expected_len = ((input.len() as f64 * out_hz as f64 / in_hz as f64).round()) as usize;
     let mut output: Vec<f32> = Vec::with_capacity(expected_len + 1024);

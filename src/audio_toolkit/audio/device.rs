@@ -84,4 +84,3 @@ pub fn list_system_audio_sources() -> Result<Vec<CpalDeviceInfo>, Box<dyn std::e
 
     Ok(monitors)
 }
-

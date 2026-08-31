@@ -489,10 +489,9 @@ fn populate_system_audio_sources(ctx: &AppContext, row: &libadwaita::ComboRow) {
                                 .unwrap_or_default();
                             let ctx = ctx_for_select.clone();
                             glib::spawn_future_local(async move {
-                                let _ = commands::audio::set_selected_system_audio_device(
-                                    &ctx, name,
-                                )
-                                .await;
+                                let _ =
+                                    commands::audio::set_selected_system_audio_device(&ctx, name)
+                                        .await;
                             });
                         }
                     });

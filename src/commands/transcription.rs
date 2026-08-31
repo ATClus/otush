@@ -64,12 +64,11 @@ pub async fn transcribe_media_file(
     let samples = decoded.samples.clone();
     let cb_stt = progress_callback.clone();
 
-    let mut doc = tokio::task::spawn_blocking(move || {
-        tm.transcribe_with_segments(samples, title, cb_stt)
-    })
-    .await
-    .map_err(|e| format!("Transcription task panicked: {}", e))?
-    .map_err(|e| format!("Transcription failed: {}", e))?;
+    let mut doc =
+        tokio::task::spawn_blocking(move || tm.transcribe_with_segments(samples, title, cb_stt))
+            .await
+            .map_err(|e| format!("Transcription task panicked: {}", e))?
+            .map_err(|e| format!("Transcription failed: {}", e))?;
 
     let full_text = doc
         .segments

@@ -49,7 +49,10 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     drop_target.connect_drop(move |_, value, _, _| {
         if let Ok(file) = value.get::<gio::File>() {
             if let Some(path) = file.path() {
-                crate::ui::file_transcription::show_file_transcription_dialog(&ctx_drop, Some(path));
+                crate::ui::file_transcription::show_file_transcription_dialog(
+                    &ctx_drop,
+                    Some(path),
+                );
                 return true;
             }
         }

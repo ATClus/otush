@@ -1571,7 +1571,9 @@ impl TranscriptionManager {
         let duration_secs = total_samples as f64 / 16000.0;
         let created_at_unix = chrono::Utc::now().timestamp();
         let settings = read_settings_from(&self.paths.settings_store_path());
-        let model_name = self.get_current_model().or_else(|| Some(settings.selected_model.clone()));
+        let model_name = self
+            .get_current_model()
+            .or_else(|| Some(settings.selected_model.clone()));
 
         if total_samples == 0 {
             return Ok(crate::audio_toolkit::TranscriptDocument {
