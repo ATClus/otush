@@ -33,7 +33,7 @@ backend in the same process. No webview, no Electron, no XWayland.
 - Ubuntu 24.04 LTS or newer (GNOME 46+, Wayland recommended)
 - For building, the native libraries:
   `libgtk-4-dev libadwaita-1-dev libasound2-dev
-  libssl-dev libvulkan-dev libopenblas-dev`
+  libssl-dev libvulkan-dev glslc spirv-headers glslang-tools libopenblas-dev`
 
 See [BUILD.md](BUILD.md) for the full build guide and [QA.md](QA.md) for the
 manual QA checklist on Ubuntu 24.04 / GNOME 46 / Wayland.

@@ -1,0 +1,57 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  publish-release:
+    name: Build and Publish Release
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v5
+
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            build-essential pkg-config libgtk-4-dev libadwaita-1-dev \
+            libasound2-dev libssl-dev \
+            libvulkan-dev glslc glslang-tools spirv-headers spirv-tools libopenblas-dev
+
+      - name: Setup Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust Cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Build Debian package (.deb)
+        run: |
+          cargo install cargo-deb --locked
+          cargo deb
+
+      - name: Package standalone binary archive (.tar.gz)
+        run: |
+          mkdir -p staging
+          cp target/release/otush staging/
+          cp LICENSE staging/ 2>/dev/null || true
+          cp README.md staging/ 2>/dev/null || true
+          tar -czvf target/otush-linux-x86_64.tar.gz -C staging .
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            target/debian/*.deb
+            target/otush-linux-x86_64.tar.gz
+          generate_release_notes: true
+          draft: false
+          prerelease: false

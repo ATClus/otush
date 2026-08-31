@@ -8,7 +8,7 @@ This file provides guidance to AI coding assistants working with code in this re
 
 - [Rust](https://rustup.rs/) (latest stable)
 - Ubuntu 24.04+ native libraries (see [BUILD.md](BUILD.md)):
-  `libgtk-4-dev libadwaita-1-dev libasound2-dev libssl-dev libvulkan-dev libopenblas-dev`
+  `libgtk-4-dev libadwaita-1-dev libasound2-dev libssl-dev libvulkan-dev glslc spirv-headers glslang-tools libopenblas-dev`
 
 **Core Development:**
 
