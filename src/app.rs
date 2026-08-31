@@ -80,11 +80,6 @@ fn subscribe_bus(ctx: &AppContext, toasts: &libadwaita::ToastOverlay) {
                     };
                     toasts.add_toast(libadwaita::Toast::new(&message));
                 }
-                AppEvent::ModelDownloadFailed { model_id, .. } => {
-                    toasts.add_toast(libadwaita::Toast::new(&format!(
-                        "Model download failed: {model_id}"
-                    )));
-                }
                 AppEvent::ThemeChanged(theme) => apply_theme(theme),
                 _ => {}
             }
@@ -99,14 +94,16 @@ pub fn run_gtk(ctx: AppContext, cli_args: &CliArgs) {
         gio::ApplicationFlags::HANDLES_COMMAND_LINE,
     );
 
-    let _ = APP_CTX.set(ctx.clone());
+    let _ = APP_CTX.set(ctx);
 
     let no_tray = cli_args.no_tray;
+    let start_hidden_cli = cli_args.start_hidden;
     app.connect_activate(move |app| {
         let Some(ctx) = APP_CTX.get() else {
             return;
         };
-        if MAIN_WINDOW.get().is_none() {
+        let is_first_init = MAIN_WINDOW.get().is_none();
+        if is_first_init {
             let (window, toasts) = crate::ui::window::build_main_window(app, ctx);
             subscribe_bus(ctx, &toasts);
             let _ = MAIN_WINDOW.set(glib::SendWeakRef::from(window.downgrade()));
@@ -128,8 +125,8 @@ pub fn run_gtk(ctx: AppContext, cli_args: &CliArgs) {
             }
         }
         // Respect start_hidden on the first show; later activates always show.
-        let start_hidden = ctx.settings().start_hidden;
-        if !start_hidden || MAIN_WINDOW.get().is_some() {
+        let start_hidden = start_hidden_cli || ctx.settings().start_hidden;
+        if !start_hidden || !is_first_init {
             show_main_window();
         }
     });
@@ -147,6 +144,19 @@ pub fn run_gtk(ctx: AppContext, cli_args: &CliArgs) {
         let mut handled = false;
 
         if let Some(ctx) = APP_CTX.get() {
+            let is_remote_control = args.iter().any(|a| {
+                a == "--toggle-transcription"
+                    || a == "--toggle-post-process"
+                    || a == "--transform-selection"
+                    || a == "--cancel"
+            });
+
+            // Ensure app subsystems (window shell, overlay, enigo, tray) are
+            // initialized on first launch before processing remote-control commands.
+            if is_remote_control && MAIN_WINDOW.get().is_none() {
+                app.activate();
+            }
+
             if args.iter().any(|a| a == "--toggle-transcription") {
                 crate::signal_handle::send_transcription_input(ctx, "transcribe", "CLI");
                 handled = true;
@@ -159,19 +169,20 @@ pub fn run_gtk(ctx: AppContext, cli_args: &CliArgs) {
                 );
                 handled = true;
             }
+            if args.iter().any(|a| a == "--transform-selection") {
+                crate::ui::prompt_palette::show_prompt_palette(ctx);
+                handled = true;
+            }
             if args.iter().any(|a| a == "--cancel") {
                 crate::utils::cancel_current_operation(ctx);
                 handled = true;
             }
+            if args.iter().any(|a| a == "--start-hidden") && MAIN_WINDOW.get().is_some() {
+                handled = true;
+            }
         }
 
-        if handled {
-            // The app must stay alive as a tray app even when it was launched
-            // with a remote-control flag and has no window yet.
-            if MAIN_WINDOW.get().is_none() {
-                app.activate();
-            }
-        } else {
+        if !handled {
             app.activate();
         }
         glib::ExitCode::from(0)

@@ -33,8 +33,7 @@ impl TrayIconState {
     }
 }
 
-/// Tray icon theme. Linux always uses the colored (pink) icon set; the
-/// light/dark variants are kept for other platforms' themes.
+/// Tray icon theme.
 #[allow(dead_code)]
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppTheme {
@@ -43,9 +42,11 @@ pub enum AppTheme {
     Colored,
 }
 
-/// Gets the current app theme; Linux always uses the colored theme.
+/// Gets the current app theme. GNOME Shell's top bar is dark by default,
+/// so the symbolic Dark theme (crisp white icon with red indicator on recording)
+/// provides the native GNOME 46+ status area look.
 pub fn get_current_theme(_ctx: &AppContext) -> AppTheme {
-    AppTheme::Colored
+    AppTheme::Dark
 }
 
 /// Gets the appropriate icon path (relative to the resource dir) for the
@@ -116,11 +117,11 @@ impl ksni::Tray for OtushTray {
         if !snapshot.visible {
             return vec![];
         }
-        let path = get_icon_path(get_current_theme(&self.ctx), snapshot.icon_state, false);
-        match load_pixmap(crate::resources::resource(path)) {
+        let name = get_icon_path(get_current_theme(&self.ctx), snapshot.icon_state, false);
+        match load_pixmap(name) {
             Some(icon) => vec![icon],
             None => {
-                warn!("Failed to load tray icon from {}", path);
+                warn!("Failed to load tray icon from {}", name);
                 vec![]
             }
         }
@@ -132,20 +133,72 @@ impl ksni::Tray for OtushTray {
     }
 }
 
-/// Decode a PNG into an ARGB32 `ksni::Icon` (network byte order).
-fn load_pixmap(path: std::path::PathBuf) -> Option<ksni::Icon> {
-    let img = image::open(&path).ok()?;
+/// The tray icon PNGs are embedded in the binary so the tray works regardless
+/// of how (or where) the app is installed — no filesystem resource lookup can
+/// fail or be shadowed by a stale resources directory.
+fn embedded_icon_bytes(name: &str) -> Option<&'static [u8]> {
+    Some(match name {
+        "otush.png" => include_bytes!("../resources/otush.png"),
+        "recording.png" => include_bytes!("../resources/recording.png"),
+        "transcribing.png" => include_bytes!("../resources/transcribing.png"),
+        "tray_idle.png" => include_bytes!("../resources/tray_idle.png"),
+        "tray_idle_dark.png" => include_bytes!("../resources/tray_idle_dark.png"),
+        "tray_idle_warning.png" => include_bytes!("../resources/tray_idle_warning.png"),
+        "tray_idle_warning_dark.png" => include_bytes!("../resources/tray_idle_warning_dark.png"),
+        "tray_recording.png" => include_bytes!("../resources/tray_recording.png"),
+        "tray_recording_dark.png" => include_bytes!("../resources/tray_recording_dark.png"),
+        "tray_transcribing.png" => include_bytes!("../resources/tray_transcribing.png"),
+        "tray_transcribing_dark.png" => include_bytes!("../resources/tray_transcribing_dark.png"),
+        _ => return None,
+    })
+}
+
+/// Decode an embedded PNG into an ARGB32 `ksni::Icon` (network byte order), caching results.
+fn load_pixmap(name: &str) -> Option<ksni::Icon> {
+    use std::collections::HashMap;
+
+    static PIXMAP_CACHE: OnceLock<Mutex<HashMap<&'static str, ksni::Icon>>> = OnceLock::new();
+    let cache = PIXMAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    {
+        let guard = cache.lock().unwrap();
+        if let Some(icon) = guard.get(name) {
+            return Some(icon.clone());
+        }
+    }
+
+    let bytes = embedded_icon_bytes(name)?;
+    let img = image::load_from_memory(bytes).ok()?;
     let (width, height) = img.dimensions();
     let mut data = img.into_rgba8().into_vec();
     // ksni expects ARGB32; the image crate yields RGBA.
     for pixel in data.as_chunks_mut::<4>().0 {
         pixel.rotate_right(1);
     }
-    Some(ksni::Icon {
+    let icon = ksni::Icon {
         width: width as i32,
         height: height as i32,
         data,
-    })
+    };
+
+    let static_key = match name {
+        "otush.png" => "otush.png",
+        "recording.png" => "recording.png",
+        "transcribing.png" => "transcribing.png",
+        "tray_idle.png" => "tray_idle.png",
+        "tray_idle_dark.png" => "tray_idle_dark.png",
+        "tray_idle_warning.png" => "tray_idle_warning.png",
+        "tray_idle_warning_dark.png" => "tray_idle_warning_dark.png",
+        "tray_recording.png" => "tray_recording.png",
+        "tray_recording_dark.png" => "tray_recording_dark.png",
+        "tray_transcribing.png" => "tray_transcribing.png",
+        "tray_transcribing_dark.png" => "tray_transcribing_dark.png",
+        _ => return Some(icon),
+    };
+
+    let mut guard = cache.lock().unwrap();
+    guard.insert(static_key, icon.clone());
+    Some(icon)
 }
 
 fn snapshot_handle() -> Arc<Mutex<TraySnapshot>> {
@@ -173,7 +226,7 @@ pub fn sync_tray(ctx: &AppContext) {
             return;
         }
         let tray = OtushTray {
-            ctx: ctx.clone(),
+            ctx,
             snapshot: snapshot_handle(),
         };
         use ksni::blocking::TrayMethods;
@@ -329,6 +382,38 @@ fn build_menu(ctx: &AppContext, icon_state: TrayIconState) -> Vec<ksni::MenuItem
             .into(),
         );
     } else {
+        // Mode toggle: Local vs Cloud Providers
+        let local_mode = settings.local_transcription_enabled;
+        let mode_label = if local_mode {
+            "Transcription: Local Mode (Offline)"
+        } else {
+            "Transcription: Cloud Providers"
+        };
+        items.push(
+            StandardItem {
+                label: mode_label.to_string(),
+                activate: Box::new({
+                    let ctx = ctx.clone();
+                    move |_| {
+                        let ctx = ctx.clone();
+                        std::thread::spawn(move || {
+                            let mut s = settings::get_settings(&ctx);
+                            s.local_transcription_enabled = !s.local_transcription_enabled;
+                            let new_val = s.local_transcription_enabled;
+                            settings::write_settings(&ctx, s);
+                            ctx.notify_setting_changed(
+                                "local_transcription_enabled",
+                                serde_json::json!(new_val),
+                            );
+                            update_tray_menu(&ctx);
+                        });
+                    }
+                }),
+                ..Default::default()
+            }
+            .into(),
+        );
+
         // Model submenu
         let models: Vec<(String, String)> = ctx
             .model
@@ -415,6 +500,26 @@ fn build_menu(ctx: &AppContext, icon_state: TrayIconState) -> Vec<ksni::MenuItem
 #[cfg(test)]
 mod tests {
     use super::{get_icon_path, AppTheme, TrayIconState};
+
+    #[test]
+    fn dark_theme_uses_symbolic_icons() {
+        assert_eq!(
+            get_icon_path(AppTheme::Dark, TrayIconState::Idle, false),
+            "tray_idle.png"
+        );
+        assert_eq!(
+            get_icon_path(AppTheme::Dark, TrayIconState::Recording, false),
+            "tray_recording.png"
+        );
+        assert_eq!(
+            get_icon_path(AppTheme::Dark, TrayIconState::Transcribing, false),
+            "tray_transcribing.png"
+        );
+        assert_eq!(
+            get_icon_path(AppTheme::Dark, TrayIconState::Idle, true),
+            "tray_idle_warning.png"
+        );
+    }
 
     #[test]
     fn colored_theme_uses_otush_icon_when_idle() {

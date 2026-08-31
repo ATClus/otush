@@ -9,7 +9,6 @@ mod app;
 mod audio_feedback;
 pub mod audio_toolkit;
 mod autostart;
-mod catalog;
 pub mod cli;
 mod clipboard;
 mod commands;
@@ -27,6 +26,7 @@ mod runtime;
 mod settings;
 mod shortcut;
 mod signal_handle;
+pub mod stt_client;
 mod transcription_coordinator;
 mod tray;
 mod tray_i18n;
@@ -38,9 +38,7 @@ pub use cli::CliArgs;
 pub use context::{AppContext, AppEvent, AppPaths, EventBus};
 pub use transcription_coordinator::TranscriptionCoordinator;
 
-// Re-exported so existing `crate::FILE_LOG_LEVEL` / `crate::WEBVIEW_LOG_STREAMING`
-// references keep working after the move into the logging module.
-pub use logging::{FILE_LOG_LEVEL, WEBVIEW_LOG_STREAMING};
+pub use logging::{FILE_LOG_LEVEL, UI_LOG_STREAMING, WEBVIEW_LOG_STREAMING};
 
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
@@ -375,6 +373,15 @@ pub fn run(cli_args: CliArgs) {
     }
 
     init_core(&ctx, &cli_args);
+
+    // Set GLib application identity and ensure desktop entry is registered for XDG Desktop Portal
+    glib::set_prgname(Some("com.clusterat.otush"));
+    autostart::ensure_desktop_entry_registered();
+
+    // Ensure autostart entry is synchronized if enabled in settings
+    if ctx.settings().autostart_enabled {
+        autostart::apply_autostart(&ctx, true);
+    }
 
     // Non-headless: run the native GNOME shell (GTK4/libadwaita).
     crate::app::run_gtk(ctx, &cli_args);
