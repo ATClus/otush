@@ -27,6 +27,7 @@ mod settings;
 mod shortcut;
 mod signal_handle;
 pub mod stt_client;
+pub mod template;
 mod transcription_coordinator;
 mod tray;
 mod tray_i18n;

@@ -233,7 +233,7 @@ fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwes
     let timeout_secs = if provider.timeout_seconds > 0 {
         provider.timeout_seconds
     } else {
-        10
+        60
     };
     reqwest::Client::builder()
         .default_headers(headers)

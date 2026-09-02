@@ -16,7 +16,7 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let transcribe_group = libadwaita::PreferencesGroup::new();
     transcribe_group.set_title("File Transcription");
     transcribe_group.set_description(Some(
-        "Drag & drop audio or video files here, or click to transcribe media files into text and subtitles.",
+        "Drag &amp; drop audio or video files here, or click to transcribe media files into text and subtitles.",
     ));
 
     let file_action_row = libadwaita::ActionRow::new();
