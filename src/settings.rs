@@ -762,7 +762,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 10,
+            timeout_seconds: 60,
         },
         PostProcessProvider {
             id: "anthropic".to_string(),
@@ -774,7 +774,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 12,
+            timeout_seconds: 60,
         },
         PostProcessProvider {
             id: "gemini".to_string(),
@@ -786,7 +786,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 10,
+            timeout_seconds: 60,
         },
         PostProcessProvider {
             id: "groq".to_string(),
@@ -798,7 +798,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 8,
+            timeout_seconds: 60,
         },
         PostProcessProvider {
             id: "deepseek".to_string(),
@@ -810,7 +810,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 15,
+            timeout_seconds: 60,
         },
         PostProcessProvider {
             id: "mistral".to_string(),
@@ -822,7 +822,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 10,
+            timeout_seconds: 60,
         },
         PostProcessProvider {
             id: "openrouter".to_string(),
@@ -834,7 +834,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 12,
+            timeout_seconds: 60,
         },
         PostProcessProvider {
             id: "zai".to_string(),
@@ -846,7 +846,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 10,
+            timeout_seconds: 60,
         },
         PostProcessProvider {
             id: "cerebras".to_string(),
@@ -858,7 +858,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 8,
+            timeout_seconds: 60,
         },
         PostProcessProvider {
             id: "ollama".to_string(),
@@ -870,7 +870,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 15,
+            timeout_seconds: 60,
         },
     ];
 
@@ -885,7 +885,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         reasoning: ProviderReasoningConfig::default(),
         enabled: true,
         custom_headers: HashMap::new(),
-        timeout_seconds: 10,
+        timeout_seconds: 60,
     });
 
     // Custom provider always comes last
@@ -899,7 +899,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         reasoning: ProviderReasoningConfig::default(),
         enabled: true,
         custom_headers: HashMap::new(),
-        timeout_seconds: 15,
+        timeout_seconds: 60,
     });
 
     providers
