@@ -84,3 +84,36 @@ pub fn list_system_audio_sources() -> Result<Vec<CpalDeviceInfo>, Box<dyn std::e
 
     Ok(monitors)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_dump_audio_devices() {
+        if let Ok(inputs) = list_input_devices() {
+            println!("=== CPAL INPUT DEVICES ({}) ===", inputs.len());
+            for d in inputs {
+                println!(
+                    "  INPUT: index={} name='{}' is_default={}",
+                    d.index, d.name, d.is_default
+                );
+            }
+        }
+        if let Ok(outputs) = list_output_devices() {
+            println!("=== CPAL OUTPUT DEVICES ({}) ===", outputs.len());
+            for d in outputs {
+                println!(
+                    "  OUTPUT: index={} name='{}' is_default={}",
+                    d.index, d.name, d.is_default
+                );
+            }
+        }
+        if let Ok(sys) = list_system_audio_sources() {
+            println!("=== SYSTEM AUDIO SOURCES ({}) ===", sys.len());
+            for d in sys {
+                println!("  SYSTEM SOURCE: index={} name='{}'", d.index, d.name);
+            }
+        }
+    }
+}

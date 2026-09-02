@@ -328,27 +328,26 @@ impl AudioRecordingManager {
 
     /* ---------- helper methods --------------------------------------------- */
 
-    /// The persisted microphone or system audio preference currently in effect.
-    fn desired_microphone(&self, settings: &AppSettings) -> DesiredMicrophone {
-        match settings.audio_capture_source {
-            crate::settings::AudioCaptureSource::SystemAudioOnly => {
-                if let Some(ref name) = settings.selected_system_audio_device {
-                    DesiredMicrophone::Selected(name.clone())
-                } else if let Ok(monitors) = crate::audio_toolkit::list_system_audio_sources() {
-                    if let Some(first_mon) = monitors.into_iter().next() {
-                        DesiredMicrophone::Selected(first_mon.name)
-                    } else {
-                        DesiredMicrophone::Default
-                    }
-                } else {
-                    DesiredMicrophone::Default
+    /// Resolve desired microphone device, prioritizing system audio monitor when in meeting mode.
+    fn desired_microphone_for_binding(
+        &self,
+        settings: &AppSettings,
+        is_meeting: bool,
+    ) -> DesiredMicrophone {
+        if is_meeting {
+            DesiredMicrophone::Selected("System Audio Monitor".to_string())
+        } else {
+            match settings.audio_capture_source {
+                crate::settings::AudioCaptureSource::SystemAudioOnly => {
+                    DesiredMicrophone::Selected("System Audio Monitor".to_string())
                 }
+                crate::settings::AudioCaptureSource::MicrophoneOnly
+                | crate::settings::AudioCaptureSource::Mixed => match &settings.selected_microphone
+                {
+                    Some(name) => DesiredMicrophone::Selected(name.clone()),
+                    None => DesiredMicrophone::Default,
+                },
             }
-            crate::settings::AudioCaptureSource::MicrophoneOnly
-            | crate::settings::AudioCaptureSource::Mixed => match &settings.selected_microphone {
-                Some(name) => DesiredMicrophone::Selected(name.clone()),
-                None => DesiredMicrophone::Default,
-            },
         }
     }
 
@@ -356,8 +355,12 @@ impl AudioRecordingManager {
         *self.cached_device.lock().unwrap() = None;
     }
 
-    fn resolve_microphone_device(&self, settings: &AppSettings) -> MicrophoneResolution {
-        let desired = self.desired_microphone(settings);
+    fn resolve_microphone_device_for_binding(
+        &self,
+        settings: &AppSettings,
+        is_meeting: bool,
+    ) -> MicrophoneResolution {
+        let desired = self.desired_microphone_for_binding(settings, is_meeting);
         let (device_name, selected_microphone) = match desired {
             DesiredMicrophone::Default => {
                 debug!("device resolve: no mic configured -> system default");
@@ -516,12 +519,19 @@ impl AudioRecordingManager {
     }
 
     pub fn start_microphone_stream(&self) -> Result<(), anyhow::Error> {
+        self.start_microphone_stream_for_binding(false)
+    }
+
+    pub fn start_microphone_stream_for_binding(
+        &self,
+        is_meeting: bool,
+    ) -> Result<(), anyhow::Error> {
         let mut open_flag = self.is_open.lock().unwrap();
+        let settings = read_settings_from(&self.paths.settings_store_path());
+        let desired = self.desired_microphone_for_binding(&settings, is_meeting);
+
         if *open_flag {
-            // `is_open` only records that we opened a stream at some point, not
-            // that one is still running. If capture has since failed (mic
-            // unplugged mid-session, USB dropout), rebuild it before the next
-            // recording instead of handing the caller a stalled recorder.
+            // Check if active stream is still alive
             let needs_reopen = self
                 .recorder
                 .lock()
@@ -529,15 +539,53 @@ impl AudioRecordingManager {
                 .as_ref()
                 .is_some_and(|rec| rec.needs_reopen());
 
-            if !needs_reopen {
-                // trace, not debug: with the aliveness check in
-                // try_start_recording this now fires on every keypress in
-                // always-on mode.
-                trace!("Microphone stream already active");
+            let current_is_monitor = self
+                .recorder
+                .lock()
+                .unwrap()
+                .as_ref()
+                .is_some_and(|rec| rec.is_monitor());
+            let target_is_monitor = is_meeting
+                || matches!(
+                    settings.audio_capture_source,
+                    crate::settings::AudioCaptureSource::SystemAudioOnly
+                );
+
+            // Check if desired capture device changed
+            let current_cached_name = self
+                .cached_device
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|(n, _)| n.clone());
+            let target_device_name = match &desired {
+                DesiredMicrophone::Default => None,
+                DesiredMicrophone::Selected(name) => Some(name.clone()),
+            };
+
+            let device_changed = if current_is_monitor != target_is_monitor {
+                true
+            } else if target_is_monitor {
+                false
+            } else {
+                match (&target_device_name, &current_cached_name) {
+                    (Some(target), Some(cached)) => target != cached,
+                    (Some(_), None) => true,
+                    (None, Some(_)) => true,
+                    (None, None) => false,
+                }
+            };
+
+            if !needs_reopen && !device_changed {
+                trace!("Microphone stream already active with desired device");
                 return Ok(());
             }
 
-            warn!("Microphone stream is no longer running (device disconnected?); reopening");
+            if device_changed {
+                info!("Target capture device changed; rebuilding audio stream");
+            } else {
+                warn!("Microphone stream is no longer running (device disconnected?); reopening");
+            }
 
             // Torn down inline rather than via stop_microphone_stream(), which
             // takes the `is_open` lock we are already holding.
@@ -561,9 +609,6 @@ impl AudioRecordingManager {
         let start_time = Instant::now();
 
         // Don't mute immediately - caller will handle muting after audio feedback.
-        // The previous stream restored audio on close, so did_mute should already
-        // be false here; if it somehow isn't, restore rather than just clearing the
-        // flag, which would strand system audio muted.
         {
             let mut mute_guard = self.mute_state.lock().unwrap();
             if mute_guard.did_mute {
@@ -572,14 +617,8 @@ impl AudioRecordingManager {
             }
         }
 
-        // Get the selected device from settings, considering clamshell mode.
-        // No pre-flight enumeration here: when nothing is configured the
-        // recorder resolves the system default itself, and a machine with no
-        // input devices at all fails inside open() with the same
-        // "No input device found" error this used to check for.
-        let settings = read_settings_from(&self.paths.settings_store_path());
         let resolve_started = Instant::now();
-        let mut resolution = self.resolve_microphone_device(&settings);
+        let mut resolution = self.resolve_microphone_device_for_binding(&settings, is_meeting);
         let resolve_elapsed = resolve_started.elapsed();
 
         // Ensure VAD is loaded if it wasn't for whatever reason
@@ -590,13 +629,21 @@ impl AudioRecordingManager {
         let open_started = Instant::now();
         let mut recorder_opt = self.recorder.lock().unwrap();
         if let Some(rec) = recorder_opt.as_mut() {
-            if let Err(first_err) = rec.open(resolution.device.clone()) {
-                // A cached device or config may have gone stale (unplugged,
-                // rate/format changed). Re-resolve from a fresh enumeration and
-                // retry once before surfacing the error.
+            if is_meeting
+                || matches!(
+                    settings.audio_capture_source,
+                    crate::settings::AudioCaptureSource::SystemAudioOnly
+                )
+            {
+                if let Err(first_err) = rec.open_monitor() {
+                    warn!("Monitor stream open failed ({first_err}); falling back to standard input device");
+                    rec.open(resolution.device.clone())
+                        .map_err(|e| anyhow::anyhow!("Failed to open recorder: {}", e))?;
+                }
+            } else if let Err(first_err) = rec.open(resolution.device.clone()) {
                 warn!("Recorder open failed ({first_err}); re-resolving device and retrying once");
                 self.invalidate_device_cache();
-                resolution = self.resolve_microphone_device(&settings);
+                resolution = self.resolve_microphone_device_for_binding(&settings, is_meeting);
                 rec.open(resolution.device.clone())
                     .map_err(|e| anyhow::anyhow!("Failed to open recorder: {}", e))?;
             }
@@ -610,10 +657,12 @@ impl AudioRecordingManager {
         drop(recorder_opt);
 
         *open_flag = true;
-        if let Some(unavailable_name) = resolution.unavailable_selected_microphone {
-            // Do this only after the default stream opened successfully. A
-            // failed fallback must not erase the user's microphone preference.
-            self.persist_default_microphone_after_fallback(&unavailable_name);
+        if !is_meeting {
+            if let Some(unavailable_name) = resolution.unavailable_selected_microphone {
+                // Do this only after the default stream opened successfully. A
+                // failed fallback must not erase the user's microphone preference.
+                self.persist_default_microphone_after_fallback(&unavailable_name);
+            }
         }
         // This timing covers through cpal's stream.play() returning — i.e. the
         // point cpal surfaces as "stream running." It does NOT guarantee the
@@ -705,12 +754,8 @@ impl AudioRecordingManager {
             // Cancel any pending lazy close (no-op in always-on mode, where
             // closes are never scheduled).
             self.close_generation.fetch_add(1, Ordering::SeqCst);
-            // Opens the stream in on-demand mode. In always-on mode the stream
-            // is normally already open and this is a cheap aliveness check —
-            // but if the capture worker died (device disconnect), it rebuilds
-            // the stream instead of leaving every subsequent start wedged on
-            // "Recorder not available".
-            if let Err(e) = self.start_microphone_stream() {
+            let is_meeting = binding_id == "transcribe_meeting";
+            if let Err(e) = self.start_microphone_stream_for_binding(is_meeting) {
                 let msg = format!("{e}");
                 error!("Failed to open microphone stream: {msg}");
                 return Err(msg);
