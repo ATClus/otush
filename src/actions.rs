@@ -69,12 +69,6 @@ fn strip_think_block(s: &str) -> &str {
     s
 }
 
-/// Build a system prompt from the user's prompt template.
-/// Removes `${output}` placeholder since the transcription is sent as the user message.
-fn build_system_prompt(prompt_template: &str) -> String {
-    prompt_template.replace("${output}", "").trim().to_string()
-}
-
 /// Returns `true` when a transcription has no meaningful content to
 /// post-process (empty or whitespace-only). Used to skip the post-processing
 /// LLM call when nothing was actually transcribed, which would otherwise make
@@ -112,6 +106,15 @@ pub(crate) async fn post_process_transcription(
     settings: &crate::settings::AppSettings,
     transcription: &str,
 ) -> Option<String> {
+    let template_ctx = crate::template::TemplateContext::new(transcription);
+    post_process_transcription_with_context(settings, transcription, &template_ctx).await
+}
+
+pub(crate) async fn post_process_transcription_with_context(
+    settings: &crate::settings::AppSettings,
+    transcription: &str,
+    template_ctx: &crate::template::TemplateContext,
+) -> Option<String> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because the transcription is empty");
         return None;
@@ -136,12 +139,23 @@ pub(crate) async fn post_process_transcription(
         }
     };
 
-    post_process_text_with_prompt(settings, transcription, prompt_obj).await
+    post_process_text_with_prompt_and_context(settings, transcription, prompt_obj, template_ctx)
+        .await
 }
 
+#[allow(dead_code)]
 pub(crate) async fn post_process_meeting_transcription(
     settings: &crate::settings::AppSettings,
     transcription: &str,
+) -> (Option<String>, Option<String>) {
+    let template_ctx = crate::template::TemplateContext::new(transcription);
+    post_process_meeting_transcription_with_context(settings, transcription, &template_ctx).await
+}
+
+pub(crate) async fn post_process_meeting_transcription_with_context(
+    settings: &crate::settings::AppSettings,
+    transcription: &str,
+    template_ctx: &crate::template::TemplateContext,
 ) -> (Option<String>, Option<String>) {
     if is_blank_transcription(transcription) {
         debug!("Meeting post-processing skipped because the transcription is empty");
@@ -163,7 +177,13 @@ pub(crate) async fn post_process_meeting_transcription(
         }
     };
 
-    let processed = post_process_text_with_prompt(settings, transcription, prompt_obj).await;
+    let processed = post_process_text_with_prompt_and_context(
+        settings,
+        transcription,
+        prompt_obj,
+        template_ctx,
+    )
+    .await;
     (processed, Some(prompt_obj.prompt.clone()))
 }
 
@@ -171,6 +191,17 @@ pub(crate) async fn post_process_text_with_prompt(
     settings: &crate::settings::AppSettings,
     transcription: &str,
     prompt_obj: &crate::settings::LLMPrompt,
+) -> Option<String> {
+    let template_ctx = crate::template::TemplateContext::new(transcription);
+    post_process_text_with_prompt_and_context(settings, transcription, prompt_obj, &template_ctx)
+        .await
+}
+
+pub(crate) async fn post_process_text_with_prompt_and_context(
+    settings: &crate::settings::AppSettings,
+    transcription: &str,
+    prompt_obj: &crate::settings::LLMPrompt,
+    template_ctx: &crate::template::TemplateContext,
 ) -> Option<String> {
     if is_blank_transcription(transcription) {
         debug!("Post-processing skipped because input text is empty");
@@ -253,7 +284,8 @@ pub(crate) async fn post_process_text_with_prompt(
             provider.id, effective_model, provider.supports_structured_output
         );
 
-        let system_prompt = build_system_prompt(prompt);
+        let system_prompt =
+            crate::template::expand_template_for_system_prompt(prompt, template_ctx);
         let user_content = transcription.to_string();
 
         info!(
@@ -331,7 +363,13 @@ pub(crate) async fn post_process_text_with_prompt(
         }
 
         // Standard completion attempt
-        let processed_prompt = prompt.replace("${output}", transcription);
+        let processed_prompt = if crate::template::has_input_placeholder(prompt) {
+            crate::template::expand_template(prompt, template_ctx)
+        } else {
+            let expanded_instruction = crate::template::expand_template(prompt, template_ctx);
+            format!("{}\n\n{}", expanded_instruction.trim(), transcription)
+        };
+
         info!(
             "Standard completion prompt for provider '{}' (model: {}):\n{}",
             provider.id, effective_model, processed_prompt
@@ -432,7 +470,7 @@ pub(crate) struct ProcessedTranscription {
 /// paths apply (see [`crate::managers::model::effective_language`]). Post-processing
 /// resolves it independently so it agrees with the language the transcription ran
 /// in, without threading a value through the pipeline.
-fn resolve_effective_language(ctx: &AppContext, settings: &AppSettings) -> String {
+pub(crate) fn resolve_effective_language(ctx: &AppContext, settings: &AppSettings) -> String {
     let tm = &ctx.transcription;
     let model_manager = &ctx.model;
     let active_model = tm
@@ -469,16 +507,21 @@ pub(crate) async fn process_transcription_output(
         final_text = converted_text;
     }
 
+    let template_ctx = crate::template::TemplateContext::gather(ctx, &final_text, None, None, None);
+
     if is_meeting {
         let (processed_text, prompt_used) =
-            post_process_meeting_transcription(&settings, &final_text).await;
+            post_process_meeting_transcription_with_context(&settings, &final_text, &template_ctx)
+                .await;
         if let Some(processed) = processed_text {
             post_processed_text = Some(processed.clone());
             final_text = processed;
             post_process_prompt = prompt_used;
         }
     } else if post_process {
-        if let Some(processed_text) = post_process_transcription(&settings, &final_text).await {
+        if let Some(processed_text) =
+            post_process_transcription_with_context(&settings, &final_text, &template_ctx).await
+        {
             post_processed_text = Some(processed_text.clone());
             final_text = processed_text;
 

@@ -28,7 +28,7 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     prompts_group.set_widget_name("prompts_templates_group");
     prompts_group.set_title("Prompt Templates");
     prompts_group.set_description(Some(
-        "Manage reusable prompt templates. Use ${output} as the placeholder for transcribed or selected text.",
+        "Manage reusable prompt templates. Variables: ${output}, ${selected_text}, ${clipboard}, ${active_window}, ${date}, ${language}.",
     ));
     page.add(&prompts_group);
 
@@ -241,7 +241,7 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
         template_box.set_margin_end(12);
 
         let title_label = gtk4::Label::new(Some(
-            "Template Prompt Content (${output} is replaced by the input text):",
+            "Template Prompt Content (Variables: ${output}, ${selected_text}, ${clipboard}, ${active_window}, ${date}, ${language}):",
         ));
         title_label.set_halign(gtk4::Align::Start);
         title_label.add_css_class("dim-label");
@@ -291,7 +291,7 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
     // Add Custom Prompt Button
     let add_row = libadwaita::ActionRow::new();
     add_row.set_title("Create New Custom Prompt Template");
-    add_row.set_subtitle("Add a custom prompt instruction with the ${output} variable");
+    add_row.set_subtitle("Add a custom prompt instruction with dynamic variables like ${output}");
 
     let add_btn = gtk4::Button::with_label("Add Prompt");
     add_btn.set_valign(gtk4::Align::Center);
