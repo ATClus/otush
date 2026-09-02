@@ -2975,7 +2975,7 @@ dependencies = [
 
 [[package]]
 name = "otush"
-version = "1.5.4"
+version = "1.6.0"
 dependencies = [
  "anyhow",
  "arboard",
