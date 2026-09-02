@@ -89,6 +89,7 @@ async fn rebind(
     let formatted_triggers: Vec<(String, String, String)> = {
         let map = desired.lock().unwrap();
         map.values()
+            .filter(|b| !b.current_binding.trim().is_empty())
             .map(|b| {
                 (
                     b.id.clone(),
