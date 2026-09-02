@@ -231,7 +231,7 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
 fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
     let headers = build_headers(provider, api_key)?;
     let timeout_secs = if provider.timeout_seconds > 0 {
-        provider.timeout_seconds.max(60)
+        provider.timeout_seconds
     } else {
         60
     };

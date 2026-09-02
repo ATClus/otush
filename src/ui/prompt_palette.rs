@@ -13,25 +13,28 @@ static PALETTE_WINDOW: OnceLock<glib::SendWeakRef<libadwaita::Window>> = OnceLoc
 
 /// Show the Quick Prompt Palette centered on screen.
 pub fn show_prompt_palette(ctx: &AppContext) {
-    // Capture environment context BEFORE focusing the palette window
-    let pre_captured_text = match crate::clipboard::capture_selected_text() {
-        Ok(text) if !text.trim().is_empty() => Some(text),
-        _ => None,
-    };
-    let pre_captured_window = crate::template::get_active_window_title();
-    let pre_captured_clipboard = match crate::clipboard::read_clipboard_text() {
-        Ok(text) if !text.trim().is_empty() => Some(text),
-        _ => None,
-    };
-
     let ctx_clone = ctx.clone();
-    glib::MainContext::default().invoke(move || {
-        build_and_present_palette(
-            &ctx_clone,
-            pre_captured_text,
-            pre_captured_window,
-            pre_captured_clipboard,
-        );
+    crate::runtime::spawn_blocking(move || {
+        // Capture environment context off the main thread before presenting the palette window
+        let pre_captured_text = match crate::clipboard::capture_selected_text() {
+            Ok(text) if !text.trim().is_empty() => Some(text),
+            _ => None,
+        };
+        let pre_captured_window = crate::template::get_active_window_title();
+        let pre_captured_clipboard = match crate::clipboard::read_clipboard_text() {
+            Ok(text) if !text.trim().is_empty() => Some(text),
+            _ => None,
+        };
+
+        let ctx_for_main = ctx_clone.clone();
+        glib::MainContext::default().invoke(move || {
+            build_and_present_palette(
+                &ctx_for_main,
+                pre_captured_text,
+                pre_captured_window,
+                pre_captured_clipboard,
+            );
+        });
     });
 }
 
@@ -249,10 +252,14 @@ fn build_and_present_palette(
                 }
             }
 
-            // If no templates match, automatically select custom row
+            // If no templates match, automatically select custom row; otherwise ensure selection stays on a visible row
             if let Some(list) = list_weak_filter.clone().into_weak_ref().upgrade() {
                 if matched_template_count == 0 {
                     list.select_row(Some(&custom_row_filter));
+                } else if let Some((_, first_match, _)) =
+                    p_rows_filter.iter().find(|(_, r, _)| r.is_visible())
+                {
+                    list.select_row(Some(first_match));
                 }
             }
         }
@@ -315,7 +322,7 @@ fn build_and_present_palette(
 
             if let Some(list) = list_weak_key.clone().into_weak_ref().upgrade() {
                 if let Some(selected) = list.selected_row() {
-                    if selected == custom_row_for_key {
+                    if selected == custom_row_for_key && custom_row_for_key.is_visible() {
                         if !query.is_empty() {
                             let custom_prompt = LLMPrompt {
                                 id: "custom_ad_hoc".to_string(),
@@ -326,7 +333,7 @@ fn build_and_present_palette(
                             exec_for_key(custom_prompt);
                             return glib::Propagation::Stop;
                         }
-                    } else {
+                    } else if selected.is_visible() {
                         for (prompt, r, _) in &p_rows_for_key {
                             if *r == selected {
                                 exec_for_key(prompt.clone());

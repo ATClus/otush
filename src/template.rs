@@ -100,14 +100,14 @@ pub fn expand_template(template: &str, context: &TemplateContext) -> String {
     let lang_str = context.language.as_deref().unwrap_or("");
 
     template
-        .replace("${output}", &context.output)
-        .replace("${selected_text}", selected_str)
         .replace("${clipboard}", clipboard_str)
         .replace("${active_window}", window_str)
         .replace("${date}", &date_str)
         .replace("${datetime}", &datetime_str)
         .replace("${time}", &time_str)
         .replace("${language}", lang_str)
+        .replace("${selected_text}", selected_str)
+        .replace("${output}", &context.output)
 }
 
 /// Expands variables for system prompts in structured output mode,
@@ -131,14 +131,14 @@ pub fn expand_template_for_system_prompt(template: &str, context: &TemplateConte
     let lang_str = context.language.as_deref().unwrap_or("");
 
     template
-        .replace("${output}", "")
-        .replace("${selected_text}", selected_str)
         .replace("${clipboard}", clipboard_str)
         .replace("${active_window}", window_str)
         .replace("${date}", &date_str)
         .replace("${datetime}", &datetime_str)
         .replace("${time}", &time_str)
         .replace("${language}", lang_str)
+        .replace("${selected_text}", selected_str)
+        .replace("${output}", "")
         .trim()
         .to_string()
 }
@@ -375,5 +375,23 @@ mod tests {
         });
         let focused = find_focused_node(&json);
         assert_eq!(focused, Some("Editor - main.rs".to_string()));
+    }
+
+    #[test]
+    fn test_user_content_containing_literal_tokens_not_mutated() {
+        let ctx = TemplateContext {
+            output: "Do not replace ${date} or ${language} inside user text".to_string(),
+            selected_text: None,
+            clipboard: Some("clip".to_string()),
+            active_window: Some("Editor".to_string()),
+            date: Some("2026-09-02".to_string()),
+            language: Some("en".to_string()),
+        };
+        let template = "Header Date: ${date}\nOutput:\n${output}";
+        let result = expand_template(template, &ctx);
+        assert_eq!(
+            result,
+            "Header Date: 2026-09-02\nOutput:\nDo not replace ${date} or ${language} inside user text"
+        );
     }
 }
