@@ -463,22 +463,37 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
                 chooser.set_current_name(&format!("{}.{}", base_name, ext));
 
                 let toast_clone = toast.clone();
+                let content_to_export = content.clone();
                 chooser.connect_response(move |dialog, response| {
                     if response == gtk4::ResponseType::Accept {
                         if let Some(file) = dialog.file() {
                             if let Some(target_path) = file.path() {
-                                if let Err(e) = std::fs::write(&target_path, &content) {
-                                    error!("Failed to write export file: {e}");
-                                    toast_clone.add_toast(libadwaita::Toast::new(&format!(
-                                        "Failed to save file: {}",
-                                        e
-                                    )));
-                                } else {
-                                    toast_clone.add_toast(libadwaita::Toast::new(&format!(
-                                        "Saved to {}",
-                                        target_path.display()
-                                    )));
-                                }
+                                let toast_inner = toast_clone.clone();
+                                let content_to_write = content_to_export.clone();
+                                glib::MainContext::default().spawn_local(async move {
+                                    let write_res = crate::runtime::spawn_blocking(move || {
+                                        std::fs::write(&target_path, &content_to_write)
+                                            .map(|_| target_path)
+                                    })
+                                    .await;
+
+                                    match write_res {
+                                        Ok(Ok(path)) => {
+                                            toast_inner.add_toast(libadwaita::Toast::new(
+                                                &format!("Saved to {}", path.display()),
+                                            ));
+                                        }
+                                        Ok(Err(e)) => {
+                                            error!("Failed to write export file: {e}");
+                                            toast_inner.add_toast(libadwaita::Toast::new(
+                                                &format!("Failed to save file: {}", e),
+                                            ));
+                                        }
+                                        Err(e) => {
+                                            error!("Export write task join error: {e}");
+                                        }
+                                    }
+                                });
                             }
                         }
                     }

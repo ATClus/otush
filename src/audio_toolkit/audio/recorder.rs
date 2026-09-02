@@ -373,7 +373,7 @@ impl AudioRecorder {
 
     /// Open a system audio / desktop output monitor recording stream (e.g. for Meeting Mode).
     /// Uses native PipeWire loopback (`pw-record --properties=stream.capture.sink=true`) when available on Linux.
-    pub fn open_monitor(&mut self) -> Result<(), Box<dyn std::error::Error>> {
+    pub fn open_monitor(&mut self, target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
         if self.worker_handle.is_some() {
             if !self.needs_reopen() {
                 return Ok(()); // already open
@@ -391,6 +391,7 @@ impl AudioRecorder {
         let vad = self.vad.clone();
         let level_cb = self.level_cb.clone();
         let audio_cb = self.audio_cb.clone();
+        let target_owned = target.map(|s| s.to_string());
 
         let worker = std::thread::spawn(move || {
             let stop_flag = Arc::new(AtomicBool::new(false));
@@ -399,15 +400,26 @@ impl AudioRecorder {
             let shutdown_for_reader = Arc::clone(&shutdown_flag);
             let sample_tx_for_reader = sample_tx.clone();
 
+            let mut args = vec![
+                "--raw".to_string(),
+                "--properties=stream.capture.sink=true".to_string(),
+                "--rate=16000".to_string(),
+                "--channels=1".to_string(),
+                "--format=s16".to_string(),
+            ];
+            if let Some(t) = &target_owned {
+                let trimmed = t.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.eq_ignore_ascii_case("default")
+                    && trimmed != "Default System Audio Monitor"
+                {
+                    args.push(format!("--target={trimmed}"));
+                }
+            }
+            args.push("-".to_string());
+
             let mut pw_child = match std::process::Command::new("pw-record")
-                .args([
-                    "--raw",
-                    "--properties=stream.capture.sink=true",
-                    "--rate=16000",
-                    "--channels=1",
-                    "--format=s16",
-                    "-",
-                ])
+                .args(&args)
                 .stdout(std::process::Stdio::piped())
                 .stderr(std::process::Stdio::null())
                 .spawn()

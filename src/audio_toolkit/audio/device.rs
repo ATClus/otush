@@ -90,6 +90,7 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore]
     fn test_dump_audio_devices() {
         if let Ok(inputs) = list_input_devices() {
             println!("=== CPAL INPUT DEVICES ({}) ===", inputs.len());

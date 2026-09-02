@@ -335,11 +335,19 @@ impl AudioRecordingManager {
         is_meeting: bool,
     ) -> DesiredMicrophone {
         if is_meeting {
-            DesiredMicrophone::Selected("System Audio Monitor".to_string())
+            let name = settings
+                .selected_system_audio_device
+                .clone()
+                .unwrap_or_else(|| "Default System Audio Monitor".to_string());
+            DesiredMicrophone::Selected(name)
         } else {
             match settings.audio_capture_source {
                 crate::settings::AudioCaptureSource::SystemAudioOnly => {
-                    DesiredMicrophone::Selected("System Audio Monitor".to_string())
+                    let name = settings
+                        .selected_system_audio_device
+                        .clone()
+                        .unwrap_or_else(|| "Default System Audio Monitor".to_string());
+                    DesiredMicrophone::Selected(name)
                 }
                 crate::settings::AudioCaptureSource::MicrophoneOnly
                 | crate::settings::AudioCaptureSource::Mixed => match &settings.selected_microphone
@@ -635,7 +643,8 @@ impl AudioRecordingManager {
                     crate::settings::AudioCaptureSource::SystemAudioOnly
                 )
             {
-                if let Err(first_err) = rec.open_monitor() {
+                let target_system_source = settings.selected_system_audio_device.as_deref();
+                if let Err(first_err) = rec.open_monitor(target_system_source) {
                     warn!("Monitor stream open failed ({first_err}); falling back to standard input device");
                     rec.open(resolution.device.clone())
                         .map_err(|e| anyhow::anyhow!("Failed to open recorder: {}", e))?;

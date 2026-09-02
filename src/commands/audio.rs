@@ -204,10 +204,14 @@ pub async fn set_selected_system_audio_device(
     device_name: String,
 ) -> Result<(), String> {
     let mut settings = get_settings(ctx);
-    settings.selected_system_audio_device = if device_name == "default" {
+    let trimmed = device_name.trim();
+    settings.selected_system_audio_device = if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("default")
+        || trimmed == "Default System Audio Monitor"
+    {
         None
     } else {
-        Some(device_name)
+        Some(trimmed.to_string())
     };
     write_settings(ctx, settings);
 
