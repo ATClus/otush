@@ -468,25 +468,35 @@ fn draw_overlay(cr: &cairo::Context, w: f64, h: f64) {
 
     // State text ("Recording… 0:00", "Transcribing…", "Processing…")
     let state_text = {
+        let label_prefix = OVERLAY_STATE_TEXT
+            .lock()
+            .map(|g| g.clone())
+            .unwrap_or_default();
+        let label = if label_prefix.is_empty() {
+            "Recording".to_string()
+        } else {
+            label_prefix.trim_end_matches('…').to_string()
+        };
+
         if phase == OverlayPhase::Recording {
             if let Ok(guard) = RECORDING_START_INSTANT.lock() {
                 if let Some(start) = *guard {
                     let secs = start.elapsed().as_secs();
                     let mins = secs / 60;
                     let rem_secs = secs % 60;
-                    format!("Recording… {:01}:{:02}", mins, rem_secs)
+                    format!("{label} {:01}:{:02}", mins, rem_secs)
                 } else {
-                    "Recording… 0:00".to_string()
+                    format!("{label} 0:00")
                 }
             } else {
-                "Recording… 0:00".to_string()
+                format!("{label} 0:00")
             }
         } else if let Ok(guard) = OVERLAY_STATE_TEXT.lock() {
             if guard.is_empty() {
                 match phase {
                     OverlayPhase::Transcribing => "Transcribing…".to_string(),
                     OverlayPhase::Processing => "Processing…".to_string(),
-                    OverlayPhase::Recording => "Recording… 0:00".to_string(),
+                    OverlayPhase::Recording => "Recording 0:00".to_string(),
                 }
             } else {
                 guard.clone()
@@ -495,7 +505,7 @@ fn draw_overlay(cr: &cairo::Context, w: f64, h: f64) {
             match phase {
                 OverlayPhase::Transcribing => "Transcribing…".to_string(),
                 OverlayPhase::Processing => "Processing…".to_string(),
-                OverlayPhase::Recording => "Recording… 0:00".to_string(),
+                OverlayPhase::Recording => "Recording 0:00".to_string(),
             }
         }
     };
@@ -623,16 +633,36 @@ pub fn show_recording_overlay(_ctx: &AppContext) {
     show_state("Recording…", OverlayPhase::Recording, false);
 }
 
+pub fn show_meeting_recording_overlay(_ctx: &AppContext) {
+    show_state("Meeting Mode…", OverlayPhase::Recording, false);
+}
+
 pub fn show_streaming_overlay(_ctx: &AppContext) {
     show_state("Recording…", OverlayPhase::Recording, true);
+}
+
+pub fn show_meeting_streaming_overlay(_ctx: &AppContext) {
+    show_state("Meeting Mode…", OverlayPhase::Recording, true);
 }
 
 pub fn show_transcribing_overlay(_ctx: &AppContext) {
     show_state("Transcribing…", OverlayPhase::Transcribing, false);
 }
 
+pub fn show_meeting_transcribing_overlay(_ctx: &AppContext) {
+    show_state("Transcribing Meeting…", OverlayPhase::Transcribing, false);
+}
+
 pub fn show_processing_overlay(_ctx: &AppContext) {
     show_state("Processing…", OverlayPhase::Processing, false);
+}
+
+pub fn show_meeting_processing_overlay(_ctx: &AppContext) {
+    show_state(
+        "Formatting Meeting Minutes…",
+        OverlayPhase::Processing,
+        false,
+    );
 }
 
 pub fn update_overlay_position(ctx: &AppContext) {

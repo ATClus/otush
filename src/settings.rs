@@ -1220,6 +1220,19 @@ pub fn get_default_settings() -> AppSettings {
             current_binding: "ctrl+alt+p".to_string(),
         },
     );
+    let default_meeting_shortcut = "ctrl+alt+m";
+
+    bindings.insert(
+        "transcribe_meeting".to_string(),
+        ShortcutBinding {
+            id: "transcribe_meeting".to_string(),
+            name: "Meeting Mode (Live Meets)".to_string(),
+            description: "Records meeting audio and generates structured meeting minutes with AI."
+                .to_string(),
+            default_binding: default_meeting_shortcut.to_string(),
+            current_binding: default_meeting_shortcut.to_string(),
+        },
+    );
 
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
@@ -1619,6 +1632,22 @@ mod tests {
 
     fn default_settings_json() -> serde_json::Value {
         serde_json::to_value(get_default_settings()).unwrap()
+    }
+
+    #[test]
+    fn test_default_bindings_include_meeting() {
+        let defaults = get_default_settings();
+        assert!(defaults.bindings.contains_key("transcribe"));
+        assert!(defaults
+            .bindings
+            .contains_key("transcribe_with_post_process"));
+        assert!(defaults.bindings.contains_key("transcribe_meeting"));
+        assert!(defaults.bindings.contains_key("cancel"));
+        assert!(defaults.bindings.contains_key("transform_selection"));
+        assert_eq!(
+            defaults.bindings["transcribe_meeting"].current_binding,
+            "ctrl+alt+m"
+        );
     }
 
     /// Every field must survive a partial store: a missing key must never fail

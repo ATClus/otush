@@ -20,6 +20,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub toggle_post_process: bool,
 
+    /// Toggle meeting recording & minutes on/off (sent to running instance)
+    #[arg(long)]
+    pub toggle_meeting: bool,
+
     /// Open prompt palette to transform selected text (sent to running instance)
     #[arg(long)]
     pub transform_selection: bool,

@@ -313,6 +313,7 @@ fn rebuild_shortcuts(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
     let default_ids = [
         "transcribe",
         "transcribe_with_post_process",
+        "transcribe_meeting",
         "cancel",
         "transform_selection",
     ];
@@ -412,6 +413,9 @@ fn show_shortcut_dialog(
         .use_header_bar(1)
         .default_width(460)
         .build();
+
+    // Suspend global shortcuts while modal recorder is active to prevent accidental triggering
+    shortcut::suspend_all_shortcuts(ctx);
 
     let content_area = dialog.content_area();
     content_area.set_margin_start(24);
@@ -562,6 +566,12 @@ fn show_shortcut_dialog(
     let id = binding.id.clone();
     let group = group.clone();
 
+    let ctx_close = ctx.clone();
+    dialog.connect_close_request(move |_| {
+        shortcut::resume_all_shortcuts(&ctx_close);
+        glib::Propagation::Proceed
+    });
+
     dialog.connect_response(move |d, resp| {
         if resp == gtk4::ResponseType::Ok {
             let final_key = recorded_key.lock().unwrap().clone();
@@ -570,6 +580,7 @@ fn show_shortcut_dialog(
                 rebuild_shortcuts(&ctx, &group);
             }
         }
+        shortcut::resume_all_shortcuts(&ctx);
         d.close();
     });
 
@@ -594,6 +605,9 @@ fn show_add_shortcut_dialog(
         .default_width(480)
         .build();
 
+    // Suspend global shortcuts while modal recorder is active to prevent accidental triggering
+    shortcut::suspend_all_shortcuts(ctx);
+
     let content_area = dialog.content_area();
     content_area.set_margin_start(24);
     content_area.set_margin_end(24);
@@ -609,19 +623,23 @@ fn show_add_shortcut_dialog(
 
     let mut action_options = vec![
         (
-            "transcribe_standard".to_string(),
+            "transcribe".to_string(),
             "Speech-to-Text Dictation (Standard)".to_string(),
         ),
         (
-            "transcribe_ai".to_string(),
+            "transcribe_with_post_process".to_string(),
             "Speech-to-Text with AI Post-Processing".to_string(),
         ),
         (
-            "transform_palette".to_string(),
-            "Transform Selection (Open AI Palette)".to_string(),
+            "transcribe_meeting".to_string(),
+            "Meeting Mode (Live Meets & Minutes)".to_string(),
         ),
         (
-            "cancel_op".to_string(),
+            "transform_selection".to_string(),
+            "Transform Selected Text (Open AI Palette)".to_string(),
+        ),
+        (
+            "cancel".to_string(),
             "Cancel Recording / Operation".to_string(),
         ),
     ];
@@ -712,22 +730,41 @@ fn show_add_shortcut_dialog(
     let ctx = ctx.clone();
     let group = group.clone();
 
+    let ctx_close = ctx.clone();
+    dialog.connect_close_request(move |_| {
+        shortcut::resume_all_shortcuts(&ctx_close);
+        glib::Propagation::Proceed
+    });
+
     dialog.connect_response(move |d, resp| {
+        let core_ids = [
+            "transcribe",
+            "transcribe_with_post_process",
+            "transcribe_meeting",
+            "transform_selection",
+            "cancel",
+        ];
+
         if resp == gtk4::ResponseType::Ok {
             let final_key = recorded_key.lock().unwrap().clone();
             let selected_idx = action_combo.selected() as usize;
             if let Some((action_id, action_name)) = action_options.get(selected_idx) {
-                let binding_id = format!("{}_{}", action_id, chrono::Utc::now().timestamp_millis());
-                let _ = shortcut::add_custom_binding(
-                    &ctx,
-                    binding_id,
-                    action_name.clone(),
-                    format!("Custom shortcut for {}", action_name),
-                    final_key,
-                );
+                if core_ids.contains(&action_id.as_str()) {
+                    let _ = shortcut::change_binding(&ctx, action_id.clone(), final_key);
+                } else if let Some(p_id) = action_id.strip_prefix("prompt_") {
+                    let binding_id = format!("custom_prompt_{}", p_id);
+                    let _ = shortcut::add_custom_binding(
+                        &ctx,
+                        binding_id,
+                        action_name.clone(),
+                        format!("Direct prompt shortcut: {}", action_name),
+                        final_key,
+                    );
+                }
                 rebuild_shortcuts(&ctx, &group);
             }
         }
+        shortcut::resume_all_shortcuts(&ctx);
         d.close();
     });
 

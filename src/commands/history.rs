@@ -187,7 +187,8 @@ pub async fn retry_history_entry_transcription(ctx: &AppContext, id: i64) -> Res
     }
 
     let processed =
-        process_transcription_output(ctx, &transcription, entry.post_process_requested).await;
+        process_transcription_output(ctx, &transcription, entry.post_process_requested, false)
+            .await;
     ctx.history
         .update_transcription(
             id,
