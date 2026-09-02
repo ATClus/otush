@@ -12,6 +12,54 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let page = libadwaita::PreferencesPage::new();
     page.set_title("History");
 
+    // --- File Transcription group ---
+    let transcribe_group = libadwaita::PreferencesGroup::new();
+    transcribe_group.set_title("File Transcription");
+    transcribe_group.set_description(Some(
+        "Drag & drop audio or video files here, or click to transcribe media files into text and subtitles.",
+    ));
+
+    let file_action_row = libadwaita::ActionRow::new();
+    file_action_row.set_title("Transcribe Audio/Video File…");
+    file_action_row.set_subtitle("Supports MP3, WAV, M4A, MP4, FLAC, OGG, AAC, WebM, MKV");
+    file_action_row.set_activatable(true);
+
+    let upload_btn = gtk4::Button::from_icon_name("document-open-symbolic");
+    upload_btn.set_tooltip_text(Some("Open Media File Transcriber"));
+    upload_btn.set_valign(gtk4::Align::Center);
+    upload_btn.add_css_class("flat");
+    file_action_row.add_suffix(&upload_btn);
+
+    let ctx_dialog = ctx.clone();
+    file_action_row.connect_activated(move |_| {
+        crate::ui::file_transcription::show_file_transcription_dialog(&ctx_dialog, None);
+    });
+
+    let ctx_btn = ctx.clone();
+    upload_btn.connect_clicked(move |_| {
+        crate::ui::file_transcription::show_file_transcription_dialog(&ctx_btn, None);
+    });
+
+    transcribe_group.add(&file_action_row);
+    page.add(&transcribe_group);
+
+    // Drop target for drag-and-dropping files on the History page
+    let drop_target = gtk4::DropTarget::new(gio::File::static_type(), gdk4::DragAction::COPY);
+    let ctx_drop = ctx.clone();
+    drop_target.connect_drop(move |_, value, _, _| {
+        if let Ok(file) = value.get::<gio::File>() {
+            if let Some(path) = file.path() {
+                crate::ui::file_transcription::show_file_transcription_dialog(
+                    &ctx_drop,
+                    Some(path),
+                );
+                return true;
+            }
+        }
+        false
+    });
+    page.add_controller(drop_target);
+
     // --- Retention group ---
     let retention_group = libadwaita::PreferencesGroup::new();
     retention_group.set_title("Retention");

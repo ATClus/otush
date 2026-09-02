@@ -36,9 +36,16 @@ pub trait ShortcutAction: Send + Sync {
     fn stop(&self, ctx: &AppContext, binding_id: &str, shortcut_str: &str);
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum TranscribeMode {
+    Standard,
+    PostProcess,
+    Meeting,
+}
+
 // Transcribe Action
-struct TranscribeAction {
-    post_process: bool,
+pub struct TranscribeAction {
+    pub mode: TranscribeMode,
 }
 
 /// Field name for structured output JSON schema
@@ -130,6 +137,34 @@ pub(crate) async fn post_process_transcription(
     };
 
     post_process_text_with_prompt(settings, transcription, prompt_obj).await
+}
+
+pub(crate) async fn post_process_meeting_transcription(
+    settings: &crate::settings::AppSettings,
+    transcription: &str,
+) -> (Option<String>, Option<String>) {
+    if is_blank_transcription(transcription) {
+        debug!("Meeting post-processing skipped because the transcription is empty");
+        return (None, None);
+    }
+
+    // Find the meeting minutes prompt (by id "default_meeting_minutes" or name containing "meeting")
+    let prompt_obj = settings
+        .post_process_prompts
+        .iter()
+        .find(|p| p.id == "default_meeting_minutes" || p.name.to_lowercase().contains("meeting"))
+        .or_else(|| settings.post_process_prompts.first());
+
+    let prompt_obj = match prompt_obj {
+        Some(p) => p,
+        None => {
+            debug!("Meeting post-processing skipped because no prompts are available");
+            return (None, None);
+        }
+    };
+
+    let processed = post_process_text_with_prompt(settings, transcription, prompt_obj).await;
+    (processed, Some(prompt_obj.prompt.clone()))
 }
 
 pub(crate) async fn post_process_text_with_prompt(
@@ -417,6 +452,7 @@ pub(crate) async fn process_transcription_output(
     ctx: &AppContext,
     transcription: &str,
     post_process: bool,
+    is_meeting: bool,
 ) -> ProcessedTranscription {
     let settings = get_settings(ctx);
     let mut final_text = transcription.to_string();
@@ -433,7 +469,15 @@ pub(crate) async fn process_transcription_output(
         final_text = converted_text;
     }
 
-    if post_process {
+    if is_meeting {
+        let (processed_text, prompt_used) =
+            post_process_meeting_transcription(&settings, &final_text).await;
+        if let Some(processed) = processed_text {
+            post_processed_text = Some(processed.clone());
+            final_text = processed;
+            post_process_prompt = prompt_used;
+        }
+    } else if post_process {
         if let Some(processed_text) = post_process_transcription(&settings, &final_text).await {
             post_processed_text = Some(processed_text.clone());
             final_text = processed_text;
@@ -518,7 +562,8 @@ impl ShortcutAction for TranscribeAction {
         } else {
             settings.is_deepgram_streaming_active()
         };
-        let vad_policy = if !settings.vad_enabled {
+        let is_meeting = self.mode == TranscribeMode::Meeting;
+        let vad_policy = if is_meeting || !settings.vad_enabled {
             VadPolicy::Disabled
         } else if model_supports_streaming {
             VadPolicy::Streaming
@@ -537,9 +582,19 @@ impl ShortcutAction for TranscribeAction {
         if recording_error.is_none() {
             match settings.overlay_style {
                 OverlayStyle::Live if model_supports_streaming => {
-                    utils::show_streaming_overlay(ctx)
+                    if is_meeting {
+                        utils::show_meeting_streaming_overlay(ctx);
+                    } else {
+                        utils::show_streaming_overlay(ctx);
+                    }
                 }
-                OverlayStyle::Live | OverlayStyle::Minimal => show_recording_overlay(ctx),
+                OverlayStyle::Live | OverlayStyle::Minimal => {
+                    if is_meeting {
+                        utils::show_meeting_recording_overlay(ctx);
+                    } else {
+                        show_recording_overlay(ctx);
+                    }
+                }
                 OverlayStyle::None => {} // show_overlay_state no-ops on None anyway
             }
         }
@@ -674,11 +729,15 @@ impl ShortcutAction for TranscribeAction {
         // spinner while the stream finalizes. Non-streaming paths use the
         // compact transcribing pill (None no-ops in show_*).
         let style = get_settings(ctx).overlay_style;
-        // Capture this before finalizing the stream so every later working state
-        // targets the same overlay that was shown for this transcription.
+        let mode = self.mode;
+        let is_meeting = mode == TranscribeMode::Meeting;
+        let post_process = mode == TranscribeMode::PostProcess || is_meeting;
         let use_streaming_overlay = should_use_streaming_overlay(style, tm.is_streaming());
+
         if use_streaming_overlay {
             tm.emit_stream_working(StreamWorkKind::Transcribing);
+        } else if is_meeting {
+            utils::show_meeting_transcribing_overlay(ctx);
         } else {
             show_transcribing_overlay(ctx);
         }
@@ -690,7 +749,6 @@ impl ShortcutAction for TranscribeAction {
         play_feedback_sound(ctx, SoundType::Stop);
 
         let binding_id = binding_id.to_string(); // Clone binding_id for the async task
-        let post_process = self.post_process;
         let cancel_generation = rm.cancel_generation();
 
         crate::runtime::spawn(async move {
@@ -828,12 +886,19 @@ impl ShortcutAction for TranscribeAction {
                             if post_process {
                                 if use_streaming_overlay {
                                     tm.emit_stream_working(StreamWorkKind::Polishing);
+                                } else if is_meeting {
+                                    utils::show_meeting_processing_overlay(&ah);
                                 } else {
                                     show_processing_overlay(&ah);
                                 }
                             }
                             let Some(processed) = complete_unless_cancelled(
-                                process_transcription_output(&ah, &transcription, post_process),
+                                process_transcription_output(
+                                    &ah,
+                                    &transcription,
+                                    post_process,
+                                    is_meeting,
+                                ),
                                 || rm.was_cancelled_since(cancel_generation),
                             )
                             .await
@@ -994,12 +1059,20 @@ pub static ACTION_MAP: LazyLock<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy
     map.insert(
         "transcribe".to_string(),
         Arc::new(TranscribeAction {
-            post_process: false,
+            mode: TranscribeMode::Standard,
         }) as Arc<dyn ShortcutAction>,
     );
     map.insert(
         "transcribe_with_post_process".to_string(),
-        Arc::new(TranscribeAction { post_process: true }) as Arc<dyn ShortcutAction>,
+        Arc::new(TranscribeAction {
+            mode: TranscribeMode::PostProcess,
+        }) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "transcribe_meeting".to_string(),
+        Arc::new(TranscribeAction {
+            mode: TranscribeMode::Meeting,
+        }) as Arc<dyn ShortcutAction>,
     );
     map.insert(
         "transform_selection".to_string(),
@@ -1100,5 +1173,14 @@ mod tests {
         assert!(!should_use_streaming_overlay(OverlayStyle::Live, false));
         assert!(!should_use_streaming_overlay(OverlayStyle::Minimal, true));
         assert!(!should_use_streaming_overlay(OverlayStyle::None, true));
+    }
+
+    #[test]
+    fn action_map_registers_transcribe_meeting() {
+        assert!(super::ACTION_MAP.contains_key("transcribe"));
+        assert!(super::ACTION_MAP.contains_key("transcribe_with_post_process"));
+        assert!(super::ACTION_MAP.contains_key("transcribe_meeting"));
+        assert!(super::ACTION_MAP.contains_key("transform_selection"));
+        assert!(super::ACTION_MAP.contains_key("cancel"));
     }
 }

@@ -158,6 +158,70 @@ pub fn set_selected_output_device(ctx: &AppContext, device_name: String) -> Resu
     Ok(())
 }
 
+/// Query available system audio / desktop output monitor sources for live meeting capture.
+pub async fn get_available_system_audio_sources() -> Result<Vec<AudioDevice>, String> {
+    crate::runtime::spawn_blocking(|| {
+        let devices = crate::audio_toolkit::list_system_audio_sources()
+            .map_err(|e| format!("Failed to list system audio sources: {}", e))?;
+
+        let mut result = vec![AudioDevice {
+            index: "default".to_string(),
+            name: "Default System Audio Monitor".to_string(),
+            is_default: true,
+        }];
+
+        result.extend(devices.into_iter().map(|d| AudioDevice {
+            index: d.index,
+            name: d.name,
+            is_default: false,
+        }));
+
+        Ok::<_, String>(result)
+    })
+    .await
+    .map_err(|e| format!("audio task join failed: {}", e))?
+}
+
+/// Update and persist the audio capture source mode (MicrophoneOnly, SystemAudioOnly, Mixed).
+pub async fn set_audio_capture_source(
+    ctx: &AppContext,
+    source: crate::settings::AudioCaptureSource,
+) -> Result<(), String> {
+    let mut settings = get_settings(ctx);
+    settings.audio_capture_source = source;
+    write_settings(ctx, settings);
+
+    let rm = ctx.audio.clone();
+    crate::runtime::spawn_blocking(move || rm.update_selected_device())
+        .await
+        .map_err(|e| format!("audio task join failed: {}", e))?
+        .map_err(|e| format!("Failed to update capture source: {}", e))
+}
+
+/// Update and persist the selected system audio loopback device.
+pub async fn set_selected_system_audio_device(
+    ctx: &AppContext,
+    device_name: String,
+) -> Result<(), String> {
+    let mut settings = get_settings(ctx);
+    let trimmed = device_name.trim();
+    settings.selected_system_audio_device = if trimmed.is_empty()
+        || trimmed.eq_ignore_ascii_case("default")
+        || trimmed == "Default System Audio Monitor"
+    {
+        None
+    } else {
+        Some(trimmed.to_string())
+    };
+    write_settings(ctx, settings);
+
+    let rm = ctx.audio.clone();
+    crate::runtime::spawn_blocking(move || rm.update_selected_device())
+        .await
+        .map_err(|e| format!("audio task join failed: {}", e))?
+        .map_err(|e| format!("Failed to update system audio device: {}", e))
+}
+
 /// Retrieve the currently selected output device name.
 pub fn get_selected_output_device(ctx: &AppContext) -> Result<String, String> {
     let settings = get_settings(ctx);

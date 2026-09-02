@@ -127,7 +127,7 @@ pub fn change_binding(
 
     // Create an updated binding
     let mut updated_binding = binding_to_modify.clone();
-    updated_binding.current_binding = binding;
+    updated_binding.current_binding = binding.clone();
 
     // Register the new binding
     if let Err(e) = register_shortcut(ctx, updated_binding.clone()) {
@@ -139,6 +139,30 @@ pub fn change_binding(
             binding: None,
             error: Some(error_msg),
         });
+    }
+
+    // Unregister and clear any conflicting binding that previously held this exact key combination
+    let mut conflicting_ids = Vec::new();
+    for (other_id, other_binding) in &settings.bindings {
+        if other_id != &id
+            && !other_binding.current_binding.trim().is_empty()
+            && other_binding
+                .current_binding
+                .trim()
+                .eq_ignore_ascii_case(binding.trim())
+        {
+            conflicting_ids.push(other_id.clone());
+        }
+    }
+    for conflict_id in conflicting_ids {
+        if let Some(mut conflict_binding) = settings.bindings.get(&conflict_id).cloned() {
+            let _ = unregister_shortcut(ctx, conflict_binding.clone());
+            conflict_binding.current_binding = String::new();
+            settings
+                .bindings
+                .insert(conflict_id.clone(), conflict_binding.clone());
+            ctx.notify_setting_changed("bindings", serde_json::json!(&conflict_binding));
+        }
     }
 
     // Update the binding in the settings
@@ -229,6 +253,7 @@ pub fn remove_custom_binding(ctx: &AppContext, id: &str) -> Result<(), String> {
 /// mid-capture. The "cancel" binding is untouched: it is managed dynamically
 /// by the recording lifecycle.
 pub fn suspend_all_shortcuts(ctx: &AppContext) {
+    handler::set_shortcuts_suspended(true);
     for (id, binding) in settings::get_bindings(ctx) {
         if id == "cancel" {
             continue;
@@ -246,6 +271,7 @@ pub fn suspend_all_shortcuts(ctx: &AppContext) {
 /// Registering an already-registered shortcut fails cleanly in both
 /// implementations, so this is idempotent and safe on every exit path.
 pub fn resume_all_shortcuts(ctx: &AppContext) {
+    handler::set_shortcuts_suspended(false);
     let settings = get_settings(ctx);
     for (id, binding) in &settings.bindings {
         if id == "cancel" {

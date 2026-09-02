@@ -3,11 +3,22 @@
 //! This module contains the common logic for handling shortcut events,
 //! used by both the portal and evdev-keys implementations.
 
-use log::warn;
+use log::{debug, warn};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use crate::actions::ACTION_MAP;
 use crate::context::AppContext;
 use crate::transcription_coordinator::is_transcribe_binding;
+
+static SHORTCUTS_SUSPENDED: AtomicBool = AtomicBool::new(false);
+
+pub fn set_shortcuts_suspended(suspended: bool) {
+    SHORTCUTS_SUSPENDED.store(suspended, Ordering::Relaxed);
+}
+
+pub fn are_shortcuts_suspended() -> bool {
+    SHORTCUTS_SUSPENDED.load(Ordering::Relaxed)
+}
 
 /// Handle a shortcut event from either implementation.
 ///
@@ -22,11 +33,20 @@ pub fn handle_shortcut_event(
     hotkey_string: &str,
     is_pressed: bool,
 ) {
+    if are_shortcuts_suspended() {
+        debug!(
+            "Shortcut event '{}' ignored because shortcuts are suspended",
+            binding_id
+        );
+        return;
+    }
+
     let settings = crate::settings::get_settings(ctx);
 
     // Transcribe bindings are handled by the coordinator.
     if is_transcribe_binding(binding_id) {
-        if settings.push_to_talk {
+        let is_meeting = binding_id == "transcribe_meeting";
+        if settings.push_to_talk && !is_meeting {
             let hotkey = if hotkey_string.is_empty() {
                 settings
                     .bindings
@@ -43,17 +63,18 @@ pub fn handle_shortcut_event(
                 ctx.coordinator.send_input(binding_id, hotkey, true, true);
                 crate::shortcut::ptt::start_ptt_release_watcher(ctx, binding_id, hotkey);
             }
-        } else {
-            ctx.coordinator.send_external_input(binding_id, "portal");
+        } else if is_pressed {
+            ctx.coordinator
+                .send_input(binding_id, hotkey_string, true, false);
         }
         return;
     }
 
-    if binding_id.starts_with("prompt_") || binding_id.starts_with("custom_prompt_") {
+    if let Some(prompt_id) = binding_id
+        .strip_prefix("custom_prompt_")
+        .or_else(|| binding_id.strip_prefix("prompt_"))
+    {
         if is_pressed {
-            let prompt_id = binding_id
-                .strip_prefix("custom_prompt_")
-                .unwrap_or(binding_id);
             crate::ui::prompt_palette::execute_prompt_by_id(ctx, prompt_id);
         }
         return;

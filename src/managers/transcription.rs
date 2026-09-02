@@ -1558,6 +1558,77 @@ impl TranscriptionManager {
 
         Ok(final_result)
     }
+
+    /// Transcribe an audio sample buffer (from a file or long recording session) into a timestamped [`TranscriptDocument`].
+    /// Automatically chunks long audio into manageable segments and invokes `progress` callback.
+    pub fn transcribe_with_segments(
+        &self,
+        audio: Vec<f32>,
+        title: String,
+        progress: Option<std::sync::Arc<dyn Fn(f32) + Send + Sync>>,
+    ) -> Result<crate::audio_toolkit::TranscriptDocument> {
+        let total_samples = audio.len();
+        let duration_secs = total_samples as f64 / 16000.0;
+        let created_at_unix = chrono::Utc::now().timestamp();
+        let settings = read_settings_from(&self.paths.settings_store_path());
+        let model_name = self
+            .get_current_model()
+            .or_else(|| Some(settings.selected_model.clone()));
+
+        if total_samples == 0 {
+            return Ok(crate::audio_toolkit::TranscriptDocument {
+                title,
+                language: Some(settings.selected_language),
+                model_name,
+                duration_secs: 0.0,
+                created_at_unix,
+                segments: Vec::new(),
+                summary_or_post_processed: None,
+            });
+        }
+
+        // Chunking length: 30 seconds max (480,000 samples)
+        let chunk_size = 30 * 16000;
+        let chunks: Vec<&[f32]> = audio.chunks(chunk_size).collect();
+        let total_chunks = chunks.len();
+
+        let mut segments = Vec::new();
+        let mut sample_offset: usize = 0;
+
+        for (i, chunk) in chunks.iter().enumerate() {
+            let chunk_start_ms = (sample_offset as f64 / 16.0) as u64;
+            let chunk_end_ms = ((sample_offset + chunk.len()) as f64 / 16.0) as u64;
+
+            let text = self.transcribe(chunk.to_vec())?;
+            let trimmed = text.trim();
+            if !trimmed.is_empty() {
+                segments.push(crate::audio_toolkit::TranscriptSegment {
+                    id: segments.len() + 1,
+                    start_ms: chunk_start_ms,
+                    end_ms: chunk_end_ms,
+                    text: trimmed.to_string(),
+                    speaker: None,
+                });
+            }
+
+            sample_offset += chunk.len();
+
+            if let Some(ref cb) = progress {
+                let frac = (i + 1) as f32 / total_chunks as f32;
+                cb(frac.clamp(0.0, 1.0));
+            }
+        }
+
+        Ok(crate::audio_toolkit::TranscriptDocument {
+            title,
+            language: Some(settings.selected_language),
+            model_name,
+            duration_secs,
+            created_at_unix,
+            segments,
+            summary_or_post_processed: None,
+        })
+    }
 }
 
 struct StreamPerf {

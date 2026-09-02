@@ -89,6 +89,8 @@ pub struct AudioRecorder {
     config_cache: Arc<Mutex<Option<(String, cpal::SupportedStreamConfig)>>>,
     /// Set by cpal when the active input stream can no longer capture.
     stream_error: Arc<AtomicBool>,
+    /// Whether the active capture stream is a desktop audio monitor (e.g. PipeWire pw-record).
+    is_monitor: bool,
 }
 
 impl AudioRecorder {
@@ -103,6 +105,7 @@ impl AudioRecorder {
             selected_channel: None,
             config_cache: Arc::new(Mutex::new(None)),
             stream_error: Arc::new(AtomicBool::new(false)),
+            is_monitor: false,
         })
     }
 
@@ -347,6 +350,7 @@ impl AudioRecorder {
                 self.device = Some(device);
                 self.cmd_tx = Some(cmd_tx);
                 self.worker_handle = Some(worker);
+                self.is_monitor = false;
                 Ok(())
             }
             Ok(Err(error_message)) => {
@@ -365,6 +369,160 @@ impl AudioRecorder {
                 ))))
             }
         }
+    }
+
+    /// Open a system audio / desktop output monitor recording stream (e.g. for Meeting Mode).
+    /// Uses native PipeWire loopback (`pw-record --properties=stream.capture.sink=true`) when available on Linux.
+    pub fn open_monitor(&mut self, target: Option<&str>) -> Result<(), Box<dyn std::error::Error>> {
+        if self.worker_handle.is_some() {
+            if !self.needs_reopen() {
+                return Ok(()); // already open
+            }
+            log::warn!("Capture stream failed; rebuilding monitor stream");
+            let _ = self.close();
+        }
+
+        self.stream_error.store(false, Ordering::Relaxed);
+
+        let (sample_tx, sample_rx) = mpsc::channel::<AudioChunk>();
+        let (cmd_tx, cmd_rx) = mpsc::channel::<Cmd>();
+        let (init_tx, init_rx) = mpsc::sync_channel::<Result<(), String>>(1);
+
+        let vad = self.vad.clone();
+        let level_cb = self.level_cb.clone();
+        let audio_cb = self.audio_cb.clone();
+        let target_owned = target.map(|s| s.to_string());
+
+        let worker = std::thread::spawn(move || {
+            let stop_flag = Arc::new(AtomicBool::new(false));
+            let stop_flag_for_reader = Arc::clone(&stop_flag);
+            let shutdown_flag = Arc::new(AtomicBool::new(false));
+            let shutdown_for_reader = Arc::clone(&shutdown_flag);
+            let sample_tx_for_reader = sample_tx.clone();
+
+            let mut args = vec![
+                "--raw".to_string(),
+                "--properties=stream.capture.sink=true".to_string(),
+                "--rate=16000".to_string(),
+                "--channels=1".to_string(),
+                "--format=s16".to_string(),
+            ];
+            if let Some(t) = &target_owned {
+                let trimmed = t.trim();
+                if !trimmed.is_empty()
+                    && !trimmed.eq_ignore_ascii_case("default")
+                    && trimmed != "Default System Audio Monitor"
+                {
+                    args.push(format!("--target={trimmed}"));
+                }
+            }
+            args.push("-".to_string());
+
+            let mut pw_child = match std::process::Command::new("pw-record")
+                .args(&args)
+                .stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+            {
+                Ok(child) => child,
+                Err(e) => {
+                    let err_msg = format!("Failed to spawn pw-record for monitor capture: {e}");
+                    log::error!("{err_msg}");
+                    let _ = init_tx.send(Err(err_msg));
+                    return;
+                }
+            };
+
+            let mut stdout = match pw_child.stdout.take() {
+                Some(s) => s,
+                None => {
+                    let err_msg = "Failed to capture stdout from pw-record".to_string();
+                    log::error!("{err_msg}");
+                    let _ = init_tx.send(Err(err_msg));
+                    return;
+                }
+            };
+
+            // Pipe reader thread: reads raw PCM bytes and converts to normalized f32
+            let reader_handle = std::thread::spawn(move || {
+                use std::io::Read;
+                let mut buffer = [0u8; 2048]; // 1024 i16 samples
+                let mut eos_sent = false;
+                while !shutdown_for_reader.load(Ordering::Relaxed) {
+                    match stdout.read(&mut buffer) {
+                        Ok(0) => break,
+                        Ok(bytes_read) => {
+                            let sample_count = bytes_read / 2;
+                            if sample_count > 0 {
+                                let stopping = stop_flag_for_reader.load(Ordering::Relaxed);
+                                if stopping {
+                                    if !eos_sent {
+                                        let _ = sample_tx_for_reader.send(AudioChunk::EndOfStream);
+                                        eos_sent = true;
+                                    }
+                                    continue;
+                                }
+                                eos_sent = false;
+
+                                let mut chunk = Vec::with_capacity(sample_count);
+                                for i in 0..sample_count {
+                                    let sample_i16 =
+                                        i16::from_le_bytes([buffer[i * 2], buffer[i * 2 + 1]]);
+                                    chunk.push(sample_i16 as f32 / 32768.0);
+                                }
+                                if sample_tx_for_reader
+                                    .send(AudioChunk::Samples(chunk))
+                                    .is_err()
+                                {
+                                    break;
+                                }
+                            }
+                        }
+                        Err(_) => break,
+                    }
+                }
+                let _ = sample_tx_for_reader.send(AudioChunk::EndOfStream);
+            });
+
+            let _ = init_tx.send(Ok(()));
+            let stream_running_at = Instant::now();
+
+            run_consumer(
+                16000,
+                vad,
+                sample_rx,
+                cmd_rx,
+                level_cb,
+                audio_cb,
+                stop_flag,
+                stream_running_at,
+            );
+
+            // Terminate child and reader thread on stream shutdown
+            shutdown_flag.store(true, Ordering::Relaxed);
+            let _ = pw_child.kill();
+            let _ = pw_child.wait();
+            let _ = reader_handle.join();
+        });
+
+        match init_rx.recv() {
+            Ok(Ok(())) => {
+                self.device = None;
+                self.cmd_tx = Some(cmd_tx);
+                self.worker_handle = Some(worker);
+                self.is_monitor = true;
+                Ok(())
+            }
+            Ok(Err(err)) => Err(Box::new(Error::other(err))),
+            Err(e) => Err(Box::new(Error::other(format!(
+                "Worker thread panicked during initialization: {e}"
+            )))),
+        }
+    }
+
+    /// Whether the active capture stream is desktop audio monitor capture.
+    pub fn is_monitor(&self) -> bool {
+        self.is_monitor
     }
 
     /// Queue a recording start and return a one-shot receiver that resolves only
@@ -412,6 +570,7 @@ impl AudioRecorder {
             let _ = h.join();
         }
         self.device = None;
+        self.is_monitor = false;
         Ok(())
     }
 

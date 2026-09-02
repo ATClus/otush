@@ -86,6 +86,13 @@ fn run_evdev_listener_loop(
         }
 
         loop {
+            // When XDG Desktop Portal is active, it handles global shortcuts natively.
+            // Direct evdev shortcut listener is only a fallback when portal is unavailable.
+            if crate::shortcut::portal::is_initialized() {
+                std::thread::sleep(Duration::from_millis(500));
+                continue;
+            }
+
             current_held_keys.clear();
 
             for dev in &mut devices {

@@ -259,6 +259,15 @@ pub enum AutoSubmitKey {
     CmdEnter,
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum AudioCaptureSource {
+    #[default]
+    MicrophoneOnly,
+    SystemAudioOnly,
+    Mixed,
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum RecordingRetentionPeriod {
@@ -462,6 +471,10 @@ pub struct AppSettings {
     pub clamshell_microphone: Option<String>,
     #[serde(default)]
     pub selected_output_device: Option<String>,
+    #[serde(default = "default_audio_capture_source")]
+    pub audio_capture_source: AudioCaptureSource,
+    #[serde(default)]
+    pub selected_system_audio_device: Option<String>,
     #[serde(default = "default_translate_to_english")]
     pub translate_to_english: bool,
     #[serde(default = "default_selected_language")]
@@ -597,6 +610,10 @@ fn default_settings_schema_version() -> u32 {
 
 fn default_push_to_talk() -> bool {
     false
+}
+
+fn default_audio_capture_source() -> AudioCaptureSource {
+    AudioCaptureSource::MicrophoneOnly
 }
 
 fn default_always_on_microphone() -> bool {
@@ -1011,6 +1028,18 @@ fn default_post_process_prompts() -> Vec<LLMPrompt> {
             prompt: "<transcript>\n${output}\n</transcript>\n\nSummarize the key ideas and action items from the transcript above into concise, well-structured bullet points. Keep the language matching the source unless requested otherwise. Return only the bullet list.".to_string(),
             preferred_provider_id: None,
         },
+        LLMPrompt {
+            id: "default_meeting_minutes".to_string(),
+            name: "Meeting Minutes & Action Items".to_string(),
+            prompt: "<transcript>\n${output}\n</transcript>\n\nYou are an executive assistant. Generate structured meeting minutes from the transcript above:\n\n1. **Executive Summary**: 2-3 sentences summarizing the meeting purpose and outcome.\n2. **Key Discussion Points**: Grouped by topic.\n3. **Decisions Made**: Explicit list of agreed points.\n4. **Action Items**: Checklist of tasks with [Task | Assignee | Deadline].\n\nPreserve all important context and names. Return only formatted Markdown meeting notes.".to_string(),
+            preferred_provider_id: None,
+        },
+        LLMPrompt {
+            id: "default_professional_subtitles".to_string(),
+            name: "Professional Subtitle Formatting".to_string(),
+            prompt: "<transcript>\n${output}\n</transcript>\n\nYou are a professional subtitler and caption editor following Netflix/BBC subtitling standards.\n\nProcess the transcript above to make it ideal for video subtitles:\n1. Fix spelling, capitalization, and punctuation\n2. Split into concise, punchy sentences (maximum 8-12 words per sentence)\n3. Remove filler words and speech stumbles\n4. Maintain natural dialogue rhythm and grammatical completeness\n5. Keep the original language\n\nReturn only the clean, punctuated text formatted for subtitles.".to_string(),
+            preferred_provider_id: None,
+        },
     ]
 }
 
@@ -1191,6 +1220,19 @@ pub fn get_default_settings() -> AppSettings {
             current_binding: "ctrl+alt+p".to_string(),
         },
     );
+    let default_meeting_shortcut = "ctrl+alt+m";
+
+    bindings.insert(
+        "transcribe_meeting".to_string(),
+        ShortcutBinding {
+            id: "transcribe_meeting".to_string(),
+            name: "Meeting Mode (Live Meets)".to_string(),
+            description: "Records meeting audio and generates structured meeting minutes with AI."
+                .to_string(),
+            default_binding: default_meeting_shortcut.to_string(),
+            current_binding: default_meeting_shortcut.to_string(),
+        },
+    );
 
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
@@ -1211,6 +1253,8 @@ pub fn get_default_settings() -> AppSettings {
         selected_channel: None,
         clamshell_microphone: None,
         selected_output_device: None,
+        audio_capture_source: default_audio_capture_source(),
+        selected_system_audio_device: None,
         translate_to_english: false,
         selected_language: "auto".to_string(),
         overlay_position: default_overlay_position(),
@@ -1588,6 +1632,22 @@ mod tests {
 
     fn default_settings_json() -> serde_json::Value {
         serde_json::to_value(get_default_settings()).unwrap()
+    }
+
+    #[test]
+    fn test_default_bindings_include_meeting() {
+        let defaults = get_default_settings();
+        assert!(defaults.bindings.contains_key("transcribe"));
+        assert!(defaults
+            .bindings
+            .contains_key("transcribe_with_post_process"));
+        assert!(defaults.bindings.contains_key("transcribe_meeting"));
+        assert!(defaults.bindings.contains_key("cancel"));
+        assert!(defaults.bindings.contains_key("transform_selection"));
+        assert_eq!(
+            defaults.bindings["transcribe_meeting"].current_binding,
+            "ctrl+alt+m"
+        );
     }
 
     /// Every field must survive a partial store: a missing key must never fail

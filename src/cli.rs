@@ -20,6 +20,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub toggle_post_process: bool,
 
+    /// Toggle meeting recording & minutes on/off (sent to running instance)
+    #[arg(long)]
+    pub toggle_meeting: bool,
+
     /// Open prompt palette to transform selected text (sent to running instance)
     #[arg(long)]
     pub transform_selection: bool,
@@ -32,10 +36,9 @@ pub struct CliArgs {
     #[arg(long)]
     pub debug: bool,
 
-    /// Transcribe this WAV (16 kHz mono) headlessly and exit. Runs the same
-    /// batch transcription path as the app — no mic, no VAD, no download
-    /// (the model must already be installed).
-    #[arg(short = 'f', long, value_name = "WAV")]
+    /// Transcribe this audio/video file (MP3, WAV, M4A, MP4, FLAC, OGG, AAC, WebM, MKV) headlessly and exit.
+    /// Runs the batch transcription pipeline with automatic decoding and resampling.
+    #[arg(short = 'f', long, value_name = "FILE")]
     pub transcribe_file: Option<PathBuf>,
 
     /// Model id to load for --transcribe-file (default: the selected model).

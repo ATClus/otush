@@ -6,8 +6,9 @@ use std::sync::{Arc, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
-const DEBOUNCE: Duration = Duration::from_millis(30);
+const DEBOUNCE: Duration = Duration::from_millis(300);
 const RELEASE_GRACE: Duration = Duration::from_millis(50);
+const MIN_TOGGLE_RECORDING_DURATION: Duration = Duration::from_millis(500);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PttAction {
@@ -71,6 +72,7 @@ enum Stage {
 }
 
 /// A keyboard/signal edge for a transcribe binding.
+#[derive(Clone)]
 struct InputEvent {
     binding_id: String,
     hotkey_string: String,
@@ -80,6 +82,7 @@ struct InputEvent {
     /// They fire on every edge by design and must never be debounced —
     /// dropping one desyncs toggle parity and wedges recording on.
     external: bool,
+    created_at: Instant,
 }
 
 /// A side effect decided by [`CoordinatorState`]; the coordinator thread is
@@ -111,7 +114,7 @@ fn classify_ptt_event(
     binding_id: &str,
     recording_binding: Option<&str>,
 ) -> PttAction {
-    if !push_to_talk {
+    if !push_to_talk || binding_id == "transcribe_meeting" {
         return PttAction::Passthrough;
     }
 
@@ -135,6 +138,7 @@ fn classify_ptt_event(
 struct CoordinatorState {
     stage: Stage,
     last_press: Option<Instant>,
+    recording_started_at: Option<Instant>,
     pending_release: Option<PendingRelease>,
     pending_press: Option<PendingPress>,
 }
@@ -144,6 +148,7 @@ impl CoordinatorState {
         Self {
             stage: Stage::Idle,
             last_press: None,
+            recording_started_at: None,
             pending_release: None,
             pending_press: None,
         }
@@ -186,19 +191,18 @@ impl CoordinatorState {
             PttAction::Passthrough => {}
         }
 
-        // Debounce rapid-fire press events (key repeat / double-tap).
-        // Push-to-talk releases may be deferred above to absorb X11 auto-repeat.
-        // External triggers are exempt: each one is a deliberate edge from the
-        // user's own integration, and dropping it desyncs toggle parity.
+        // Debounce rapid-fire press events (key repeat / double-tap / duplicate portal+evdev).
+        // Uses input.created_at so events queued while the coordinator was busy starting
+        // are properly debounced against the actual keypress timestamp.
         if input.is_pressed && !input.external {
             if self
                 .last_press
-                .is_some_and(|t| now.duration_since(t) < DEBOUNCE)
+                .is_some_and(|t| input.created_at.duration_since(t) < DEBOUNCE)
             {
                 debug!("Debounced press for '{}'", input.binding_id);
                 return None;
             }
-            self.last_press = Some(now);
+            self.last_press = Some(input.created_at);
         }
 
         // A busy pipeline can't accept lifecycle changes now: classify the
@@ -241,26 +245,36 @@ impl CoordinatorState {
             return None;
         }
 
-        if input.push_to_talk {
+        let is_ptt = input.push_to_talk && input.binding_id != "transcribe_meeting";
+        if is_ptt {
             if input.is_pressed {
                 if matches!(self.stage, Stage::Idle) {
-                    return Some(self.begin_recording(input.binding_id, input.hotkey_string));
+                    return Some(self.begin_recording(input.binding_id, input.hotkey_string, now));
                 }
-            } else if matches!(&self.stage, Stage::Recording(id) if id == &input.binding_id) {
-                return Some(self.begin_processing(input.binding_id, input.hotkey_string));
+            } else if let Stage::Recording(active_id) = &self.stage {
+                return Some(self.begin_processing(active_id.clone(), input.hotkey_string));
             }
         } else if input.is_pressed {
             match &self.stage {
                 Stage::Idle => {
-                    return Some(self.begin_recording(input.binding_id, input.hotkey_string));
+                    return Some(self.begin_recording(input.binding_id, input.hotkey_string, now));
                 }
-                Stage::Recording(id) if id == &input.binding_id => {
-                    return Some(self.begin_processing(input.binding_id, input.hotkey_string));
+                Stage::Recording(active_id) => {
+                    if let Some(started_at) = self.recording_started_at {
+                        if now.duration_since(started_at) < MIN_TOGGLE_RECORDING_DURATION
+                            && !input.external
+                        {
+                            debug!(
+                                "Ignoring toggle stop for '{}': recording just started ({:?} ago)",
+                                active_id,
+                                now.duration_since(started_at)
+                            );
+                            return None;
+                        }
+                    }
+                    return Some(self.begin_processing(active_id.clone(), input.hotkey_string));
                 }
-                _ => debug!(
-                    "Ignoring press for '{}': another binding is recording",
-                    input.binding_id
-                ),
+                _ => debug!("Ignoring press for '{}': pipeline busy", input.binding_id),
             }
         }
         None
@@ -282,6 +296,7 @@ impl CoordinatorState {
         // An explicit cancel abandons any remembered start too — the user
         // asked for silence, not a deferred recording.
         self.pending_press = None;
+        self.recording_started_at = None;
         // Don't reset during processing — wait for the pipeline to finish.
         if !matches!(self.stage, Stage::Processing)
             && (recording_was_active || matches!(self.stage, Stage::Recording(_)))
@@ -292,12 +307,13 @@ impl CoordinatorState {
 
     fn on_processing_finished(&mut self) -> Option<Effect> {
         self.stage = Stage::Idle;
+        self.recording_started_at = None;
         let pending = self.pending_press.take()?;
         debug!(
             "Pipeline drained; starting remembered press for '{}'",
             pending.binding_id
         );
-        Some(self.begin_recording(pending.binding_id, pending.hotkey_string))
+        Some(self.begin_recording(pending.binding_id, pending.hotkey_string, Instant::now()))
     }
 
     /// Reconcile the optimistic `Stage::Recording` after the executor reports
@@ -305,14 +321,21 @@ impl CoordinatorState {
     fn on_start_result(&mut self, binding_id: &str, started: bool) {
         if !started && matches!(&self.stage, Stage::Recording(id) if id == binding_id) {
             self.stage = Stage::Idle;
+            self.recording_started_at = None;
         }
     }
 
     /// Optimistic transition to `Recording`; rolled back via
     /// [`CoordinatorState::on_start_result`] if the effect fails to start
     /// recording for real.
-    fn begin_recording(&mut self, binding_id: String, hotkey_string: String) -> Effect {
+    fn begin_recording(
+        &mut self,
+        binding_id: String,
+        hotkey_string: String,
+        now: Instant,
+    ) -> Effect {
         self.stage = Stage::Recording(binding_id.clone());
+        self.recording_started_at = Some(now);
         Effect::Start {
             binding_id,
             hotkey_string,
@@ -321,6 +344,7 @@ impl CoordinatorState {
 
     fn begin_processing(&mut self, binding_id: String, hotkey_string: String) -> Effect {
         self.stage = Stage::Processing;
+        self.recording_started_at = None;
         Effect::Stop {
             binding_id,
             hotkey_string,
@@ -341,7 +365,7 @@ pub struct TranscriptionCoordinator {
 }
 
 pub fn is_transcribe_binding(id: &str) -> bool {
-    id == "transcribe" || id == "transcribe_with_post_process"
+    id == "transcribe" || id == "transcribe_with_post_process" || id == "transcribe_meeting"
 }
 
 impl Default for TranscriptionCoordinator {
@@ -469,6 +493,7 @@ impl TranscriptionCoordinator {
                 is_pressed,
                 push_to_talk,
                 external,
+                created_at: Instant::now(),
             }))
             .is_err()
         {
@@ -703,12 +728,17 @@ mod tests {
     }
 
     fn ptt_input(is_pressed: bool) -> InputEvent {
+        ptt_input_at(is_pressed, Instant::now())
+    }
+
+    fn ptt_input_at(is_pressed: bool, at: Instant) -> InputEvent {
         InputEvent {
             binding_id: BINDING.to_string(),
             hotkey_string: BINDING.to_string(),
             is_pressed,
             push_to_talk: true,
             external: false,
+            created_at: at,
         }
     }
 
@@ -727,7 +757,8 @@ mod tests {
             let effect = match ev {
                 Ev::Grace => state.on_grace_expired(),
                 Ev::Press | Ev::Release => {
-                    state.on_input(ptt_input(matches!(ev, Ev::Press)), clock)
+                    let input = ptt_input_at(matches!(ev, Ev::Press), clock);
+                    state.on_input(input, clock)
                 }
             };
             match effect {
@@ -805,16 +836,22 @@ mod tests {
         let mut state = CoordinatorState::new();
         let now = Instant::now();
 
-        let effect = state.on_input(ptt_input(true), now);
+        let effect = state.on_input(ptt_input_at(true, now), now);
         assert!(matches!(effect, Some(Effect::Start { .. })));
 
-        let effect = state.on_input(ptt_input(false), now + Duration::from_millis(100));
+        let effect = state.on_input(
+            ptt_input_at(false, now + Duration::from_millis(100)),
+            now + Duration::from_millis(100),
+        );
         assert!(effect.is_none(), "release should be deferred, not fired");
 
         let effect = state.on_grace_expired();
         assert!(matches!(effect, Some(Effect::Stop { .. })));
 
-        let effect = state.on_input(ptt_input(true), now + Duration::from_millis(200));
+        let effect = state.on_input(
+            ptt_input_at(true, now + Duration::from_millis(350)),
+            now + Duration::from_millis(350),
+        );
         assert!(effect.is_none(), "busy pipeline must remember, not start");
 
         let effect = state.on_processing_finished();
@@ -831,9 +868,12 @@ mod tests {
         let mut state = CoordinatorState::new();
         let now = Instant::now();
 
-        let effect = state.on_input(ptt_input(true), now);
+        let effect = state.on_input(ptt_input_at(true, now), now);
         assert!(matches!(effect, Some(Effect::Start { .. })));
-        let effect = state.on_input(ptt_input(false), now + Duration::from_millis(100));
+        let effect = state.on_input(
+            ptt_input_at(false, now + Duration::from_millis(100)),
+            now + Duration::from_millis(100),
+        );
         assert!(effect.is_none());
         let effect = state.on_grace_expired();
         assert!(matches!(effect, Some(Effect::Stop { .. })));
@@ -846,6 +886,7 @@ mod tests {
                     is_pressed: true,
                     push_to_talk: false,
                     external: true,
+                    created_at: at,
                 },
                 at,
             )
@@ -871,14 +912,20 @@ mod tests {
         let mut state = CoordinatorState::new();
         let now = Instant::now();
 
-        let effect = state.on_input(ptt_input(true), now);
+        let effect = state.on_input(ptt_input_at(true, now), now);
         assert!(matches!(effect, Some(Effect::Start { .. })));
-        let effect = state.on_input(ptt_input(false), now + Duration::from_millis(100));
+        let effect = state.on_input(
+            ptt_input_at(false, now + Duration::from_millis(100)),
+            now + Duration::from_millis(100),
+        );
         assert!(effect.is_none());
         let effect = state.on_grace_expired();
         assert!(matches!(effect, Some(Effect::Stop { .. })));
 
-        let effect = state.on_input(ptt_input(true), now + Duration::from_millis(200));
+        let effect = state.on_input(
+            ptt_input_at(true, now + Duration::from_millis(350)),
+            now + Duration::from_millis(350),
+        );
         assert!(effect.is_none());
 
         state.on_cancel(false);
@@ -907,14 +954,31 @@ mod tests {
             is_pressed: true,
             push_to_talk: false,
             external,
+            created_at: Instant::now(),
+        }
+    }
+
+    fn toggle_input_at(binding_id: &str, external: bool, at: Instant) -> InputEvent {
+        InputEvent {
+            binding_id: binding_id.to_string(),
+            hotkey_string: binding_id.to_string(),
+            is_pressed: true,
+            push_to_talk: false,
+            external,
+            created_at: at,
         }
     }
 
     /// Start and stop one toggle recording so the machine sits in `Processing`.
     fn drive_into_processing(state: &mut CoordinatorState, now: Instant) {
-        let effect = state.on_input(toggle_input(true), now);
+        let mut start_input = toggle_input(true);
+        start_input.created_at = now;
+        let effect = state.on_input(start_input, now);
         assert!(matches!(effect, Some(Effect::Start { .. })));
-        let effect = state.on_input(toggle_input(true), now + Duration::from_millis(100));
+        let stop_time = now + Duration::from_millis(600);
+        let mut stop_input = toggle_input(true);
+        stop_input.created_at = stop_time;
+        let effect = state.on_input(stop_input, stop_time);
         assert!(matches!(effect, Some(Effect::Stop { .. })));
         assert_eq!(state.stage, Stage::Processing);
     }
@@ -932,11 +996,15 @@ mod tests {
         drive_into_processing(&mut state, now);
 
         let at = |ms| now + Duration::from_millis(ms);
-        assert!(state.on_input(toggle_input(true), at(200)).is_none());
         assert!(state
-            .on_input(toggle_input_for(OTHER_BINDING, true), at(300))
+            .on_input(toggle_input_at(BINDING, true, at(700)), at(700))
             .is_none());
-        assert!(state.on_input(toggle_input(true), at(400)).is_none());
+        assert!(state
+            .on_input(toggle_input_at(OTHER_BINDING, true, at(800)), at(800))
+            .is_none());
+        assert!(state
+            .on_input(toggle_input_at(BINDING, true, at(900)), at(900))
+            .is_none());
 
         let effect = state.on_processing_finished();
         assert!(
@@ -955,9 +1023,11 @@ mod tests {
         drive_into_processing(&mut state, now);
 
         let at = |ms| now + Duration::from_millis(ms);
-        assert!(state.on_input(toggle_input(true), at(200)).is_none());
         assert!(state
-            .on_input(toggle_input_for(OTHER_BINDING, true), at(300))
+            .on_input(toggle_input_at(BINDING, true, at(700)), at(700))
+            .is_none());
+        assert!(state
+            .on_input(toggle_input_at(OTHER_BINDING, true, at(800)), at(800))
             .is_none());
 
         match state.on_processing_finished() {
@@ -974,10 +1044,14 @@ mod tests {
         let mut state = CoordinatorState::new();
         let now = Instant::now();
 
-        let effect = state.on_input(toggle_input(true), now);
+        let mut start_input = toggle_input(true);
+        start_input.created_at = now;
+        let effect = state.on_input(start_input, now);
         assert!(matches!(effect, Some(Effect::Start { .. })));
 
-        let effect = state.on_input(toggle_input(true), now + Duration::from_millis(5));
+        let mut edge2 = toggle_input(true);
+        edge2.created_at = now + Duration::from_millis(5);
+        let effect = state.on_input(edge2, now + Duration::from_millis(5));
         assert!(
             matches!(effect, Some(Effect::Stop { .. })),
             "second external edge inside DEBOUNCE must stop the recording"
@@ -992,10 +1066,14 @@ mod tests {
         let mut state = CoordinatorState::new();
         let now = Instant::now();
 
-        let effect = state.on_input(toggle_input(false), now);
+        let mut press1 = toggle_input(false);
+        press1.created_at = now;
+        let effect = state.on_input(press1, now);
         assert!(matches!(effect, Some(Effect::Start { .. })));
 
-        let effect = state.on_input(toggle_input(false), now + Duration::from_millis(5));
+        let mut press2 = toggle_input(false);
+        press2.created_at = now + Duration::from_millis(5);
+        let effect = state.on_input(press2, now + Duration::from_millis(5));
         assert!(
             effect.is_none(),
             "keyboard repeat inside DEBOUNCE must be debounced"
@@ -1014,5 +1092,100 @@ mod tests {
 
         state.on_start_result(BINDING, false);
         assert_eq!(state.stage, Stage::Idle);
+    }
+
+    #[test]
+    fn test_is_transcribe_binding_includes_meeting() {
+        assert!(super::is_transcribe_binding("transcribe"));
+        assert!(super::is_transcribe_binding("transcribe_with_post_process"));
+        assert!(super::is_transcribe_binding("transcribe_meeting"));
+        assert!(!super::is_transcribe_binding("cancel"));
+        assert!(!super::is_transcribe_binding("transform_selection"));
+    }
+
+    #[test]
+    fn test_transcribe_meeting_always_toggle_even_with_ptt() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+
+        let mut meeting_press = InputEvent {
+            binding_id: "transcribe_meeting".to_string(),
+            hotkey_string: "ctrl+alt+m".to_string(),
+            is_pressed: true,
+            push_to_talk: true,
+            external: false,
+            created_at: now,
+        };
+
+        let meeting_release = InputEvent {
+            binding_id: "transcribe_meeting".to_string(),
+            hotkey_string: "ctrl+alt+m".to_string(),
+            is_pressed: false,
+            push_to_talk: true,
+            external: false,
+            created_at: now + Duration::from_millis(100),
+        };
+
+        // First press starts recording
+        let effect1 = state.on_input(meeting_press.clone(), now);
+        assert!(matches!(effect1, Some(Effect::Start { .. })));
+        assert_eq!(
+            state.stage,
+            Stage::Recording("transcribe_meeting".to_string())
+        );
+
+        // Release does NOT stop recording (it ignores PTT)
+        let effect2 = state.on_input(meeting_release, now + Duration::from_millis(100));
+        assert!(effect2.is_none());
+        assert_eq!(
+            state.stage,
+            Stage::Recording("transcribe_meeting".to_string())
+        );
+
+        // Second press stops recording (after debounce window and min duration)
+        let stop_time = now + Duration::from_millis(600);
+        meeting_press.created_at = stop_time;
+        let effect3 = state.on_input(meeting_press, stop_time);
+        assert!(matches!(effect3, Some(Effect::Stop { .. })));
+        assert_eq!(state.stage, Stage::Processing);
+    }
+
+    #[test]
+    fn toggle_press_too_soon_after_start_is_ignored() {
+        let mut state = CoordinatorState::new();
+        let now = Instant::now();
+
+        let mut press = toggle_input(false);
+        press.created_at = now;
+        let effect1 = state.on_input(press, now);
+        assert!(matches!(effect1, Some(Effect::Start { .. })));
+
+        // Duplicate press generated at t=20ms (e.g. from portal + evdev double fire)
+        // dequeued at t=200ms (after microphone initialization delay)
+        let mut dup_press = toggle_input(false);
+        dup_press.created_at = now + Duration::from_millis(20);
+        let effect2 = state.on_input(dup_press, now + Duration::from_millis(200));
+        assert!(
+            effect2.is_none(),
+            "queued duplicate press must be debounced"
+        );
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+
+        // Fast re-tap within MIN_TOGGLE_RECORDING_DURATION (e.g. at 350ms)
+        let mut early_stop = toggle_input(false);
+        early_stop.created_at = now + Duration::from_millis(350);
+        let effect3 = state.on_input(early_stop, now + Duration::from_millis(350));
+        assert!(
+            effect3.is_none(),
+            "press within min toggle duration must be ignored"
+        );
+        assert_eq!(state.stage, Stage::Recording(BINDING.to_string()));
+
+        // Legitimate stop press at t=800ms
+        let mut real_stop = toggle_input(false);
+        real_stop.created_at = now + Duration::from_millis(800);
+        let effect4 = state.on_input(real_stop, now + Duration::from_millis(800));
+        assert!(matches!(effect4, Some(Effect::Stop { .. })));
+        assert_eq!(state.stage, Stage::Processing);
     }
 }

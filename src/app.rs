@@ -147,6 +147,7 @@ pub fn run_gtk(ctx: AppContext, cli_args: &CliArgs) {
             let is_remote_control = args.iter().any(|a| {
                 a == "--toggle-transcription"
                     || a == "--toggle-post-process"
+                    || a == "--toggle-meeting"
                     || a == "--transform-selection"
                     || a == "--cancel"
             });
@@ -167,6 +168,10 @@ pub fn run_gtk(ctx: AppContext, cli_args: &CliArgs) {
                     "transcribe_with_post_process",
                     "CLI",
                 );
+                handled = true;
+            }
+            if args.iter().any(|a| a == "--toggle-meeting") {
+                crate::signal_handle::send_transcription_input(ctx, "transcribe_meeting", "CLI");
                 handled = true;
             }
             if args.iter().any(|a| a == "--transform-selection") {
