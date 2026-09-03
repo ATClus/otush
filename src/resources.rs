@@ -14,9 +14,12 @@ pub fn resource_dir() -> PathBuf {
     // runtime. Stale copies that end up next to build artifacts (e.g. an old
     // `target/debug/resources` from a previous project generation) must never
     // shadow the real resource set.
-    let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
-    if dev.is_dir() {
-        return dev;
+    #[cfg(debug_assertions)]
+    {
+        let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("resources");
+        if dev.is_dir() {
+            return dev;
+        }
     }
     if let Ok(exe) = std::env::current_exe() {
         let exe_dir = exe.parent().map(|p| p.to_path_buf()).unwrap_or_default();

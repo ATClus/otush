@@ -80,8 +80,12 @@ pub fn has_input_placeholder(template: &str) -> bool {
     template.contains("${output}") || template.contains("${selected_text}")
 }
 
-/// Expands all dynamic variables in the prompt template.
-pub fn expand_template(template: &str, context: &TemplateContext) -> String {
+/// Expands variables in a prompt template in a single pass, preventing second-order token injection.
+fn expand_template_single_pass(
+    template: &str,
+    context: &TemplateContext,
+    include_output: bool,
+) -> String {
     let now = chrono::Local::now();
     let date_str = context
         .date
@@ -99,46 +103,55 @@ pub fn expand_template(template: &str, context: &TemplateContext) -> String {
     let window_str = context.active_window.as_deref().unwrap_or("");
     let lang_str = context.language.as_deref().unwrap_or("");
 
-    template
-        .replace("${clipboard}", clipboard_str)
-        .replace("${active_window}", window_str)
-        .replace("${date}", &date_str)
-        .replace("${datetime}", &datetime_str)
-        .replace("${time}", &time_str)
-        .replace("${language}", lang_str)
-        .replace("${selected_text}", selected_str)
-        .replace("${output}", &context.output)
+    let mut result = String::with_capacity(template.len() + 64);
+    let mut remainder = template;
+
+    while let Some(start_idx) = remainder.find("${") {
+        result.push_str(&remainder[..start_idx]);
+        let after_prefix = &remainder[start_idx + 2..];
+        if let Some(end_idx) = after_prefix.find('}') {
+            let token_name = &after_prefix[..end_idx];
+            match token_name {
+                "clipboard" => result.push_str(clipboard_str),
+                "active_window" => result.push_str(window_str),
+                "date" => result.push_str(&date_str),
+                "datetime" => result.push_str(&datetime_str),
+                "time" => result.push_str(&time_str),
+                "language" => result.push_str(lang_str),
+                "selected_text" => result.push_str(selected_str),
+                "output" => {
+                    if include_output {
+                        result.push_str(&context.output);
+                    }
+                }
+                _ => {
+                    // Unknown placeholder, keep literal
+                    result.push_str("${");
+                    result.push_str(token_name);
+                    result.push('}');
+                }
+            }
+            remainder = &after_prefix[end_idx + 1..];
+        } else {
+            // Unclosed '${'
+            result.push_str("${");
+            remainder = after_prefix;
+            break;
+        }
+    }
+    result.push_str(remainder);
+    result
+}
+
+/// Expands all dynamic variables in the prompt template.
+pub fn expand_template(template: &str, context: &TemplateContext) -> String {
+    expand_template_single_pass(template, context, true)
 }
 
 /// Expands variables for system prompts in structured output mode,
 /// removing the `${output}` placeholder since the input is sent as user content.
 pub fn expand_template_for_system_prompt(template: &str, context: &TemplateContext) -> String {
-    let now = chrono::Local::now();
-    let date_str = context
-        .date
-        .clone()
-        .unwrap_or_else(|| now.format("%Y-%m-%d").to_string());
-    let datetime_str = now.format("%Y-%m-%d %H:%M:%S").to_string();
-    let time_str = now.format("%H:%M:%S").to_string();
-
-    let selected_str = context
-        .selected_text
-        .as_deref()
-        .unwrap_or(context.output.as_str());
-
-    let clipboard_str = context.clipboard.as_deref().unwrap_or("");
-    let window_str = context.active_window.as_deref().unwrap_or("");
-    let lang_str = context.language.as_deref().unwrap_or("");
-
-    template
-        .replace("${clipboard}", clipboard_str)
-        .replace("${active_window}", window_str)
-        .replace("${date}", &date_str)
-        .replace("${datetime}", &datetime_str)
-        .replace("${time}", &time_str)
-        .replace("${language}", lang_str)
-        .replace("${selected_text}", selected_str)
-        .replace("${output}", "")
+    expand_template_single_pass(template, context, false)
         .trim()
         .to_string()
 }
@@ -393,5 +406,25 @@ mod tests {
             result,
             "Header Date: 2026-09-02\nOutput:\nDo not replace ${date} or ${language} inside user text"
         );
+    }
+
+    #[test]
+    fn test_token_injection_in_selected_text_and_clipboard() {
+        let ctx = TemplateContext {
+            output: "Actual Audio Output".to_string(),
+            selected_text: Some("User wrote ${output} and ${clipboard} here".to_string()),
+            clipboard: Some("Clipboard has ${selected_text}".to_string()),
+            active_window: Some("Terminal".to_string()),
+            date: Some("2026-09-02".to_string()),
+            language: Some("en".to_string()),
+        };
+        let template = "Transform: ${selected_text}\nWith Clip: ${clipboard}\nFinal: ${output}";
+        let result = expand_template(template, &ctx);
+        // Ensure ${output} inside selected_text was NOT expanded to "Actual Audio Output"
+        assert!(result.contains("User wrote ${output} and ${clipboard} here"));
+        // Ensure ${selected_text} inside clipboard was NOT expanded
+        assert!(result.contains("Clipboard has ${selected_text}"));
+        // Ensure the top-level ${output} placeholder WAS expanded
+        assert!(result.contains("Final: Actual Audio Output"));
     }
 }

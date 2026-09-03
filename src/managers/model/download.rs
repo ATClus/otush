@@ -20,6 +20,39 @@ use std::sync::LazyLock;
 static CANCEL_DOWNLOAD: LazyLock<std::sync::Mutex<Option<Arc<AtomicBool>>>> =
     LazyLock::new(|| std::sync::Mutex::new(None));
 
+/// Sanitize a candidate model filename, preventing path traversal or directory escaping.
+pub fn sanitize_model_filename(candidate: &str) -> String {
+    let raw = candidate.trim();
+
+    // 1. Normalize Windows backslashes to forward slashes before path inspection
+    let normalized = raw.replace('\\', "/");
+
+    // 3. Extract only the last path component (strips / or .. prefixes)
+    let path = std::path::Path::new(&normalized);
+    let name = path
+        .file_name()
+        .and_then(|f| f.to_str())
+        .unwrap_or("model.gguf");
+
+    // 4. Remove/replace path traversal characters, control chars, and reserved characters
+    let sanitized: String = name
+        .chars()
+        .map(|c| match c {
+            '/' | '\\' | '\0' | ':' | '*' | '?' | '"' | '<' | '>' | '|' => '_',
+            c if c.is_control() => '_',
+            c => c,
+        })
+        .collect();
+
+    // 5. Ensure it doesn't resolve to "." or ".." or empty, and trim leading dots
+    let trimmed = sanitized.trim_start_matches('.');
+    if trimmed.is_empty() || trimmed == ".." {
+        "model.gguf".to_string()
+    } else {
+        trimmed.to_string()
+    }
+}
+
 /// Parse and normalize user input into a direct download URL and suggested filename.
 pub fn normalize_model_url(input: &str) -> Result<(String, String), String> {
     let raw = input.trim();
@@ -34,12 +67,12 @@ pub fn normalize_model_url(input: &str) -> Result<(String, String), String> {
         if parts.len() == 3 {
             let org = parts[0];
             let repo = parts[1];
-            let file = parts[2];
+            let file = sanitize_model_filename(parts[2]);
             let url = format!(
                 "https://huggingface.co/{}/{}/resolve/main/{}?download=true",
                 org, repo, file
             );
-            return Ok((url, file.to_string()));
+            return Ok((url, file));
         } else {
             return Err(
                 "Invalid format. Provide a full URL (https://huggingface.co/...) or 'owner/repo/model.gguf'."
@@ -60,13 +93,9 @@ pub fn normalize_model_url(input: &str) -> Result<(String, String), String> {
                 path.to_string()
             };
 
-            let filename = resolved_path
-                .split('/')
-                .next_back()
-                .unwrap_or("model.gguf")
-                .to_string();
+            let filename = resolved_path.split('/').next_back().unwrap_or("model.gguf");
 
-            let clean_filename = filename.split('?').next().unwrap_or(&filename).to_string();
+            let clean_filename = sanitize_model_filename(filename);
 
             let mut final_url = format!("https://huggingface.co{}", resolved_path);
             if !final_url.contains("download=true") {
@@ -86,10 +115,9 @@ pub fn normalize_model_url(input: &str) -> Result<(String, String), String> {
         .split('/')
         .next_back()
         .filter(|s| !s.is_empty())
-        .unwrap_or("model.gguf")
-        .to_string();
+        .unwrap_or("model.gguf");
 
-    let clean_filename = filename.split('?').next().unwrap_or(&filename).to_string();
+    let clean_filename = sanitize_model_filename(filename);
 
     Ok((raw.to_string(), clean_filename))
 }
@@ -285,5 +313,24 @@ mod tests {
             normalize_model_url("https://example.com/models/whisper-large.gguf").unwrap();
         assert_eq!(filename, "whisper-large.gguf");
         assert_eq!(url, "https://example.com/models/whisper-large.gguf");
+    }
+
+    #[test]
+    fn test_sanitize_path_traversal_attempts() {
+        assert_eq!(sanitize_model_filename("../../etc/passwd"), "passwd");
+        assert_eq!(
+            sanitize_model_filename("..\\..\\windows\\win.ini"),
+            "win.ini"
+        );
+        assert_eq!(sanitize_model_filename("...."), "model.gguf");
+        assert_eq!(sanitize_model_filename("/root/.ssh/id_rsa"), "id_rsa");
+        assert_eq!(
+            sanitize_model_filename("normal-model.bin"),
+            "normal-model.bin"
+        );
+        assert_eq!(
+            sanitize_model_filename("model:with*special?chars.gguf"),
+            "model_with_special_chars.gguf"
+        );
     }
 }

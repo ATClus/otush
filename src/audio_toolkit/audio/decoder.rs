@@ -144,10 +144,15 @@ fn decode_media_source(
                 let num_frames = audio_buf.frames();
                 decoded_frames += num_frames as u64;
 
-                let sbuf = sample_buf.get_or_insert_with(|| {
-                    SampleBuffer::<f32>::new(audio_buf.capacity() as u64, spec)
-                });
+                let need_realloc = match sample_buf {
+                    Some(ref buf) => buf.capacity() < audio_buf.capacity(),
+                    None => true,
+                };
+                if need_realloc {
+                    sample_buf = Some(SampleBuffer::<f32>::new(audio_buf.capacity() as u64, spec));
+                }
 
+                let sbuf = sample_buf.as_mut().unwrap();
                 sbuf.copy_interleaved_ref(audio_buf);
                 let interleaved = sbuf.samples();
 
@@ -323,5 +328,15 @@ mod tests {
         assert_eq!(decoded.sample_rate, 16000);
         assert!((decoded.duration_secs - 0.5).abs() < 0.05);
         assert_eq!(decoded.original_channels, 1);
+    }
+
+    #[test]
+    fn test_decode_corrupted_media_bytes_returns_error() {
+        let junk = vec![0xDE, 0xAD, 0xBE, 0xEF, 0x00, 0x11, 0x22, 0x33];
+        let res = decode_media_bytes(junk, Some("wav"), None);
+        assert!(
+            res.is_err(),
+            "Decoding random bytes should return Err cleanly, not panic"
+        );
     }
 }

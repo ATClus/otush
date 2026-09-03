@@ -26,10 +26,18 @@ impl FrameResampler {
         // Use fixed chunk size instead of GCD-based
         let chunk_in = RESAMPLER_CHUNK_SIZE;
 
-        let resampler = (in_hz != out_hz).then(|| {
-            FftFixedIn::<f32>::new(in_hz, out_hz, chunk_in, 1, 1)
-                .expect("Failed to create resampler")
-        });
+        let resampler = (in_hz != out_hz)
+            .then(|| {
+                FftFixedIn::<f32>::new(in_hz, out_hz, chunk_in, 1, 1)
+                    .map_err(|e| {
+                        log::error!(
+                            "Failed to create FFT resampler for {in_hz}Hz -> {out_hz}Hz: {e}; falling back to passthrough"
+                        );
+                        e
+                    })
+                    .ok()
+            })
+            .flatten();
 
         Self {
             resampler,
