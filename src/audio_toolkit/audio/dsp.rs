@@ -310,4 +310,60 @@ mod tests {
             audio[0]
         );
     }
+
+    #[test]
+    fn test_noise_gate_attenuates_low_noise_and_passes_speech() {
+        let mut gate = NoiseGate::new(-40.0, -20.0, 16000.0);
+        // Low noise signal (~ -60 dBFS)
+        let mut low_noise = vec![0.001f32; 1600];
+        gate.process_in_place(&mut low_noise);
+        let final_sample = low_noise.last().copied().unwrap_or(0.0);
+        assert!(
+            final_sample < 0.001,
+            "Noise gate should attenuate noise below threshold, got {final_sample}"
+        );
+
+        // Loud signal (~ -6 dBFS)
+        let mut loud_speech = vec![0.5f32; 1600];
+        gate.process_in_place(&mut loud_speech);
+        let final_speech = loud_speech.last().copied().unwrap_or(0.0);
+        assert!(
+            (final_speech - 0.5).abs() < 0.05,
+            "Noise gate should pass speech above threshold, got {final_speech}"
+        );
+    }
+
+    #[test]
+    fn test_voice_enhancer_limiter_handles_extreme_peaks() {
+        let mut extreme = vec![10.0f32, -10.0, 5.0, -5.0, 2.0, -2.0];
+        let config = VoiceEnhancerConfig {
+            input_gain: 2.0,
+            high_pass_filter: false,
+            noise_reduction: false,
+            noise_gate_threshold_db: -45.0,
+            normalization: true,
+        };
+        VoiceEnhancer::process_with_config(&mut extreme, &config);
+        for &s in &extreme {
+            assert!(!s.is_nan());
+            assert!(!s.is_infinite());
+            assert!(
+                s.abs() <= 1.0,
+                "Soft-knee limiter must clamp extreme peaks to <= 1.0, got {s}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_high_pass_filter_reset() {
+        let mut hp = HighPassFilter::new_80hz_16khz();
+        let mut dc = vec![1.0f32; 800];
+        hp.process_in_place(&mut dc);
+        assert!(hp.x1 != 0.0 || hp.y1 != 0.0);
+        hp.reset();
+        assert_eq!(hp.x1, 0.0);
+        assert_eq!(hp.x2, 0.0);
+        assert_eq!(hp.y1, 0.0);
+        assert_eq!(hp.y2, 0.0);
+    }
 }

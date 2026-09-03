@@ -160,3 +160,64 @@ impl AudioVisualiser {
         self.noise_floor.fill(-40.0);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::f32::consts::PI;
+
+    fn generate_sine(
+        sample_rate: u32,
+        freq_hz: f32,
+        duration_samples: usize,
+        amplitude: f32,
+    ) -> Vec<f32> {
+        (0..duration_samples)
+            .map(|i| amplitude * (2.0 * PI * freq_hz * i as f32 / sample_rate as f32).sin())
+            .collect()
+    }
+
+    #[test]
+    fn test_visualizer_creation_and_partial_feed() {
+        let mut vis = AudioVisualiser::new(16000, 512, 16, 80.0, 8000.0);
+        let partial_samples = vec![0.0f32; 256];
+        assert!(vis.feed(&partial_samples).is_none());
+    }
+
+    #[test]
+    fn test_visualizer_silence_feed() {
+        let mut vis = AudioVisualiser::new(16000, 512, 16, 80.0, 8000.0);
+        let silence = vec![0.0f32; 512];
+        let buckets = vis.feed(&silence).expect("full window produces buckets");
+        assert_eq!(buckets.len(), 16);
+        for &b in &buckets {
+            assert!(b >= 0.0 && b <= 1.0);
+            assert!(b < 0.1, "Silence should produce near-zero levels, got {b}");
+        }
+    }
+
+    #[test]
+    fn test_visualizer_sine_wave_activation() {
+        let mut vis = AudioVisualiser::new(16000, 512, 16, 80.0, 8000.0);
+        let tone = generate_sine(16000, 1000.0, 512, 0.8);
+        let buckets = vis.feed(&tone).expect("full window produces buckets");
+        assert_eq!(buckets.len(), 16);
+        let max_val = buckets.iter().copied().fold(0.0f32, f32::max);
+        assert!(
+            max_val > 0.3,
+            "Loud tone must produce elevated visualizer response, got {max_val}"
+        );
+    }
+
+    #[test]
+    fn test_visualizer_reset() {
+        let mut vis = AudioVisualiser::new(16000, 512, 16, 80.0, 8000.0);
+        vis.feed(&[0.5f32; 256]);
+        assert_eq!(vis.buffer.len(), 256);
+        vis.reset();
+        assert_eq!(vis.buffer.len(), 0);
+        for &floor in &vis.noise_floor {
+            assert_eq!(floor, -40.0);
+        }
+    }
+}
