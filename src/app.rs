@@ -47,10 +47,10 @@ fn apply_theme(theme: crate::settings::Theme) {
 
 /// Wire backend events to shell-level UI effects (toasts, theme).
 fn subscribe_bus(ctx: &AppContext, toasts: &libadwaita::ToastOverlay) {
+    let ctx_owned = ctx.clone();
     let toasts = glib::SendWeakRef::from(toasts.downgrade());
     ctx.bus.subscribe(move |event| {
-        // Marshal onto the GTK main loop (GTK objects are not Send, so the
-        // closure carries a sendable weak ref to the toast overlay).
+        let ctx = ctx_owned.clone();
         let toasts = toasts.clone();
         glib::MainContext::default().invoke(move || {
             let weak = toasts.into_weak_ref();
@@ -79,6 +79,15 @@ fn subscribe_bus(ctx: &AppContext, toasts: &libadwaita::ToastOverlay) {
                         _ => format!("Recording failed: {}", e.detail.unwrap_or_default()),
                     };
                     toasts.add_toast(libadwaita::Toast::new(&message));
+                }
+                AppEvent::TextCopiedToClipboard { message } => {
+                    let toast = libadwaita::Toast::new(&message);
+                    toast.set_button_label(Some("Open History"));
+                    let toast_ctx = ctx.clone();
+                    toast.connect_button_clicked(move |_| {
+                        crate::ui::history_palette::show_history_palette(&toast_ctx);
+                    });
+                    toasts.add_toast(toast);
                 }
                 AppEvent::ThemeChanged(theme) => apply_theme(theme),
                 _ => {}
@@ -149,6 +158,7 @@ pub fn run_gtk(ctx: AppContext, cli_args: &CliArgs) {
                     || a == "--toggle-post-process"
                     || a == "--toggle-meeting"
                     || a == "--transform-selection"
+                    || a == "--toggle-history"
                     || a == "--cancel"
             });
 
@@ -176,6 +186,10 @@ pub fn run_gtk(ctx: AppContext, cli_args: &CliArgs) {
             }
             if args.iter().any(|a| a == "--transform-selection") {
                 crate::ui::prompt_palette::show_prompt_palette(ctx);
+                handled = true;
+            }
+            if args.iter().any(|a| a == "--toggle-history") {
+                crate::ui::history_palette::toggle_history_palette(ctx);
                 handled = true;
             }
             if args.iter().any(|a| a == "--cancel") {

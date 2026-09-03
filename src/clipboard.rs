@@ -89,14 +89,8 @@ fn try_send_copy_linux() -> Result<bool, String> {
                 return Ok(true);
             }
         }
-        if is_dotool_available() {
-            let status = Command::new("sh")
-                .arg("-c")
-                .arg("echo key ctrl+c | dotool")
-                .status();
-            if status.map(|s| s.success()).unwrap_or(false) {
-                return Ok(true);
-            }
+        if is_dotool_available() && dotool_send_key("ctrl+c").unwrap_or(false) {
+            return Ok(true);
         }
         if is_ydotool_available() {
             let status = Command::new("ydotool")
@@ -173,6 +167,73 @@ pub fn capture_selected_text() -> Result<String, String> {
 /// Write text to the system clipboard (used by the tray "copy last transcript").
 pub fn write_clipboard_text(ctx: &AppContext, text: &str) -> Result<(), String> {
     write_text_to_clipboard(ctx, text)
+}
+
+/// Check whether a valid external application window is focused and available to receive paste keystrokes.
+/// Returns `false` if detection confirms the desktop background, GNOME overview, or no focused window.
+/// Returns `true` if an application window is detected, or if compositor detection is not supported.
+pub fn is_paste_target_available() -> bool {
+    // 1. Check GNOME Activities overview if running GNOME
+    if std::env::var("XDG_CURRENT_DESKTOP")
+        .map(|d| d.to_lowercase().contains("gnome"))
+        .unwrap_or(false)
+    {
+        if let Ok(output) = std::process::Command::new("gdbus")
+            .args([
+                "call",
+                "--session",
+                "--dest",
+                "org.gnome.Shell",
+                "--object-path",
+                "/org/gnome/Shell",
+                "--method",
+                "org.freedesktop.DBus.Properties.Get",
+                "org.gnome.Shell",
+                "OverviewActive",
+            ])
+            .output()
+        {
+            if output.status.success() {
+                let out = String::from_utf8_lossy(&output.stdout);
+                if out.contains("<true>") {
+                    log::debug!("GNOME Shell overview is active; no application focused");
+                    return false;
+                }
+            }
+        }
+    }
+
+    // 2. Check active window title if compositor detection is available
+    if let Some(active_win) = crate::template::get_active_window_title() {
+        let win_lower = active_win.trim().to_lowercase();
+        if win_lower.is_empty()
+            || win_lower == "desktop"
+            || win_lower == "desktop icons"
+            || win_lower == "desktop-icons"
+            || win_lower == "gnome-shell"
+            || win_lower == "root"
+            || win_lower == "plasma"
+        {
+            log::debug!(
+                "Active window '{active_win}' is a desktop/shell surface, not a paste target"
+            );
+            return false;
+        }
+        return true;
+    }
+
+    // On Hyprland / Sway / i3 where detection is supported, if get_active_window_title() returned None,
+    // that means no focused window was found.
+    if std::env::var("HYPRLAND_INSTANCE_SIGNATURE").is_ok()
+        || std::env::var("SWAYSOCK").is_ok()
+        || std::env::var("I3SOCK").is_ok()
+    {
+        log::debug!("Compositor tree has no focused window node");
+        return false;
+    }
+
+    // Default to true when compositor does not expose window tree (e.g. standard GNOME Wayland)
+    true
 }
 
 fn finish_clipboard_paste(
@@ -730,27 +791,43 @@ fn send_key_combo_via_wtype(paste_method: &PasteMethod) -> Result<(), String> {
     Ok(())
 }
 
-/// Send a key combination (e.g., Ctrl+V) via dotool.
-fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
-    let command = match paste_method {
-        PasteMethod::CtrlV => "echo key ctrl+v | dotool",
-        PasteMethod::ShiftInsert => "echo key shift+insert | dotool",
-        PasteMethod::CtrlShiftV => "echo key ctrl+shift+v | dotool",
-        _ => return Err("Unsupported paste method".into()),
-    };
+/// Send a key combination command directly to dotool via stdin.
+fn dotool_send_key(combo: &str) -> Result<bool, String> {
+    use std::io::Write;
     use std::process::Stdio;
-    let status = Command::new("sh")
-        .arg("-c")
-        .arg(command)
+
+    let mut child = Command::new("dotool")
+        .stdin(Stdio::piped())
         .stdout(Stdio::null())
         .stderr(Stdio::null())
-        .status()
-        .map_err(|e| format!("Failed to execute dotool: {}", e))?;
-    if !status.success() {
-        return Err("dotool failed".into());
+        .spawn()
+        .map_err(|e| format!("Failed to spawn dotool: {}", e))?;
+
+    if let Some(mut stdin) = child.stdin.take() {
+        let _ = writeln!(stdin, "key {}", combo);
     }
 
-    Ok(())
+    let status = child
+        .wait()
+        .map_err(|e| format!("Failed to wait for dotool: {}", e))?;
+
+    Ok(status.success())
+}
+
+/// Send a key combination (e.g., Ctrl+V) via dotool.
+fn send_key_combo_via_dotool(paste_method: &PasteMethod) -> Result<(), String> {
+    let combo = match paste_method {
+        PasteMethod::CtrlV => "ctrl+v",
+        PasteMethod::ShiftInsert => "shift+insert",
+        PasteMethod::CtrlShiftV => "ctrl+shift+v",
+        _ => return Err("Unsupported paste method".into()),
+    };
+
+    if dotool_send_key(combo)? {
+        Ok(())
+    } else {
+        Err("dotool failed".into())
+    }
 }
 
 fn ydotool_key_args(

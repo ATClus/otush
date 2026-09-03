@@ -58,10 +58,16 @@ pub async fn transcribe_media_file(
     .map_err(|e| format!("Decoding task panicked: {}", e))?
     .map_err(|e| format!("Failed to decode media file: {}", e))?;
 
-    // 2. Transcribe samples
+    // 2. Save audio WAV copy to recordings_dir first so samples can be moved without cloning
+    let safe_base = file_name.replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '_', "_");
+    let target_recording_name = format!("{}_{}.wav", chrono::Utc::now().timestamp(), safe_base);
+    let target_wav_path = ctx.history.get_audio_file_path(&target_recording_name);
+    let _ = crate::audio_toolkit::save_wav_file(&target_wav_path, &decoded.samples);
+
+    // 3. Transcribe samples (zero-copy ownership transfer of decoded.samples)
     let tm = ctx.transcription.clone();
     let title = file_name.clone();
-    let samples = decoded.samples.clone();
+    let samples = decoded.samples;
     let cb_stt = progress_callback.clone();
 
     let mut doc =
@@ -77,7 +83,7 @@ pub async fn transcribe_media_file(
         .collect::<Vec<_>>()
         .join(" ");
 
-    // 3. Optional LLM Post-Processing
+    // 4. Optional LLM Post-Processing
     let settings = ctx.settings();
     let mut post_processed_text: Option<String> = None;
     let mut used_prompt_title: Option<String> = None;
@@ -101,18 +107,14 @@ pub async fn transcribe_media_file(
         }
     }
 
-    // 4. Save to history (write a copy of WAV file into recordings_dir so it can be replayed)
-    let safe_base = file_name.replace(|c: char| !c.is_alphanumeric() && c != '.' && c != '_', "_");
-    let target_recording_name = format!("{}_{}.wav", chrono::Utc::now().timestamp(), safe_base);
-    let target_wav_path = ctx.history.get_audio_file_path(&target_recording_name);
-    let _ = crate::audio_toolkit::save_wav_file(&target_wav_path, &decoded.samples);
-
+    // 5. Save transcription entry to history
     let _ = ctx.history.save_entry(
         target_recording_name,
         full_text,
         post_processed_text.is_some(),
         post_processed_text,
         used_prompt_title,
+        Some("file"),
     );
 
     Ok(doc)

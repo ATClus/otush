@@ -960,6 +960,14 @@ impl ShortcutAction for TranscribeAction {
                             }
 
                             // Save to history if WAV was saved
+                            let entry_kind = if is_meeting {
+                                "meeting"
+                            } else if post_process {
+                                "post_process"
+                            } else {
+                                "transcription"
+                            };
+
                             if wav_saved {
                                 if let Err(err) = hm.save_entry(
                                     file_name,
@@ -967,6 +975,7 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     processed.post_processed_text.clone(),
                                     processed.post_process_prompt.clone(),
+                                    Some(entry_kind),
                                 ) {
                                     error!("Failed to save history entry: {}", err);
                                 }
@@ -983,19 +992,39 @@ impl ShortcutAction for TranscribeAction {
                                     utils::hide_recording_overlay(&ah);
                                     set_tray_state(&ah, TrayIconState::Idle);
                                 } else {
-                                    // Hide the overlay before injecting the
-                                    // paste chord so the target app holds
-                                    // keyboard focus (an overlay that stole
-                                    // focus would swallow Ctrl+V).
                                     utils::hide_recording_overlay(&ah);
-                                    match utils::paste(&ah, final_text) {
-                                        Ok(()) => debug!(
-                                            "Text pasted successfully in {:?}",
-                                            paste_time.elapsed()
-                                        ),
-                                        Err(e) => {
-                                            error!("Failed to paste transcription: {}", e);
-                                            ah.bus.send(AppEvent::PasteError);
+                                    let paste_target_available =
+                                        crate::clipboard::is_paste_target_available();
+                                    if !paste_target_available {
+                                        debug!("No focused application found for paste; leaving text in clipboard");
+                                        if let Err(e) =
+                                            crate::clipboard::write_clipboard_text(&ah, &final_text)
+                                        {
+                                            error!("Failed to write text to clipboard: {}", e);
+                                        }
+                                        ah.bus.send(AppEvent::TextCopiedToClipboard {
+                                            message:
+                                                "No application in focus — text copied to clipboard"
+                                                    .to_string(),
+                                        });
+                                    } else {
+                                        match utils::paste(&ah, final_text.clone()) {
+                                            Ok(()) => debug!(
+                                                "Text pasted successfully in {:?}",
+                                                paste_time.elapsed()
+                                            ),
+                                            Err(e) => {
+                                                error!("Failed to paste transcription: {}", e);
+                                                let _ = crate::clipboard::write_clipboard_text(
+                                                    &ah,
+                                                    &final_text,
+                                                );
+                                                ah.bus.send(AppEvent::TextCopiedToClipboard {
+                                                    message:
+                                                        "Paste failed — text saved to clipboard"
+                                                            .to_string(),
+                                                });
+                                            }
                                         }
                                     }
                                     utils::hide_recording_overlay(&ah);
@@ -1018,6 +1047,13 @@ impl ShortcutAction for TranscribeAction {
                             // message is also in otush.log via the line above.
                             ah.bus.send(AppEvent::TranscriptionError(err));
                             // Save entry with empty text so user can retry
+                            let entry_kind = if is_meeting {
+                                "meeting"
+                            } else if post_process {
+                                "post_process"
+                            } else {
+                                "transcription"
+                            };
                             if wav_saved {
                                 if let Err(save_err) = hm.save_entry(
                                     file_name,
@@ -1025,6 +1061,7 @@ impl ShortcutAction for TranscribeAction {
                                     post_process,
                                     None,
                                     None,
+                                    Some(entry_kind),
                                 ) {
                                     error!("Failed to save failed history entry: {}", save_err);
                                 }
@@ -1096,6 +1133,18 @@ impl ShortcutAction for TransformSelectionAction {
     fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
 }
 
+#[derive(Debug)]
+pub struct ShowHistoryAction;
+
+impl ShortcutAction for ShowHistoryAction {
+    fn start(&self, ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {
+        log::info!("ShowHistoryAction triggered");
+        crate::ui::history_palette::toggle_history_palette(ctx);
+    }
+
+    fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
+}
+
 // Static Action Map
 pub static ACTION_MAP: LazyLock<HashMap<String, Arc<dyn ShortcutAction>>> = LazyLock::new(|| {
     let mut map = HashMap::new();
@@ -1120,6 +1169,10 @@ pub static ACTION_MAP: LazyLock<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy
     map.insert(
         "transform_selection".to_string(),
         Arc::new(TransformSelectionAction) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "show_history".to_string(),
+        Arc::new(ShowHistoryAction) as Arc<dyn ShortcutAction>,
     );
     map.insert(
         "cancel".to_string(),

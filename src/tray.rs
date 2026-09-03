@@ -363,6 +363,21 @@ fn build_menu(ctx: &AppContext, icon_state: TrayIconState) -> Vec<ksni::MenuItem
         .into(),
     );
 
+    // History
+    items.push(
+        StandardItem {
+            label: "History…".to_string(),
+            activate: Box::new({
+                let ctx = ctx.clone();
+                move |_| {
+                    crate::ui::history_palette::show_history_palette(&ctx);
+                }
+            }),
+            ..Default::default()
+        }
+        .into(),
+    );
+
     // Transcribe Media File
     items.push(
         StandardItem {

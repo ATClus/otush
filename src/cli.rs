@@ -28,6 +28,10 @@ pub struct CliArgs {
     #[arg(long)]
     pub transform_selection: bool,
 
+    /// Toggle quick-access history overlay on/off (sent to running instance)
+    #[arg(long)]
+    pub toggle_history: bool,
+
     /// Cancel the current operation (sent to running instance)
     #[arg(long)]
     pub cancel: bool,

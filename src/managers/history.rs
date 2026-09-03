@@ -29,7 +29,14 @@ static MIGRATIONS: &[M] = &[
     M::up("ALTER TABLE transcription_history ADD COLUMN post_processed_text TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_prompt TEXT;"),
     M::up("ALTER TABLE transcription_history ADD COLUMN post_process_requested BOOLEAN NOT NULL DEFAULT 0;"),
+    M::up("CREATE INDEX IF NOT EXISTS idx_history_saved_timestamp ON transcription_history (saved, timestamp DESC);"),
+    M::up("ALTER TABLE transcription_history ADD COLUMN entry_kind TEXT NOT NULL DEFAULT 'transcription';"),
+    M::up("UPDATE transcription_history SET entry_kind = 'post_process' WHERE post_process_requested = 1;"),
 ];
+
+fn default_entry_kind() -> String {
+    "transcription".to_string()
+}
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PaginatedHistory {
@@ -61,6 +68,8 @@ pub struct HistoryEntry {
     pub post_processed_text: Option<String>,
     pub post_process_prompt: Option<String>,
     pub post_process_requested: bool,
+    #[serde(default = "default_entry_kind")]
+    pub entry_kind: String,
 }
 
 pub struct HistoryManager {
@@ -196,6 +205,9 @@ impl HistoryManager {
     }
 
     fn map_history_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
+        let entry_kind: String = row
+            .get("entry_kind")
+            .unwrap_or_else(|_| "transcription".to_string());
         Ok(HistoryEntry {
             id: row.get("id")?,
             file_name: row.get("file_name")?,
@@ -206,6 +218,7 @@ impl HistoryManager {
             post_processed_text: row.get("post_processed_text")?,
             post_process_prompt: row.get("post_process_prompt")?,
             post_process_requested: row.get("post_process_requested")?,
+            entry_kind,
         })
     }
 
@@ -222,9 +235,15 @@ impl HistoryManager {
         post_process_requested: bool,
         post_processed_text: Option<String>,
         post_process_prompt: Option<String>,
+        entry_kind: Option<&str>,
     ) -> Result<HistoryEntry> {
         let timestamp = Utc::now().timestamp();
         let title = self.format_timestamp_title(timestamp);
+        let entry_kind_str = entry_kind.unwrap_or(if post_process_requested {
+            "post_process"
+        } else {
+            "transcription"
+        });
 
         let conn = self.get_connection()?;
         conn.execute(
@@ -236,8 +255,9 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                post_process_requested,
+                entry_kind
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 &file_name,
                 timestamp,
@@ -247,6 +267,7 @@ impl HistoryManager {
                 &post_processed_text,
                 &post_process_prompt,
                 post_process_requested,
+                entry_kind_str,
             ],
         )?;
 
@@ -260,6 +281,7 @@ impl HistoryManager {
             post_processed_text,
             post_process_prompt,
             post_process_requested,
+            entry_kind: entry_kind_str.to_string(),
         };
 
         debug!("Saved history entry with id {}", entry.id);
@@ -304,7 +326,7 @@ impl HistoryManager {
 
         let entry = conn
             .query_row(
-                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, entry_kind
                  FROM transcription_history WHERE id = ?1",
                 params![id],
                 Self::map_history_entry,
@@ -348,17 +370,20 @@ impl HistoryManager {
             return Ok(0);
         }
 
-        let conn = self.get_connection()?;
+        let mut conn = self.get_connection()?;
+        let tx = conn.transaction()?;
         let mut deleted_count = 0;
 
-        for (id, file_name) in entries {
-            // Delete database entry
-            conn.execute(
-                "DELETE FROM transcription_history WHERE id = ?1",
-                params![id],
-            )?;
+        {
+            let mut stmt = tx.prepare_cached("DELETE FROM transcription_history WHERE id = ?1")?;
+            for (id, _) in entries {
+                stmt.execute(params![id])?;
+            }
+        }
 
-            // Delete WAV file
+        tx.commit()?;
+
+        for (_, file_name) in entries {
             let file_path = self.recordings_dir.join(file_name);
             if file_path.exists() {
                 if let Err(e) = fs::remove_file(&file_path) {
@@ -376,24 +401,22 @@ impl HistoryManager {
     fn cleanup_by_count(&self, limit: usize) -> Result<()> {
         let conn = self.get_connection()?;
 
-        // Get all entries that are not saved, ordered by timestamp desc
-        let mut stmt = conn.prepare(
-            "SELECT id, file_name FROM transcription_history WHERE saved = 0 ORDER BY timestamp DESC"
+        // Query only unsaved entries exceeding the retention limit using OFFSET
+        let mut stmt = conn.prepare_cached(
+            "SELECT id, file_name FROM transcription_history WHERE saved = 0 ORDER BY timestamp DESC LIMIT -1 OFFSET ?1"
         )?;
 
-        let rows = stmt.query_map([], |row| {
+        let rows = stmt.query_map(params![limit as i64], |row| {
             Ok((row.get::<_, i64>("id")?, row.get::<_, String>("file_name")?))
         })?;
 
-        let mut entries: Vec<(i64, String)> = Vec::new();
+        let mut entries_to_delete: Vec<(i64, String)> = Vec::new();
         for row in rows {
-            entries.push(row?);
+            entries_to_delete.push(row?);
         }
 
-        if entries.len() > limit {
-            let entries_to_delete = &entries[limit..];
-            let deleted_count = self.delete_entries_and_files(entries_to_delete)?;
-
+        if !entries_to_delete.is_empty() {
+            let deleted_count = self.delete_entries_and_files(&entries_to_delete)?;
             if deleted_count > 0 {
                 debug!("Cleaned up {} old history entries by count", deleted_count);
             }
@@ -455,7 +478,7 @@ impl HistoryManager {
             (Some(cursor_id), Some(lim)) => {
                 let fetch_count = (lim + 1) as i64;
                 let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, entry_kind
                      FROM transcription_history
                      WHERE id < ?1
                      ORDER BY id DESC
@@ -469,7 +492,7 @@ impl HistoryManager {
             (None, Some(lim)) => {
                 let fetch_count = (lim + 1) as i64;
                 let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, entry_kind
                      FROM transcription_history
                      ORDER BY id DESC
                      LIMIT ?1",
@@ -481,7 +504,7 @@ impl HistoryManager {
             }
             (_, None) => {
                 let mut stmt = conn.prepare(
-                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested
+                    "SELECT id, file_name, timestamp, saved, title, transcription_text, post_processed_text, post_process_prompt, post_process_requested, entry_kind
                      FROM transcription_history
                      ORDER BY id DESC",
                 )?;
@@ -512,7 +535,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                entry_kind
              FROM transcription_history
              ORDER BY timestamp DESC
              LIMIT 1",
@@ -539,7 +563,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                entry_kind
              FROM transcription_history
              WHERE transcription_text != ''
              ORDER BY timestamp DESC
@@ -594,7 +619,8 @@ impl HistoryManager {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
+                post_process_requested,
+                entry_kind
              FROM transcription_history
              WHERE id = ?1",
         )?;
@@ -664,7 +690,8 @@ mod tests {
                 transcription_text TEXT NOT NULL,
                 post_processed_text TEXT,
                 post_process_prompt TEXT,
-                post_process_requested BOOLEAN NOT NULL DEFAULT 0
+                post_process_requested BOOLEAN NOT NULL DEFAULT 0,
+                entry_kind TEXT NOT NULL DEFAULT 'transcription'
             );",
         )
         .expect("create transcription_history table");
@@ -672,6 +699,16 @@ mod tests {
     }
 
     fn insert_entry(conn: &Connection, timestamp: i64, text: &str, post_processed: Option<&str>) {
+        insert_entry_with_kind(conn, timestamp, text, post_processed, "transcription");
+    }
+
+    fn insert_entry_with_kind(
+        conn: &Connection,
+        timestamp: i64,
+        text: &str,
+        post_processed: Option<&str>,
+        kind: &str,
+    ) {
         conn.execute(
             "INSERT INTO transcription_history (
                 file_name,
@@ -681,8 +718,9 @@ mod tests {
                 transcription_text,
                 post_processed_text,
                 post_process_prompt,
-                post_process_requested
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+                post_process_requested,
+                entry_kind
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
             params![
                 format!("Otush-{}.wav", timestamp),
                 timestamp,
@@ -692,6 +730,7 @@ mod tests {
                 post_processed,
                 Option::<String>::None,
                 false,
+                kind,
             ],
         )
         .expect("insert history entry");
@@ -708,7 +747,7 @@ mod tests {
     fn get_latest_entry_returns_newest_entry() {
         let conn = setup_conn();
         insert_entry(&conn, 100, "first", None);
-        insert_entry(&conn, 200, "second", Some("processed"));
+        insert_entry_with_kind(&conn, 200, "second", Some("processed"), "post_process");
 
         let entry = HistoryManager::get_latest_entry_with_conn(&conn)
             .expect("fetch latest entry")
@@ -717,6 +756,7 @@ mod tests {
         assert_eq!(entry.timestamp, 200);
         assert_eq!(entry.transcription_text, "second");
         assert_eq!(entry.post_processed_text.as_deref(), Some("processed"));
+        assert_eq!(entry.entry_kind, "post_process");
     }
 
     #[test]
@@ -731,5 +771,6 @@ mod tests {
 
         assert_eq!(entry.timestamp, 100);
         assert_eq!(entry.transcription_text, "completed");
+        assert_eq!(entry.entry_kind, "transcription");
     }
 }

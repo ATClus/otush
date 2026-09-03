@@ -119,6 +119,9 @@ pub enum AppEvent {
     HideOverlay,
     // --- clipboard / paste ---
     PasteError,
+    TextCopiedToClipboard {
+        message: String,
+    },
     // --- history ---
     HistoryUpdated(HistoryUpdatePayload),
     // --- debug ---
@@ -136,7 +139,7 @@ pub type EventBusSubscriber = Arc<dyn Fn(AppEvent) + Send + Sync>;
 /// all live subscribers from any thread.
 #[derive(Clone, Default)]
 pub struct EventBus {
-    subscribers: Arc<Mutex<Vec<EventBusSubscriber>>>,
+    subscribers: Arc<Mutex<Arc<[EventBusSubscriber]>>>,
 }
 
 impl EventBus {
@@ -148,18 +151,18 @@ impl EventBus {
     /// the callback should marshal to the UI thread (e.g. with
     /// `glib::MainContext::default().invoke(...)`).
     pub fn subscribe(&self, callback: impl Fn(AppEvent) + Send + Sync + 'static) {
-        self.subscribers.lock().unwrap().push(Arc::new(callback));
+        let mut guard = self.subscribers.lock().unwrap();
+        let mut list: Vec<EventBusSubscriber> = (**guard).to_vec();
+        list.push(Arc::new(callback));
+        *guard = list.into();
     }
 
-    /// Fan out to all subscribers.
+    /// Fan out to all subscribers without allocating a vector on send.
     pub fn send(&self, event: AppEvent) {
-        let subscribers = {
-            let guard = self.subscribers.lock().unwrap();
-            if guard.is_empty() {
-                return;
-            }
-            guard.clone()
-        };
+        let subscribers = Arc::clone(&*self.subscribers.lock().unwrap());
+        if subscribers.is_empty() {
+            return;
+        }
 
         let count = subscribers.len();
         for (i, callback) in subscribers.iter().enumerate() {

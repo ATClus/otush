@@ -1,5 +1,5 @@
 use crate::context::AppContext;
-use log::{debug, warn};
+use log::{debug, info, warn};
 use serde::de::{self, Visitor};
 use serde::{Deserialize, Deserializer, Serialize};
 use std::collections::HashMap;
@@ -122,7 +122,7 @@ fn default_provider_enabled() -> bool {
 }
 
 fn default_provider_timeout() -> u32 {
-    10
+    120
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq)]
@@ -762,7 +762,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
         PostProcessProvider {
             id: "anthropic".to_string(),
@@ -774,7 +774,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
         PostProcessProvider {
             id: "gemini".to_string(),
@@ -786,7 +786,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
         PostProcessProvider {
             id: "groq".to_string(),
@@ -798,7 +798,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
         PostProcessProvider {
             id: "deepseek".to_string(),
@@ -810,7 +810,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
         PostProcessProvider {
             id: "mistral".to_string(),
@@ -822,7 +822,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
         PostProcessProvider {
             id: "openrouter".to_string(),
@@ -834,7 +834,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
         PostProcessProvider {
             id: "zai".to_string(),
@@ -846,7 +846,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
         PostProcessProvider {
             id: "cerebras".to_string(),
@@ -858,7 +858,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
         PostProcessProvider {
             id: "ollama".to_string(),
@@ -870,7 +870,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             reasoning: ProviderReasoningConfig::default(),
             enabled: true,
             custom_headers: HashMap::new(),
-            timeout_seconds: 60,
+            timeout_seconds: 120,
         },
     ];
 
@@ -885,7 +885,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         reasoning: ProviderReasoningConfig::default(),
         enabled: true,
         custom_headers: HashMap::new(),
-        timeout_seconds: 60,
+        timeout_seconds: 120,
     });
 
     // Custom provider always comes last
@@ -899,7 +899,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         reasoning: ProviderReasoningConfig::default(),
         enabled: true,
         custom_headers: HashMap::new(),
-        timeout_seconds: 60,
+        timeout_seconds: 120,
     });
 
     providers
@@ -1121,6 +1121,18 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
         }
     }
 
+    // Automatically upgrade legacy or too-low timeouts (< 60s) to default 120s
+    for p in &mut settings.post_process_providers {
+        if p.timeout_seconds < 60 {
+            info!(
+                "Upgrading timeout_seconds for provider '{}' from {}s to 120s",
+                p.id, p.timeout_seconds
+            );
+            p.timeout_seconds = 120;
+            changed = true;
+        }
+    }
+
     changed
 }
 
@@ -1231,6 +1243,18 @@ pub fn get_default_settings() -> AppSettings {
                 .to_string(),
             default_binding: default_meeting_shortcut.to_string(),
             current_binding: default_meeting_shortcut.to_string(),
+        },
+    );
+
+    let default_history_shortcut = "ctrl+alt+h";
+    bindings.insert(
+        "show_history".to_string(),
+        ShortcutBinding {
+            id: "show_history".to_string(),
+            name: "Transcription History".to_string(),
+            description: "Opens the quick-access history overlay.".to_string(),
+            default_binding: default_history_shortcut.to_string(),
+            current_binding: default_history_shortcut.to_string(),
         },
     );
 
@@ -1400,11 +1424,31 @@ fn read_store_at(path: &std::path::Path) -> serde_json::Value {
 fn write_store_at(path: &std::path::Path, store: &serde_json::Value) {
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(metadata) = std::fs::metadata(parent) {
+                let mut perms = metadata.permissions();
+                if perms.mode() & 0o777 != 0o700 {
+                    perms.set_mode(0o700);
+                    let _ = std::fs::set_permissions(parent, perms);
+                }
+            }
+        }
     }
     let tmp = path.with_extension("json.tmp");
     match serde_json::to_string_pretty(store) {
         Ok(contents) => {
             if std::fs::write(&tmp, contents).is_ok() {
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(metadata) = std::fs::metadata(&tmp) {
+                        let mut perms = metadata.permissions();
+                        perms.set_mode(0o600);
+                        let _ = std::fs::set_permissions(&tmp, perms);
+                    }
+                }
                 let _ = std::fs::rename(&tmp, path);
             } else {
                 warn!("Failed to write settings store to {}", tmp.display());
@@ -1621,9 +1665,24 @@ pub fn get_bindings(ctx: &AppContext) -> HashMap<String, ShortcutBinding> {
 pub fn get_stored_binding(ctx: &AppContext, id: &str) -> ShortcutBinding {
     let bindings = get_bindings(ctx);
 
-    let binding = bindings.get(id).unwrap().clone();
-
-    binding
+    if let Some(binding) = bindings.get(id) {
+        binding.clone()
+    } else if let Some(default_binding) = get_default_settings().bindings.get(id) {
+        warn!("Binding '{}' missing from settings, using default", id);
+        default_binding.clone()
+    } else {
+        warn!(
+            "Unknown binding '{}' requested; returning empty fallback",
+            id
+        );
+        ShortcutBinding {
+            id: id.to_string(),
+            name: id.to_string(),
+            description: String::new(),
+            default_binding: String::new(),
+            current_binding: String::new(),
+        }
+    }
 }
 
 #[cfg(test)]
@@ -1644,9 +1703,14 @@ mod tests {
         assert!(defaults.bindings.contains_key("transcribe_meeting"));
         assert!(defaults.bindings.contains_key("cancel"));
         assert!(defaults.bindings.contains_key("transform_selection"));
+        assert!(defaults.bindings.contains_key("show_history"));
         assert_eq!(
             defaults.bindings["transcribe_meeting"].current_binding,
             "ctrl+alt+m"
+        );
+        assert_eq!(
+            defaults.bindings["show_history"].current_binding,
+            "ctrl+alt+h"
         );
     }
 
@@ -2049,5 +2113,33 @@ mod tests {
         let out = format!("{:?}", map);
         assert!(!out.contains("secret"));
         assert!(out.contains("[REDACTED]"));
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn write_store_at_sets_0600_permissions_on_unix() {
+        use std::os::unix::fs::PermissionsExt;
+        let temp_dir = tempfile::tempdir().expect("create temp dir");
+        let store_path = temp_dir.path().join("sub").join("settings_store.json");
+        let store_val = serde_json::json!({ "test": "val" });
+
+        write_store_at(&store_path, &store_val);
+
+        assert!(store_path.exists());
+        let meta = std::fs::metadata(&store_path).expect("read metadata");
+        let mode = meta.permissions().mode() & 0o777;
+        assert_eq!(
+            mode, 0o600,
+            "Settings store file must have 0600 permissions, got {:o}",
+            mode
+        );
+
+        let parent_meta = std::fs::metadata(store_path.parent().unwrap()).expect("parent metadata");
+        let parent_mode = parent_meta.permissions().mode() & 0o777;
+        assert_eq!(
+            parent_mode, 0o700,
+            "Settings store parent dir must have 0700 permissions, got {:o}",
+            parent_mode
+        );
     }
 }

@@ -1,66 +1,77 @@
-//! History settings page: recent transcriptions with saved/delete/retry
-//! actions, refreshed through the event bus.
+//! History settings page: global application history covering standard
+//! voice transcriptions, meeting minutes, AI prompt processings, and file transcriptions.
 
 use crate::commands::history as history_cmds;
 use crate::context::{AppContext, AppEvent};
+use crate::managers::history::HistoryEntry;
 use gdk4::prelude::*;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
+use std::cell::RefCell;
 
-/// Build the History preferences page.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CategoryFilter {
+    All,
+    Voice,
+    Meeting,
+    PostProcess,
+    File,
+}
+
+thread_local! {
+    static HISTORY_TRACKED: RefCell<Vec<(HistoryEntry, libadwaita::ExpanderRow)>> =
+        const { RefCell::new(Vec::new()) };
+    static HISTORY_FILTER: RefCell<CategoryFilter> = const { RefCell::new(CategoryFilter::All) };
+    static HISTORY_SEARCH: RefCell<String> = const { RefCell::new(String::new()) };
+}
+
+fn apply_history_filter() {
+    HISTORY_TRACKED.with(|tracked| {
+        let cat = HISTORY_FILTER.with(|f| *f.borrow());
+        let query = HISTORY_SEARCH.with(|s| s.borrow().clone());
+        let query_lower = query.trim().to_lowercase();
+
+        for (entry, row) in tracked.borrow().iter() {
+            let matches_cat = match cat {
+                CategoryFilter::All => true,
+                CategoryFilter::Voice => entry.entry_kind == "transcription",
+                CategoryFilter::Meeting => entry.entry_kind == "meeting",
+                CategoryFilter::PostProcess => entry.entry_kind == "post_process",
+                CategoryFilter::File => entry.entry_kind == "file",
+            };
+
+            let matches_search = if query_lower.is_empty() {
+                true
+            } else {
+                entry.title.to_lowercase().contains(&query_lower)
+                    || entry
+                        .transcription_text
+                        .to_lowercase()
+                        .contains(&query_lower)
+                    || entry
+                        .post_processed_text
+                        .as_deref()
+                        .map(|pp| pp.to_lowercase().contains(&query_lower))
+                        .unwrap_or(false)
+                    || entry
+                        .post_process_prompt
+                        .as_deref()
+                        .map(|pr| pr.to_lowercase().contains(&query_lower))
+                        .unwrap_or(false)
+            };
+
+            row.set_visible(matches_cat && matches_search);
+        }
+    });
+}
+
+/// Build the Global History preferences page.
 pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let page = libadwaita::PreferencesPage::new();
     page.set_title("History");
+    page.set_icon_name(Some("document-open-recent-symbolic"));
 
-    // --- File Transcription group ---
-    let transcribe_group = libadwaita::PreferencesGroup::new();
-    transcribe_group.set_title("File Transcription");
-    transcribe_group.set_description(Some(
-        "Drag &amp; drop audio or video files here, or click to transcribe media files into text and subtitles.",
-    ));
-
-    let file_action_row = libadwaita::ActionRow::new();
-    file_action_row.set_title("Transcribe Audio/Video File…");
-    file_action_row.set_subtitle("Supports MP3, WAV, M4A, MP4, FLAC, OGG, AAC, WebM, MKV");
-    file_action_row.set_activatable(true);
-
-    let upload_btn = gtk4::Button::from_icon_name("document-open-symbolic");
-    upload_btn.set_tooltip_text(Some("Open Media File Transcriber"));
-    upload_btn.set_valign(gtk4::Align::Center);
-    upload_btn.add_css_class("flat");
-    file_action_row.add_suffix(&upload_btn);
-
-    let ctx_dialog = ctx.clone();
-    file_action_row.connect_activated(move |_| {
-        crate::ui::file_transcription::show_file_transcription_dialog(&ctx_dialog, None);
-    });
-
-    let ctx_btn = ctx.clone();
-    upload_btn.connect_clicked(move |_| {
-        crate::ui::file_transcription::show_file_transcription_dialog(&ctx_btn, None);
-    });
-
-    transcribe_group.add(&file_action_row);
-    page.add(&transcribe_group);
-
-    // Drop target for drag-and-dropping files on the History page
-    let drop_target = gtk4::DropTarget::new(gio::File::static_type(), gdk4::DragAction::COPY);
-    let ctx_drop = ctx.clone();
-    drop_target.connect_drop(move |_, value, _, _| {
-        if let Ok(file) = value.get::<gio::File>() {
-            if let Some(path) = file.path() {
-                crate::ui::file_transcription::show_file_transcription_dialog(
-                    &ctx_drop,
-                    Some(path),
-                );
-                return true;
-            }
-        }
-        false
-    });
-    page.add_controller(drop_target);
-
-    // --- Retention group ---
+    // --- 1. Retention group ---
     let retention_group = libadwaita::PreferencesGroup::new();
     retention_group.set_title("Retention");
 
@@ -88,21 +99,109 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     retention_group.add(&limit_row);
     page.add(&retention_group);
 
-    // --- Entries group ---
+    // --- 2. Filter & Search Controls ---
+    let filter_group = libadwaita::PreferencesGroup::new();
+    filter_group.set_title("Filter &amp; Search");
+
+    let controls_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    controls_box.set_margin_top(4);
+    controls_box.set_margin_bottom(8);
+
+    let search_entry = gtk4::SearchEntry::new();
+    search_entry.set_placeholder_text(Some("Search transcripts, meeting minutes, or AI text…"));
+    controls_box.append(&search_entry);
+
+    let filter_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    filter_row.set_halign(gtk4::Align::Center);
+
+    let filter_categories = [
+        (CategoryFilter::All, "All"),
+        (CategoryFilter::Voice, "🎙️ Voice"),
+        (CategoryFilter::Meeting, "👥 Meetings"),
+        (CategoryFilter::PostProcess, "✨ AI Polish"),
+        (CategoryFilter::File, "📁 Files"),
+    ];
+
+    let mut cat_buttons = Vec::new();
+    for (cat, label) in filter_categories {
+        let btn = gtk4::Button::with_label(label);
+        btn.add_css_class("flat");
+        if cat == CategoryFilter::All {
+            btn.add_css_class("suggested-action");
+        }
+        filter_row.append(&btn);
+        cat_buttons.push((cat, btn));
+    }
+    controls_box.append(&filter_row);
+
+    // Open Overlay Quick Action Row
+    let overlay_action_row = libadwaita::ActionRow::new();
+    overlay_action_row.set_title("Quick History Overlay");
+    overlay_action_row
+        .set_subtitle("Open the floating quick-access history palette (Shortcut: Ctrl+Alt+H)");
+    overlay_action_row.set_activatable(true);
+
+    let open_overlay_btn = gtk4::Button::from_icon_name("window-new-symbolic");
+    open_overlay_btn.set_tooltip_text(Some("Open History Overlay"));
+    open_overlay_btn.set_valign(gtk4::Align::Center);
+    open_overlay_btn.add_css_class("flat");
+    overlay_action_row.add_suffix(&open_overlay_btn);
+
+    let ctx_overlay = ctx.clone();
+    overlay_action_row.connect_activated(move |_| {
+        crate::ui::history_palette::show_history_palette(&ctx_overlay);
+    });
+    let ctx_overlay_btn = ctx.clone();
+    open_overlay_btn.connect_clicked(move |_| {
+        crate::ui::history_palette::show_history_palette(&ctx_overlay_btn);
+    });
+
+    filter_group.add(&controls_box);
+    filter_group.add(&overlay_action_row);
+    page.add(&filter_group);
+
+    // --- 3. Entries group ---
     let entries_group = libadwaita::PreferencesGroup::new();
     entries_group.set_widget_name("history-list");
-    entries_group.set_title("Recent Transcriptions");
+    entries_group.set_title("Global Activity &amp; Records");
+    entries_group.set_description(Some(
+        "All voice recordings, meeting notes, AI transformations, and media transcripts.",
+    ));
     page.add(&entries_group);
 
-    // Initial render + live refresh on history events.
-    let ctx = ctx.clone();
-    refresh_entries(&ctx, &entries_group);
+    // Category button click handlers
+    for (cat, btn) in cat_buttons.clone() {
+        let cat_buttons = cat_buttons.clone();
+        btn.connect_clicked(move |_| {
+            HISTORY_FILTER.with(|f| *f.borrow_mut() = cat);
+            for (c, b) in &cat_buttons {
+                if *c == cat {
+                    b.add_css_class("suggested-action");
+                } else {
+                    b.remove_css_class("suggested-action");
+                }
+            }
+            apply_history_filter();
+        });
+    }
+
+    // Search entry handler
+    search_entry.connect_search_changed(move |entry| {
+        HISTORY_SEARCH.with(|s| *s.borrow_mut() = entry.text().to_string());
+        apply_history_filter();
+    });
+
+    // Initial render + live refresh on history events
+    let ctx_render = ctx.clone();
+    refresh_entries(&ctx_render, &entries_group);
 
     let group_for_events = glib::SendWeakRef::from(entries_group.downgrade());
     let bus = ctx.bus.clone();
+
     bus.subscribe(move |event| {
-        let ctx = ctx.clone();
+        let ctx = ctx_render.clone();
         let group = group_for_events.clone();
+
         glib::MainContext::default().invoke(move || {
             let weak = group.into_weak_ref();
             let Some(group) = weak.upgrade() else {
@@ -119,11 +218,12 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
 fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
     crate::ui::pages::clear_group_rows(group);
+    HISTORY_TRACKED.with(|t| t.borrow_mut().clear());
 
     let ctx = ctx.clone();
     let group_weak = glib::SendWeakRef::from(group.downgrade());
     crate::runtime::spawn(async move {
-        let result = history_cmds::get_history_entries(&ctx, None, Some(20)).await;
+        let result = history_cmds::get_history_entries(&ctx, None, Some(50)).await;
         let ctx = ctx.clone();
         let group_weak = group_weak.clone();
         glib::MainContext::default().invoke(move || {
@@ -132,12 +232,29 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
             };
             match result {
                 Ok(paginated) => {
+                    let mut new_tracked = Vec::new();
                     for entry in paginated.entries {
                         let row = libadwaita::ExpanderRow::new();
                         row.set_widget_name(&entry.id.to_string());
+
+                        // Category Badge
+                        let (kind_label, badge_style) = match entry.entry_kind.as_str() {
+                            "meeting" => ("👥 Meeting", "accent"),
+                            "post_process" => ("✨ AI Polish", "accent"),
+                            "file" => ("📁 File", "dim-label"),
+                            _ => ("🎙️ Voice", "accent"),
+                        };
+                        let kind_badge = gtk4::Label::new(Some(kind_label));
+                        kind_badge.add_css_class("caption");
+                        kind_badge.add_css_class(badge_style);
+                        row.add_prefix(&kind_badge);
+
                         row.set_title(&glib::markup_escape_text(&entry.title));
                         let ts = chrono::DateTime::from_timestamp(entry.timestamp, 0)
-                            .map(|t| t.format("%Y-%m-%d %H:%M").to_string())
+                            .map(|t| {
+                                let local = t.with_timezone(&chrono::Local);
+                                local.format("%Y-%m-%d %H:%M").to_string()
+                            })
                             .unwrap_or_else(|| "unknown time".to_string());
                         row.set_subtitle(&ts);
                         row.set_expanded(false);
@@ -157,7 +274,12 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                         if has_distinct_post_process {
                             let pp_text = entry.post_processed_text.as_deref().unwrap_or_default();
                             let processed_row = libadwaita::ActionRow::new();
-                            processed_row.set_title("Processed Transcript");
+                            let section_title = if entry.entry_kind == "meeting" {
+                                "Meeting Minutes & Summary"
+                            } else {
+                                "Processed Transcript"
+                            };
+                            processed_row.set_title(section_title);
                             processed_row.set_subtitle(&glib::markup_escape_text(pp_text));
                             processed_row.set_subtitle_lines(0);
                             processed_row.set_activatable(false);
@@ -167,7 +289,7 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
 
                             if !entry.transcription_text.trim().is_empty() {
                                 let raw_row = libadwaita::ActionRow::new();
-                                raw_row.set_title("Original Transcript");
+                                raw_row.set_title("Original Audio Transcript");
                                 raw_row.set_subtitle(&glib::markup_escape_text(
                                     &entry.transcription_text,
                                 ));
@@ -180,7 +302,12 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                             }
                         } else {
                             let text_row = libadwaita::ActionRow::new();
-                            text_row.set_title("Transcript");
+                            let label = if entry.entry_kind == "file" {
+                                "File Transcript"
+                            } else {
+                                "Transcript"
+                            };
+                            text_row.set_title(label);
                             text_row.set_subtitle(&glib::markup_escape_text(primary_text));
                             text_row.set_subtitle_lines(0);
                             text_row.set_activatable(false);
@@ -189,7 +316,7 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                             row.add_row(&text_row);
                         }
 
-                        // Saved toggle.
+                        // Saved toggle
                         let saved_row = libadwaita::SwitchRow::new();
                         saved_row.set_title("Keep this entry");
                         saved_row.set_active(entry.saved);
@@ -204,11 +331,11 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                         });
                         row.add_row(&saved_row);
 
-                        // Copy button for the expander row header.
+                        // Copy button for the expander row header
                         let copy_button = create_copy_button(&ctx, primary_text);
                         row.add_suffix(&copy_button);
 
-                        // Audio Playback.
+                        // Audio Playback
                         let is_playing = history_cmds::is_playing_history_audio(entry.id);
                         let play_button = if is_playing {
                             let btn = gtk4::Button::from_icon_name("media-playback-stop-symbolic");
@@ -303,7 +430,11 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
 
                         group.add(&row);
                         crate::ui::pages::track_row(&group, &row);
+                        new_tracked.push((entry, row));
                     }
+
+                    HISTORY_TRACKED.with(|t| *t.borrow_mut() = new_tracked);
+                    apply_history_filter();
                 }
                 Err(e) => {
                     let row = libadwaita::ActionRow::new();
