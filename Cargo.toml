@@ -1,6 +1,6 @@
 [package]
 name = "otush"
-version = "1.6.1"
+version = "1.6.4"
 description = "Otush - a free, open source, offline speech-to-text application for GNOME"
 authors = ["Otush contributors"]
 edition = "2021"
