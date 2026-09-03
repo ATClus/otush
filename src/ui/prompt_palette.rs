@@ -7,9 +7,10 @@ use crate::settings::LLMPrompt;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use log::{info, warn};
-use std::sync::OnceLock;
+use std::sync::{LazyLock, Mutex};
 
-static PALETTE_WINDOW: OnceLock<glib::SendWeakRef<libadwaita::Window>> = OnceLock::new();
+static PALETTE_WINDOW: LazyLock<Mutex<Option<glib::SendWeakRef<libadwaita::Window>>>> =
+    LazyLock::new(|| Mutex::new(None));
 
 /// Show the Quick Prompt Palette centered on screen.
 pub fn show_prompt_palette(ctx: &AppContext) {
@@ -45,10 +46,12 @@ fn build_and_present_palette(
     pre_captured_clipboard: Option<String>,
 ) {
     // If a palette is already open, focus it
-    if let Some(weak) = PALETTE_WINDOW.get() {
-        if let Some(win) = weak.clone().into_weak_ref().upgrade() {
-            win.present();
-            return;
+    if let Ok(guard) = PALETTE_WINDOW.lock() {
+        if let Some(ref weak) = *guard {
+            if let Some(win) = weak.clone().into_weak_ref().upgrade() {
+                win.present();
+                return;
+            }
         }
     }
 
@@ -362,7 +365,15 @@ fn build_and_present_palette(
 
     window.add_controller(key_controller);
 
-    let _ = PALETTE_WINDOW.set(glib::SendWeakRef::from(window.downgrade()));
+    window.connect_destroy(|_| {
+        if let Ok(mut guard) = PALETTE_WINDOW.lock() {
+            *guard = None;
+        }
+    });
+
+    if let Ok(mut guard) = PALETTE_WINDOW.lock() {
+        *guard = Some(glib::SendWeakRef::from(window.downgrade()));
+    }
     window.present();
 }
 

@@ -813,6 +813,24 @@ pub fn change_post_process_model_setting(
     Ok(())
 }
 
+pub fn change_post_process_timeout_setting(
+    ctx: &AppContext,
+    provider_id: String,
+    timeout_seconds: u32,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    validate_provider_exists(&settings, &provider_id)?;
+    if let Some(provider) = settings.post_process_provider_mut(&provider_id) {
+        provider.timeout_seconds = timeout_seconds;
+        settings::write_settings(ctx, settings);
+        ctx.notify_setting_changed(
+            "post_process_provider_timeout",
+            serde_json::json!(provider_id),
+        );
+    }
+    Ok(())
+}
+
 pub fn set_post_process_provider(ctx: &AppContext, provider_id: String) -> Result<(), String> {
     let mut settings = settings::get_settings(ctx);
     validate_provider_exists(&settings, &provider_id)?;
@@ -849,6 +867,51 @@ pub fn add_post_process_prompt(
     Ok(new_prompt)
 }
 
+pub fn update_post_process_prompt_name(
+    ctx: &AppContext,
+    id: String,
+    name: String,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+
+    if let Some(existing_prompt) = settings
+        .post_process_prompts
+        .iter_mut()
+        .find(|p| p.id == id)
+    {
+        existing_prompt.name = name.clone();
+        ctx.notify_setting_changed(
+            "post_process_prompt_name",
+            serde_json::json!({ "id": id, "name": name }),
+        );
+        settings::write_settings(ctx, settings);
+        Ok(())
+    } else {
+        Err(format!("Prompt with id '{}' not found", id))
+    }
+}
+
+pub fn update_post_process_prompt_content(
+    ctx: &AppContext,
+    id: String,
+    prompt: String,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+
+    if let Some(existing_prompt) = settings
+        .post_process_prompts
+        .iter_mut()
+        .find(|p| p.id == id)
+    {
+        existing_prompt.prompt = prompt;
+        ctx.notify_setting_changed("post_process_prompt_content", serde_json::json!(&id));
+        settings::write_settings(ctx, settings);
+        Ok(())
+    } else {
+        Err(format!("Prompt with id '{}' not found", id))
+    }
+}
+
 pub fn update_post_process_prompt(
     ctx: &AppContext,
     id: String,
@@ -862,8 +925,12 @@ pub fn update_post_process_prompt(
         .iter_mut()
         .find(|p| p.id == id)
     {
-        existing_prompt.name = name;
+        existing_prompt.name = name.clone();
         existing_prompt.prompt = prompt;
+        ctx.notify_setting_changed(
+            "post_process_prompt_name",
+            serde_json::json!({ "id": id, "name": name }),
+        );
         ctx.notify_setting_changed("post_process_prompt_content", serde_json::json!(&id));
         settings::write_settings(ctx, settings);
         Ok(())
@@ -1433,4 +1500,89 @@ pub fn change_audio_noise_gate_threshold_setting(
         serde_json::json!(threshold_db),
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::{AppContext, AppPaths, EventBus};
+    use crate::managers::audio::AudioRecordingManager;
+    use crate::managers::history::HistoryManager;
+    use crate::managers::model::ModelManager;
+    use crate::managers::transcription::TranscriptionManager;
+    use crate::TranscriptionCoordinator;
+    use std::sync::Arc;
+
+    fn create_test_context() -> (AppContext, tempfile::TempDir) {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let paths = AppPaths {
+            data_dir: temp_dir.path().to_path_buf(),
+            resource_dir: temp_dir.path().to_path_buf(),
+            log_dir: temp_dir.path().to_path_buf(),
+        };
+        paths.ensure_dirs().unwrap();
+        let bus = EventBus::new();
+        let model = Arc::new(ModelManager::new(&paths, bus.clone()).unwrap());
+        let transcription =
+            Arc::new(TranscriptionManager::new(&paths, bus.clone(), model.clone()).unwrap());
+        let audio = Arc::new(
+            AudioRecordingManager::new(&paths, bus.clone(), transcription.stream_router()).unwrap(),
+        );
+        let history = Arc::new(HistoryManager::new(&paths, bus.clone()).unwrap());
+        let coordinator = Arc::new(TranscriptionCoordinator::new());
+        let ctx = AppContext {
+            paths,
+            bus,
+            model,
+            transcription,
+            audio,
+            history,
+            coordinator,
+        };
+        (ctx, temp_dir)
+    }
+
+    #[test]
+    fn test_update_prompt_name_and_content_independent() {
+        let (ctx, _dir) = create_test_context();
+        let new_prompt = add_post_process_prompt(
+            &ctx,
+            "Initial Name".to_string(),
+            "Initial content: ${output}".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(new_prompt.name, "Initial Name");
+        assert_eq!(new_prompt.prompt, "Initial content: ${output}");
+
+        // 1. Update only name
+        update_post_process_prompt_name(&ctx, new_prompt.id.clone(), "Updated Name".to_string())
+            .unwrap();
+
+        let s = settings::get_settings(&ctx);
+        let p = s
+            .post_process_prompts
+            .iter()
+            .find(|p| p.id == new_prompt.id)
+            .unwrap();
+        assert_eq!(p.name, "Updated Name");
+        assert_eq!(p.prompt, "Initial content: ${output}");
+
+        // 2. Update only content
+        update_post_process_prompt_content(
+            &ctx,
+            new_prompt.id.clone(),
+            "Brand new instructions: ${output}".to_string(),
+        )
+        .unwrap();
+
+        let s2 = settings::get_settings(&ctx);
+        let p2 = s2
+            .post_process_prompts
+            .iter()
+            .find(|p| p.id == new_prompt.id)
+            .unwrap();
+        assert_eq!(p2.name, "Updated Name");
+        assert_eq!(p2.prompt, "Brand new instructions: ${output}");
+    }
 }

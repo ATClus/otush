@@ -3,7 +3,7 @@ use log::{debug, info};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::{Mutex, OnceLock};
 
@@ -230,16 +230,51 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
 /// Create an HTTP client with provider-specific headers and timeout
 fn create_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
     let headers = build_headers(provider, api_key)?;
-    let timeout_secs = if provider.timeout_seconds > 0 {
+    // Enforce a sane timeout for LLM generation: minimum 60s, default 120s if zero/unconfigured
+    let timeout_secs = if provider.timeout_seconds >= 30 {
         provider.timeout_seconds
+    } else if provider.timeout_seconds > 0 {
+        provider.timeout_seconds.max(60)
     } else {
-        60
+        120
     };
     reqwest::Client::builder()
         .default_headers(headers)
+        .connect_timeout(std::time::Duration::from_secs(30))
         .timeout(std::time::Duration::from_secs(timeout_secs as u64))
         .build()
         .map_err(|e| report_reqwest_error("Failed to build HTTP client", &e))
+}
+
+/// Retrieve or create a cached HTTP client to reuse TCP/TLS connection pools and keep-alive.
+fn cached_client(provider: &PostProcessProvider, api_key: &str) -> Result<reqwest::Client, String> {
+    static CLIENT_CACHE: OnceLock<Mutex<HashMap<String, reqwest::Client>>> = OnceLock::new();
+    let cache = CLIENT_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
+
+    let timeout_secs = if provider.timeout_seconds >= 30 {
+        provider.timeout_seconds
+    } else if provider.timeout_seconds > 0 {
+        provider.timeout_seconds.max(60)
+    } else {
+        120
+    };
+
+    let cache_key = format!(
+        "{}:{}:{}:{}",
+        provider.id, provider.base_url, timeout_secs, api_key
+    );
+
+    if let Ok(guard) = cache.lock() {
+        if let Some(client) = guard.get(&cache_key) {
+            return Ok(client.clone());
+        }
+    }
+
+    let new_client = create_client(provider, api_key)?;
+    if let Ok(mut guard) = cache.lock() {
+        guard.insert(cache_key, new_client.clone());
+    }
+    Ok(new_client)
 }
 
 /// Format a bounded error source chain.
@@ -339,7 +374,9 @@ fn report_reqwest_error(context: &str, error: &reqwest::Error) -> String {
     } else {
         error_source_chain(error)
     };
-    let cause_details = if !causes.is_empty() {
+    let cause_details = if error.is_timeout() {
+        ": request timed out waiting for response or receiving body (consider increasing provider timeout for large transcripts or reasoning models)".to_string()
+    } else if !causes.is_empty() {
         format!(": caused by: {}", causes.join(" -> "))
     } else if error.url().is_none() {
         // Reqwest's short Display text is safe when it cannot append a raw URL.
@@ -404,7 +441,7 @@ pub async fn send_chat_completion_with_schema(
         sanitized_url_for_log(&url)
     );
 
-    let client = create_client(provider, &api_key)?;
+    let client = cached_client(provider, &api_key)?;
 
     // Build messages vector
     let mut messages = Vec::new();
@@ -560,7 +597,7 @@ pub async fn fetch_models(
 
     debug!("Fetching models from: {}", sanitized_url_for_log(&url));
 
-    let client = create_client(provider, &api_key)?;
+    let client = cached_client(provider, &api_key)?;
 
     let response = client
         .get(&url)

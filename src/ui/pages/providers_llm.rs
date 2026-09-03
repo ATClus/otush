@@ -63,7 +63,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
         glib::MainContext::default().invoke(move || {
             if let AppEvent::SettingsChanged { setting, .. } = event {
-                if setting == "post_process_enabled" || setting == "post_process_selected_prompt_id"
+                if setting == "post_process_enabled"
+                    || setting == "post_process_selected_prompt_id"
+                    || setting == "post_process_prompt_name"
                 {
                     if let Some(grp) = post_weak.into_weak_ref().upgrade() {
                         refresh_master_group(&ctx, &grp);
@@ -189,14 +191,18 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
         name_row.set_text(&prompt.name);
         let n_ctx = ctx.clone();
         let n_id = prompt.id.clone();
-        let n_current_prompt = prompt.prompt.clone();
+        let row_weak = glib::SendWeakRef::from(row.downgrade());
         name_row.connect_changed(move |r| {
-            let _ = shortcut::update_post_process_prompt(
-                &n_ctx,
-                n_id.clone(),
-                r.text().to_string(),
-                n_current_prompt.clone(),
-            );
+            let new_name = r.text().to_string();
+            let title = if new_name.trim().is_empty() {
+                "Untitled Prompt".to_string()
+            } else {
+                new_name.clone()
+            };
+            if let Some(row) = row_weak.clone().into_weak_ref().upgrade() {
+                row.set_title(&title);
+            }
+            let _ = shortcut::update_post_process_prompt_name(&n_ctx, n_id.clone(), new_name);
         });
         row.add_row(&name_row);
 
@@ -261,15 +267,13 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
 
         let t_ctx = ctx.clone();
         let t_id = prompt.id.clone();
-        let t_name = prompt.name.clone();
         buffer.connect_changed(move |buf| {
             let start = buf.start_iter();
             let end = buf.end_iter();
             let text = buf.text(&start, &end, false);
-            let _ = shortcut::update_post_process_prompt(
+            let _ = shortcut::update_post_process_prompt_content(
                 &t_ctx,
                 t_id.clone(),
-                t_name.clone(),
                 text.to_string(),
             );
         });
@@ -454,7 +458,36 @@ fn refresh_providers_group(
             row.add_row(&url_row);
         }
 
-        // 4. Test Connection Row
+        // 4. Request Timeout Row (SpinRow)
+        let timeout_adj = gtk4::Adjustment::new(
+            provider.timeout_seconds.max(15) as f64,
+            15.0,
+            600.0,
+            15.0,
+            30.0,
+            0.0,
+        );
+        let timeout_row = libadwaita::SpinRow::new(Some(&timeout_adj), 15.0, 0);
+        timeout_row.set_title("Request Timeout (seconds)");
+        timeout_row.set_subtitle(
+            "Recommended 120s+ for large transcripts, reasoning models or slow providers",
+        );
+        timeout_row.set_snap_to_ticks(true);
+        timeout_row.set_numeric(true);
+
+        let timeout_ctx = ctx.clone();
+        let timeout_id = provider.id.clone();
+        timeout_adj.connect_value_changed(move |adj| {
+            let val = adj.value().round() as u32;
+            let _ = shortcut::change_post_process_timeout_setting(
+                &timeout_ctx,
+                timeout_id.clone(),
+                val,
+            );
+        });
+        row.add_row(&timeout_row);
+
+        // 5. Test Connection Row
         let test_row = libadwaita::ActionRow::new();
         test_row.set_title("Connection Test");
         test_row.set_subtitle("Send a short test query to verify API key and model availability");
