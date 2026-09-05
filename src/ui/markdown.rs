@@ -277,14 +277,42 @@ pub fn render_into_buffer(buffer: &gtk4::TextBuffer, markdown: &str) {
 
 /// Build a read-only, selectable, word-wrapping [`gtk4::TextView`]
 /// pre-rendered with `markdown`. Used for agent bubbles and previews.
+///
+/// The view is transparent (no background, no border): it is always hosted
+/// inside a `.card` container that already provides the surface, so the
+/// text flows as a single visual block instead of a box inside a box.
 pub fn markdown_textview(markdown: &str) -> gtk4::TextView {
+    ensure_flat_style();
     let view = gtk4::TextView::new();
     view.set_editable(false);
     view.set_cursor_visible(false);
     view.set_wrap_mode(gtk4::WrapMode::Word);
-    view.add_css_class("card");
+    // Transparent: no `view` background/border of its own. The CSS nodes
+    // are `textview > text`; clearing both keeps every theme flat.
+    view.add_css_class("md-flat");
     render_into_buffer(&view.buffer(), markdown);
     view
+}
+
+/// Install the `.md-flat` rule once per process (idempotent): transparent
+/// background and no border on the view and its inner `text` node.
+fn ensure_flat_style() {
+    use std::sync::Once;
+    static INSTALL: Once = Once::new();
+    INSTALL.call_once(|| {
+        let Some(display) = gtk4::gdk::Display::default() else {
+            return;
+        };
+        let provider = gtk4::CssProvider::new();
+        provider.load_from_data(
+            "textview.md-flat, textview.md-flat text { background: transparent; border: none; }",
+        );
+        gtk4::style_context_add_provider_for_display(
+            &display,
+            &provider,
+            gtk4::STYLE_PROVIDER_PRIORITY_APPLICATION,
+        );
+    });
 }
 
 // ---------------------------------------------------------------------------
