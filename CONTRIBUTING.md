@@ -1,8 +1,7 @@
 # Contributing to Otush
 
 Thank you for your interest in contributing to Otush! This guide covers how to
-get started with this open source, offline speech-to-text application for
-GNOME.
+get started with this open source AI voice and productivity suite for GNOME.
 
 ## Getting started
 

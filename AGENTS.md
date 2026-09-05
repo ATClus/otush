@@ -51,14 +51,19 @@ Otush is a **native GNOME application** (GTK4 + libadwaita on Wayland) with a Ru
 - `lib.rs` — crate entry: `run()` builds the `AppContext` (paths, managers, event bus), initializes the core, and starts the GTK shell (`app::run_gtk`) or the headless CLI path.
 - `context.rs` — the host abstraction: `AppContext` (paths + managers + `EventBus`), `AppPaths` (portable-aware dirs), `EventBus` (backend → UI fan-out) and `AppEvent` (the single event enum).
 - `app.rs` — GTK shell: `adw::Application`, single-instance + remote CLI via GApplication's `command-line` signal, event-bus → toast/theme wiring.
-- `ui/` — GTK4 widgets: `window.rs` (navigation shell), `pages/` (General, Models, Post-Processing, History, Advanced, Debug, About), all `AdwPreferencesPage`s.
+- `actions.rs` — unified action dispatcher for global shortcuts and floating palettes (Transcription, Meeting mode, Selection AI, Notes, Todos, Doc OCR, Web Research).
+- `llm_client.rs`, `stt_client.rs`, `web_client.rs` — multi-provider integration (local Ollama + cloud Anthropic, OpenAI, Groq, Mistral, Deepgram, Cerebras, Tavily, Firecrawl).
+- `ui/` — GTK4 / Libadwaita interface:
+  - `window.rs` — navigation shell (split view with Workspace and Preferences sections).
+  - Floating palettes & overlays: `history_palette.rs`, `notes_palette.rs`, `todo_palette.rs`, `prompt_palette.rs`, `search_overlay.rs`, `doc_parser.rs`.
+  - `pages/` — settings & workspace pages (General, Audio, Models, AI/Prompts, Providers, Shortcuts, Notes, Todos, Docs, Research, History, Advanced).
 - `overlay.rs` — recording overlay: a fullscreen transparent, click-through surface (GNOME/Mutter lacks the wlr-layer-shell protocol) with a Cairo-painted pill at the bottom/top screen edge (state, pulsing record button, mic waveform, streaming text).
 - `tray.rs` — StatusNotifierItem via `ksni`.
 - `managers/` — core business logic:
   - `audio.rs` — audio recording and device management (cpal)
   - `model.rs` — model catalog, downloads, extraction
   - `transcription.rs` — speech-to-text pipeline (transcribe-cpp / transcribe-rs)
-  - `history.rs` — transcription history (rusqlite)
+  - `history.rs` — transcription history, notes, todos, documents storage (rusqlite)
 - `audio_toolkit/` — low-level audio processing (devices, recording, resampling, VAD).
 - `commands/` — the command layer (plain functions on `&AppContext`) that the UI calls.
 - `shortcut/` — shortcut engines behind one interface: `portal.rs` (XDG GlobalShortcuts portal via `ashpd`, Wayland-native) and `evdev.rs` (evdev via the handy-keys crate); `handler.rs` dispatches events.
