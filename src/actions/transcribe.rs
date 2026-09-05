@@ -20,7 +20,7 @@ use crate::utils::redact_text;
 use ferrous_opencc::{config::BuiltinConfig, OpenCC};
 use log::{debug, error, info, warn};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Instant;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum TranscribeMode {
@@ -640,7 +640,7 @@ impl ShortcutAction for TranscribeAction {
                                 debug!(
                                     "Delaying microphone-ready cue by {delay_ms}ms for UI preview"
                                 );
-                                std::thread::sleep(Duration::from_millis(delay_ms));
+                                std::thread::sleep(std::time::Duration::from_millis(delay_ms));
                             }
                         }
 
