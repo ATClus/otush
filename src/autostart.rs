@@ -32,7 +32,7 @@ pub fn apply_autostart(_ctx: &AppContext, enabled: bool) {
             "[Desktop Entry]\n\
              Type=Application\n\
              Name=Otush\n\
-             Comment=Offline speech-to-text\n\
+             Comment=Native AI Voice & Productivity Suite for GNOME\n\
              Exec={} --start-hidden\n\
              X-GNOME-Autostart-enabled=true\n\
              Hidden=false\n",
@@ -94,14 +94,14 @@ pub fn ensure_desktop_entry_registered() {
         "[Desktop Entry]\n\
          Type=Application\n\
          Name=Otush\n\
-         GenericName=Speech to Text\n\
-         Comment=A free, open source, offline speech-to-text application\n\
+         GenericName=AI Voice & Productivity Suite\n\
+         Comment=Native speech-to-text, meeting intelligence, notes, tasks, OCR, and AI research for GNOME\n\
          Exec={}\n\
          Path={}\n\
          Icon=com.clusterat.otush\n\
          Terminal=false\n\
-         Categories=Utility;AudioVideo;Accessibility;\n\
-         Keywords=speech;text;transcription;dictation;whisper;voice;\n\
+         Categories=Utility;AudioVideo;Accessibility;Office;\n\
+         Keywords=speech;text;transcription;dictation;whisper;voice;ai;llm;notes;todos;ocr;research;gnome;wayland;productivity;\n\
          StartupNotify=true\n\
          StartupWMClass=com.clusterat.otush\n\
          X-GNOME-UsesNotifications=true\n",
@@ -112,16 +112,45 @@ pub fn ensure_desktop_entry_registered() {
     let _ = std::fs::create_dir_all(&apps_dir);
     let _ = std::fs::write(&desktop_file, content);
 
-    // Also install the application icon into ~/.local/share/icons if not present
-    let icons_dir = data_dir.join("icons/hicolor/128x128/apps");
-    let icon_file = icons_dir.join("com.clusterat.otush.png");
-    if !icon_file.exists() {
-        let _ = std::fs::create_dir_all(&icons_dir);
-        let bundled_icon = crate::resources::resource_dir().join("otush-128.png");
-        if bundled_icon.exists() {
-            let _ = std::fs::copy(&bundled_icon, &icon_file);
+    // Install the application icons into ~/.local/share/icons/hicolor
+    let resource_dir = crate::resources::resource_dir();
+
+    // 1. Scalable vector SVG
+    let svg_dir = data_dir.join("icons/hicolor/scalable/apps");
+    if std::fs::create_dir_all(&svg_dir).is_ok() {
+        let bundled_svg = resource_dir.join("otush-icon.svg");
+        if bundled_svg.exists() {
+            let _ = std::fs::copy(&bundled_svg, svg_dir.join("com.clusterat.otush.svg"));
         }
     }
+
+    // 2. High-res 512x512 PNG
+    let p512_dir = data_dir.join("icons/hicolor/512x512/apps");
+    if std::fs::create_dir_all(&p512_dir).is_ok() {
+        let bundled_512 = resource_dir.join("otush.png");
+        if bundled_512.exists() {
+            let _ = std::fs::copy(&bundled_512, p512_dir.join("com.clusterat.otush.png"));
+        }
+    }
+
+    // 3. Standard 128x128 PNG
+    let p128_dir = data_dir.join("icons/hicolor/128x128/apps");
+    if std::fs::create_dir_all(&p128_dir).is_ok() {
+        let bundled_128 = resource_dir.join("otush-128.png");
+        if bundled_128.exists() {
+            let _ = std::fs::copy(&bundled_128, p128_dir.join("com.clusterat.otush.png"));
+        }
+    }
+
+    // Refresh icon cache
+    let hicolor_dir = data_dir.join("icons/hicolor");
+    let _ = std::process::Command::new("gtk-update-icon-cache")
+        .arg("-f")
+        .arg("-t")
+        .arg(&hicolor_dir)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status();
 
     // Refresh user desktop database so GNOME immediately recognizes the application ID
     let _ = std::process::Command::new("update-desktop-database")

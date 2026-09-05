@@ -184,25 +184,70 @@ def draw_studio_mic_geometry(d, cx, cy, h, color=WHITE, is_shadow=False):
     d.rounded_rectangle([cx - (base_w / 2.0), base_y0, cx + (base_w / 2.0), base_y1], radius=stroke / 2.0, fill=color)
 
 
+def make_sparkle_points(cx, cy, r, num_steps=16):
+    """Calculates polygon vertices for a 4-pointed Libadwaita AI sparkle."""
+    points = []
+    quadrants = [
+        ((cx, cy - r), (cx, cy), (cx + r, cy)),
+        ((cx + r, cy), (cx, cy), (cx, cy + r)),
+        ((cx, cy + r), (cx, cy), (cx - r, cy)),
+        ((cx - r, cy), (cx, cy), (cx, cy - r)),
+    ]
+    for p0, pc, p1 in quadrants:
+        for i in range(num_steps):
+            t = i / float(num_steps)
+            x = (1 - t) ** 2 * p0[0] + 2 * (1 - t) * t * pc[0] + t ** 2 * p1[0]
+            y = (1 - t) ** 2 * p0[1] + 2 * (1 - t) * t * pc[1] + t ** 2 * p1[1]
+            points.append((x, y))
+    return points
+
+
+def draw_ai_sparkle(d, cx, cy, r, color=WHITE):
+    """Draws a smooth 4-pointed AI intelligence sparkle."""
+    pts = make_sparkle_points(cx, cy, r)
+    d.polygon(pts, fill=color)
+
+
+# ==============================================================================
+# Layers 3 and 4: Studio Microphone & AI Sparkles with Soft Shadow
+# ==============================================================================
+def draw_suite_elements(d, cx, cy, h, color=WHITE, is_shadow=False, ss=SS):
+    """Draws studio microphone together with AI intelligence sparkles."""
+    # 1. Microphone
+    draw_studio_mic_geometry(d, cx, cy, h, color=color, is_shadow=is_shadow)
+
+    # 2. Primary AI Sparkle (Upper Right)
+    sparkle_cx = cx + (h * 0.48)
+    sparkle_cy = cy - (h * 0.46)
+    sparkle_r = h * 0.21
+    draw_ai_sparkle(d, sparkle_cx, sparkle_cy, sparkle_r, color=color)
+
+    # 3. Secondary Micro Sparkle (Upper Left)
+    micro_cx = cx - (h * 0.47)
+    micro_cy = cy - (h * 0.34)
+    micro_r = h * 0.10
+    draw_ai_sparkle(d, micro_cx, micro_cy, micro_r, color=color)
+
+
 def draw_studio_microphone_with_shadow(img, size, color=WHITE, ss=SS):
-    """Renders diffuse contact shadow and composites the solid microphone."""
+    """Renders diffuse contact shadow and composites the solid microphone + AI sparkles."""
     cx = (size / 2.0) * ss
     cy = (size / 2.0) * ss
-    h = size * 0.46 * ss
+    h = size * 0.44 * ss
 
     # 1. Soft Shadow Layer (Ambient Occlusion)
     shadow_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
     s_draw = ImageDraw.Draw(shadow_layer)
     shadow_offset_y = 3.0 * ss
-    draw_studio_mic_geometry(s_draw, cx, cy + shadow_offset_y, h, color=(0, 0, 0, 90), is_shadow=True)
+    draw_suite_elements(s_draw, cx, cy + shadow_offset_y, h, color=(0, 0, 0, 95), is_shadow=True, ss=ss)
     shadow_layer = shadow_layer.filter(ImageFilter.GaussianBlur(radius=3.5 * ss))
     img.alpha_composite(shadow_layer)
 
-    # 2. Foreground Solid Microphone Layer
-    mic_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
-    m_draw = ImageDraw.Draw(mic_layer)
-    draw_studio_mic_geometry(m_draw, cx, cy, h, color=color, is_shadow=False)
-    img.alpha_composite(mic_layer)
+    # 2. Foreground Solid Layer
+    fg_layer = Image.new("RGBA", img.size, (0, 0, 0, 0))
+    fg_draw = ImageDraw.Draw(fg_layer)
+    draw_suite_elements(fg_draw, cx, cy, h, color=color, is_shadow=False, ss=ss)
+    img.alpha_composite(fg_layer)
 
 
 # ==============================================================================
@@ -285,6 +330,13 @@ def make_tray_symbolic(color, transcribing=False, recording=False, warning=False
     # 4. Lower base
     d.rounded_rectangle([cx - base_w / 2.0, base_y0, cx + base_w / 2.0, base_y1], radius=base_h / 2.0, fill=color)
 
+    # 5. AI Suite Sparkle on idle/transcribing
+    if not recording and not warning:
+        sparkle_cx = 48.0 * ss
+        sparkle_cy = 13.0 * ss
+        sparkle_r = 7.5 * ss
+        draw_ai_sparkle(d, sparkle_cx, sparkle_cy, sparkle_r, color=color)
+
     if recording:
         # Pulsing bright red recording dot on top-right
         dot_r = 8.5 * ss
@@ -301,7 +353,7 @@ def make_tray_symbolic(color, transcribing=False, recording=False, warning=False
 
 
 def write_scalable_svg(path):
-    """Generates layered SVG file with backdrop soundwaves and studio microphone."""
+    """Generates layered SVG file with backdrop soundwaves, studio microphone, and AI sparkles."""
     svg = """<?xml version="1.0" encoding="UTF-8"?>
 <svg xmlns="http://www.w3.org/2000/svg" width="512" height="512" viewBox="0 0 512 512">
   <defs>
@@ -349,19 +401,25 @@ def write_scalable_svg(path):
     <rect x="434" y="227" width="18" height="58"  rx="9"/>
   </g>
 
-  <!-- 3. Foreground Studio Microphone (with Shadow) -->
+  <!-- 3. Foreground Studio Microphone & AI Sparkles (with Shadow) -->
   <g filter="url(#mic_shadow)" fill="#ffffff" stroke="#ffffff" stroke-linecap="round" stroke-linejoin="round">
     <!-- Central Capsule -->
-    <rect x="212" y="142" width="88" height="134" rx="44" stroke-width="0"/>
+    <rect x="212" y="148" width="88" height="130" rx="44" stroke-width="0"/>
     <!-- Grill Detail -->
-    <line x1="220" y1="198" x2="292" y2="198" stroke="#000000" stroke-width="2.5" opacity="0.2"/>
+    <line x1="220" y1="202" x2="292" y2="202" stroke="#000000" stroke-width="2.5" opacity="0.2"/>
 
     <!-- U-Arc Holder -->
-    <path d="M 190 232 A 66 66 0 0 0 322 232" fill="none" stroke-width="20"/>
+    <path d="M 190 236 A 66 66 0 0 0 322 236" fill="none" stroke-width="20"/>
 
     <!-- Stem and Base -->
-    <line x1="256" y1="298" x2="256" y2="326" stroke-width="20"/>
-    <line x1="210" y1="336" x2="302" y2="336" stroke-width="20"/>
+    <line x1="256" y1="300" x2="256" y2="328" stroke-width="20"/>
+    <line x1="210" y1="338" x2="302" y2="338" stroke-width="20"/>
+
+    <!-- Primary AI Sparkle (Intelligence Symbol) -->
+    <path d="M 366 102 Q 366 150 414 150 Q 366 150 366 198 Q 366 150 318 150 Q 366 150 366 102 Z" stroke-width="0"/>
+
+    <!-- Secondary Micro Sparkle -->
+    <path d="M 148 156 Q 148 178 170 178 Q 148 178 148 200 Q 148 178 126 178 Q 148 178 148 156 Z" stroke-width="0" opacity="0.90"/>
   </g>
 </svg>
 """
