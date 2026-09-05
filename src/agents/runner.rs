@@ -291,7 +291,14 @@ pub async fn run_agent_turn(
         .collect();
 
     let rag_block = if agent.agent.rag_enabled {
-        let passages = rag::rag_search(ctx, user_text, agent.agent.effective_top_k());
+        let (query_vector, embedding_model) = resolve_query_embedding(ctx, user_text).await;
+        let passages = rag::hybrid_search(
+            ctx,
+            user_text,
+            agent.agent.effective_top_k(),
+            query_vector.as_deref(),
+            embedding_model.as_deref(),
+        );
         rag::render_context_block(&passages)
     } else {
         None
@@ -303,6 +310,58 @@ pub async fn run_agent_turn(
         settings,
     };
     run_turn_with(agent, history, user_text, rag_block, &live, &live, sink).await
+}
+
+/// Embed the user query when a provider configures an `embeddings_model`.
+/// Returns `(vector, model)`; `None` on any failure (chat falls back to pure
+/// BM25). Also kicks an opportunistic backfill so partially embedded indexes
+/// converge without the user opening Settings.
+async fn resolve_query_embedding(
+    ctx: &AppContext,
+    user_text: &str,
+) -> (Option<Vec<f32>>, Option<String>) {
+    let settings = ctx.settings();
+    let Some((provider, model, api_key)) = settings
+        .post_process_providers
+        .iter()
+        .filter(|p| p.enabled)
+        .filter_map(|p| {
+            let model = p
+                .embeddings_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())?;
+            let key = settings
+                .post_process_api_keys
+                .get(&p.id)
+                .cloned()
+                .unwrap_or_default();
+            Some((p.clone(), model.to_string(), key))
+        })
+        .next()
+    else {
+        return (None, None);
+    };
+    if api_key.trim().is_empty() && provider.id != "custom" && provider.id != "ollama" {
+        return (None, None);
+    }
+    crate::commands::agents::backfill_embeddings(ctx);
+    let query = user_text.trim();
+    if query.is_empty() {
+        return (None, None);
+    }
+    match crate::llm_client::fetch_embeddings(&provider, api_key, &model, &[query.to_string()])
+        .await
+    {
+        Ok(mut vectors) => match vectors.pop() {
+            Some(vector) if !vector.is_empty() => (Some(vector), Some(model)),
+            _ => (None, None),
+        },
+        Err(err) => {
+            log::debug!("RAG query embedding failed ({model}): {err}");
+            (None, None)
+        }
+    }
 }
 
 #[cfg(test)]

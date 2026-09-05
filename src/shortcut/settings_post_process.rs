@@ -94,6 +94,31 @@ pub fn change_post_process_timeout_setting(
     Ok(())
 }
 
+/// Set (or clear with an empty string) the provider's embeddings model for
+/// semantic RAG (`/embeddings`). Clearing disables vector search.
+pub fn change_post_process_embeddings_model_setting(
+    ctx: &AppContext,
+    provider_id: String,
+    model: String,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    validate_provider_exists(&settings, &provider_id)?;
+    if let Some(provider) = settings.post_process_provider_mut(&provider_id) {
+        let model = model.trim();
+        provider.embeddings_model = if model.is_empty() {
+            None
+        } else {
+            Some(model.to_string())
+        };
+        settings::write_settings(ctx, settings);
+        ctx.notify_setting_changed(
+            "post_process_provider_embeddings",
+            serde_json::json!(provider_id),
+        );
+    }
+    Ok(())
+}
+
 pub fn add_post_process_prompt(
     ctx: &AppContext,
     name: String,

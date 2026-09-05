@@ -72,12 +72,13 @@ pub use settings_general::{
 
 pub use settings_post_process::{
     add_post_process_prompt, change_post_process_api_key_setting,
-    change_post_process_base_url_setting, change_post_process_model_setting,
-    change_post_process_timeout_setting, move_post_process_provider_priority,
-    remove_post_process_prompt, set_post_process_prompt_preferred_provider,
-    set_post_process_provider_reasoning, set_post_process_selected_prompt,
-    test_post_process_provider_connection, toggle_post_process_provider_enabled,
-    update_post_process_prompt_content, update_post_process_prompt_name,
+    change_post_process_base_url_setting, change_post_process_embeddings_model_setting,
+    change_post_process_model_setting, change_post_process_timeout_setting,
+    move_post_process_provider_priority, remove_post_process_prompt,
+    set_post_process_prompt_preferred_provider, set_post_process_provider_reasoning,
+    set_post_process_selected_prompt, test_post_process_provider_connection,
+    toggle_post_process_provider_enabled, update_post_process_prompt_content,
+    update_post_process_prompt_name,
 };
 
 pub use settings_audio_ui::{

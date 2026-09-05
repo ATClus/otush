@@ -377,6 +377,31 @@ fn refresh_llm_providers_group(
         });
         row.add_row(&timeout_row);
 
+        // 5. Embeddings model row (semantic RAG; empty = keyword-only FTS5).
+        let embed_row = libadwaita::EntryRow::new();
+        embed_row.set_title("Embeddings Model");
+        embed_row.set_tooltip_text(Some(
+            "Semantic search model, e.g. text-embedding-3-small (empty = keywords only)",
+        ));
+        let embed_icon = gtk4::Image::from_icon_name("system-search-symbolic");
+        embed_row.add_prefix(&embed_icon);
+        embed_row.set_text(provider.embeddings_model.as_deref().unwrap_or(""));
+        let embed_ctx = ctx.clone();
+        let embed_id = provider.id.clone();
+        embed_row.connect_changed(move |r| {
+            if let Err(err) = shortcut::change_post_process_embeddings_model_setting(
+                &embed_ctx,
+                embed_id.clone(),
+                r.text().to_string(),
+            ) {
+                embed_ctx.report_error("change_post_process_embeddings_model_setting", err);
+            } else {
+                // New model = stale vectors: kick a backfill for its chunks.
+                crate::commands::agents::backfill_embeddings(&embed_ctx);
+            }
+        });
+        row.add_row(&embed_row);
+
         // 5. Reasoning / Thinking Effort Row (ComboRow)
         let reasoning_row = libadwaita::ComboRow::new();
         reasoning_row.set_title("Reasoning & Thinking Effort");

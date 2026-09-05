@@ -225,6 +225,11 @@ pub struct PostProcessProvider {
     pub custom_headers: HashMap<String, String>,
     #[serde(default = "default_provider_timeout")]
     pub timeout_seconds: u32,
+    /// Optional embeddings model for semantic RAG (OpenAI-compat
+    /// `/embeddings`). Empty/`None` disables vector search: retrieval stays
+    /// pure FTS5. Example: `text-embedding-3-small`.
+    #[serde(default)]
+    pub embeddings_model: Option<String>,
 }
 
 fn default_provider_enabled() -> bool {

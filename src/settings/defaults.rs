@@ -171,6 +171,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "anthropic".to_string(),
@@ -183,6 +184,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "gemini".to_string(),
@@ -195,6 +197,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "groq".to_string(),
@@ -207,6 +210,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "deepseek".to_string(),
@@ -219,6 +223,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "mistral".to_string(),
@@ -231,6 +236,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "openrouter".to_string(),
@@ -243,6 +249,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "zai".to_string(),
@@ -255,6 +262,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "cerebras".to_string(),
@@ -267,6 +275,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "moonshot".to_string(),
@@ -279,6 +288,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "meta".to_string(),
@@ -291,6 +301,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "local_slm".to_string(),
@@ -303,6 +314,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
         PostProcessProvider {
             id: "ollama".to_string(),
@@ -315,6 +327,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
             enabled: true,
             custom_headers: HashMap::new(),
             timeout_seconds: 120,
+            embeddings_model: None,
         },
     ];
 
@@ -330,6 +343,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
         enabled: true,
         custom_headers: HashMap::new(),
         timeout_seconds: 120,
+        embeddings_model: None,
     });
 
     // Custom provider always comes last
@@ -344,6 +358,7 @@ pub(crate) fn default_post_process_providers() -> Vec<PostProcessProvider> {
         enabled: true,
         custom_headers: HashMap::new(),
         timeout_seconds: 120,
+        embeddings_model: None,
     });
 
     providers

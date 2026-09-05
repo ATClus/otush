@@ -1067,6 +1067,126 @@ fn handle_sse_line(
     Ok(())
 }
 
+/// One vector of an OpenAI-compat `/embeddings` response.
+#[derive(Debug, Deserialize)]
+struct EmbeddingItem {
+    embedding: Vec<f32>,
+    #[allow(dead_code)]
+    index: usize,
+}
+
+#[derive(Debug, Deserialize)]
+struct EmbeddingsResponse {
+    data: Vec<EmbeddingItem>,
+}
+
+/// Embed one batch of texts with an OpenAI-compat `/embeddings` endpoint.
+///
+/// Returns one `Vec<f32>` per input, in order. Empty/whitespace inputs are
+/// sent as-is (providers reject truly empty strings, so they are replaced
+/// with a single space). Uses the shared client, headers, and timeout; no
+/// reasoning fields are sent (embeddings endpoints reject them).
+pub async fn fetch_embeddings(
+    provider: &PostProcessProvider,
+    api_key: String,
+    model: &str,
+    inputs: &[String],
+) -> Result<Vec<Vec<f32>>, String> {
+    if inputs.is_empty() {
+        return Ok(Vec::new());
+    }
+    let base_url = provider.base_url.trim_end_matches('/');
+    let url = format!("{}/embeddings", base_url);
+    let client = cached_client(provider, &api_key)?;
+
+    let safe_inputs: Vec<String> = inputs
+        .iter()
+        .map(|text| {
+            if text.trim().is_empty() {
+                " ".to_string()
+            } else {
+                text.clone()
+            }
+        })
+        .collect();
+    let request_body = serde_json::json!({
+        "model": model,
+        "input": safe_inputs,
+    });
+
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| report_reqwest_error("Embeddings request failed", &e))?;
+    let status = response.status();
+    if !status.is_success() {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|e| report_reqwest_error("Failed to read embeddings error", &e));
+        return Err(format!(
+            "Embeddings request failed with status {}: {}",
+            status, error_text
+        ));
+    }
+    let parsed: EmbeddingsResponse = response
+        .json()
+        .await
+        .map_err(|e| report_reqwest_error("Failed to parse embeddings response", &e))?;
+    if parsed.data.len() != inputs.len() {
+        return Err(format!(
+            "Embeddings response returned {} vectors for {} inputs",
+            parsed.data.len(),
+            inputs.len()
+        ));
+    }
+    Ok(parsed.data.into_iter().map(|item| item.embedding).collect())
+}
+
+/// Encode an embedding as little-endian `f32` bytes for SQLite BLOB storage.
+pub fn encode_embedding(embedding: &[f32]) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(embedding.len() * 4);
+    for value in embedding {
+        bytes.extend_from_slice(&value.to_le_bytes());
+    }
+    bytes
+}
+
+/// Decode little-endian `f32` bytes back into an embedding. Returns `None`
+/// on truncated or misaligned blobs (treat the chunk as unembedded).
+pub fn decode_embedding(bytes: &[u8]) -> Option<Vec<f32>> {
+    if bytes.is_empty() || !bytes.len().is_multiple_of(4) {
+        return None;
+    }
+    let mut out = Vec::with_capacity(bytes.len() / 4);
+    let (words, _) = bytes.as_chunks::<4>();
+    for word in words {
+        out.push(f32::from_le_bytes(*word));
+    }
+    Some(out)
+}
+
+/// Cosine similarity in `[-1, 1]` (0 for degenerate inputs). Pure function
+/// so hybrid ranking stays unit-testable without a database.
+pub fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
+    if a.len() != b.len() || a.is_empty() {
+        return 0.0;
+    }
+    let (mut dot, mut norm_a, mut norm_b) = (0.0f32, 0.0f32, 0.0f32);
+    for (x, y) in a.iter().zip(b.iter()) {
+        dot += x * y;
+        norm_a += x * x;
+        norm_b += y * y;
+    }
+    let denom = norm_a.sqrt() * norm_b.sqrt();
+    if denom <= f32::EPSILON {
+        return 0.0;
+    }
+    (dot / denom).clamp(-1.0, 1.0)
+}
+
 /// Fetch available models dynamically from an LLM provider API.
 /// Returns a list of clean model IDs suitable for chat completion.
 pub async fn fetch_models(
@@ -1291,6 +1411,7 @@ mod tests {
             enabled: true,
             custom_headers: std::collections::HashMap::new(),
             timeout_seconds: 10,
+            embeddings_model: None,
         }
     }
 
@@ -1582,5 +1703,75 @@ mod tests {
         prov.reasoning.effort = ReasoningEffort::XHigh;
         let json = request_json(build_reasoning_params(&prov, false));
         assert_eq!(json["reasoning_effort"], "xhigh");
+    }
+
+    #[test]
+    fn embedding_blob_round_trips() {
+        let original = vec![0.5f32, -1.25, 0.0, 3.75];
+        let bytes = encode_embedding(&original);
+        assert_eq!(bytes.len(), 16);
+        let decoded = decode_embedding(&bytes).expect("decodes");
+        assert_eq!(decoded, original);
+        // Corrupt blobs are rejected instead of panicking.
+        assert!(decode_embedding(&[]).is_none());
+        assert!(decode_embedding(&[1, 2, 3]).is_none());
+    }
+
+    #[test]
+    fn cosine_similarity_basics() {
+        assert!((cosine_similarity(&[1.0, 0.0], &[1.0, 0.0]) - 1.0).abs() < 1e-6);
+        assert!((cosine_similarity(&[1.0, 0.0], &[0.0, 1.0])).abs() < 1e-6);
+        assert!((cosine_similarity(&[1.0, 1.0], &[-1.0, -1.0]) + 1.0).abs() < 1e-6);
+        // Degenerate inputs score zero, never NaN.
+        assert_eq!(cosine_similarity(&[], &[]), 0.0);
+        assert_eq!(cosine_similarity(&[0.0, 0.0], &[1.0, 0.0]), 0.0);
+        assert_eq!(cosine_similarity(&[1.0], &[1.0, 2.0]), 0.0);
+    }
+
+    #[tokio::test]
+    async fn embeddings_request_returns_vectors_in_order() {
+        let body =
+            r#"{"data":[{"embedding":[0.1,0.2],"index":0},{"embedding":[0.3,0.4],"index":1}]}"#;
+        let base_url = serve_one_response("200 OK", body).await;
+        let vectors = fetch_embeddings(
+            &provider("openai", &base_url),
+            String::new(),
+            "text-embedding-3-small",
+            &["hello".to_string(), "world".to_string()],
+        )
+        .await
+        .expect("vectors");
+        assert_eq!(vectors.len(), 2);
+        assert_eq!(vectors[0], vec![0.1f32, 0.2]);
+        assert_eq!(vectors[1], vec![0.3f32, 0.4]);
+    }
+
+    #[tokio::test]
+    async fn embeddings_count_mismatch_is_an_error() {
+        let body = r#"{"data":[{"embedding":[0.1],"index":0}]}"#;
+        let base_url = serve_one_response("200 OK", body).await;
+        let err = fetch_embeddings(
+            &provider("openai", &base_url),
+            String::new(),
+            "text-embedding-3-small",
+            &["a".to_string(), "b".to_string()],
+        )
+        .await
+        .expect_err("mismatch");
+        assert!(err.contains("1 vectors for 2 inputs"));
+    }
+
+    #[tokio::test]
+    async fn embeddings_http_error_is_surfaced() {
+        let base_url = serve_one_response("401 Unauthorized", "bad key").await;
+        let err = fetch_embeddings(
+            &provider("openai", &base_url),
+            String::new(),
+            "text-embedding-3-small",
+            &["a".to_string()],
+        )
+        .await
+        .expect_err("http error");
+        assert!(err.contains("401"));
     }
 }

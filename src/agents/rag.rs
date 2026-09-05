@@ -1,10 +1,15 @@
-//! Basic local RAG: whitespace chunking + FTS5 retrieval.
+//! Hybrid local RAG: whitespace chunking + FTS5 + optional vector search.
 //!
-//! No embedding models, no new dependencies: documents are split into
-//! ~600-char chunks (120-char overlap) and indexed in the `rag_*` tables of
-//! the history database (see [`crate::managers::history::HistoryManager`]).
-//! Retrieval is BM25 over the FTS5 index, injected as a `system` block the
-//! model must cite as `[source: title]`.
+//! Documents are split into ~600-char chunks (120-char overlap) and indexed
+//! in the `rag_*` tables of the history database (see
+//! [`crate::managers::history::HistoryManager`]). Retrieval fuses two
+//! signals with reciprocal rank fusion (RRF):
+//! - BM25 over the FTS5 index (always available, no network);
+//! - cosine similarity over per-chunk embeddings (only when a provider has
+//!   an `embeddings_model` configured and chunks were backfilled).
+//!
+//! Passages are injected as a `system` block the model must cite as
+//! `[source: title]`.
 
 use crate::context::AppContext;
 
@@ -69,6 +74,100 @@ pub fn rag_search(ctx: &AppContext, query: &str, top_k: u32) -> Vec<RagPassage> 
             title: hit.title,
             uri: hit.uri,
             snippet: hit.snippet,
+        })
+        .collect()
+}
+
+/// RRF smoothing constant (standard 60).
+const RRF_K: f64 = 60.0;
+
+/// Fuse a BM25 ranking with a cosine-similarity ranking via reciprocal rank
+/// fusion. `bm25_ids` are chunk ids ordered best-first; `cosine` holds
+/// `(chunk_id, similarity)` pairs (order irrelevant). Returns chunk ids
+/// best-first. Pure function for unit tests.
+pub fn fuse_rankings(bm25_ids: &[i64], cosine: &[(i64, f32)], top_k: usize) -> Vec<i64> {
+    use std::collections::HashMap;
+    let mut scores: HashMap<i64, f64> = HashMap::new();
+    for (rank, id) in bm25_ids.iter().enumerate() {
+        *scores.entry(*id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+    }
+    let mut ordered: Vec<(i64, f32)> = cosine.to_vec();
+    ordered.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    for (rank, (id, _)) in ordered.iter().enumerate() {
+        *scores.entry(*id).or_default() += 1.0 / (RRF_K + rank as f64 + 1.0);
+    }
+    let mut fused: Vec<(i64, f64)> = scores.into_iter().collect();
+    fused.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
+    fused
+        .into_iter()
+        .take(top_k.max(1))
+        .map(|(id, _)| id)
+        .collect()
+}
+
+/// Hybrid retrieval entry used by the runner: BM25 candidates re-ranked with
+/// cosine similarity when `query_vector` and stored embeddings exist.
+///
+/// - `query_vector: None` → pure BM25 (no embeddings configured).
+/// - With a vector, the top `3 × top_k` BM25 candidates are fetched, their
+///   stored embeddings (tagged `embedding_model`) are scored, and RRF fuses
+///   both rankings. Chunks without embeddings keep their BM25-only score, so
+///   partially backfilled indexes degrade gracefully instead of dropping
+///   passages.
+pub fn hybrid_search(
+    ctx: &AppContext,
+    query: &str,
+    top_k: u32,
+    query_vector: Option<&[f32]>,
+    embedding_model: Option<&str>,
+) -> Vec<RagPassage> {
+    let top_k = top_k.clamp(1, 10);
+    let candidate_limit = top_k.saturating_mul(3).max(top_k);
+    let candidates = ctx.history.rag_search(query, candidate_limit);
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    let (Some(vector), Some(model)) = (query_vector, embedding_model) else {
+        return candidates
+            .into_iter()
+            .take(top_k as usize)
+            .map(|hit| RagPassage {
+                title: hit.title,
+                uri: hit.uri,
+                snippet: hit.snippet,
+            })
+            .collect();
+    };
+    let ids: Vec<i64> = candidates.iter().map(|hit| hit.chunk_id).collect();
+    let stored = ctx.history.rag_chunk_embeddings(&ids, model);
+    if stored.is_empty() {
+        return candidates
+            .into_iter()
+            .take(top_k as usize)
+            .map(|hit| RagPassage {
+                title: hit.title,
+                uri: hit.uri,
+                snippet: hit.snippet,
+            })
+            .collect();
+    }
+    let cosine: Vec<(i64, f32)> = stored
+        .iter()
+        .map(|(id, vec)| (*id, crate::llm_client::cosine_similarity(vector, vec)))
+        .collect();
+    let bm25_ids: Vec<i64> = candidates.iter().map(|hit| hit.chunk_id).collect();
+    let fused = fuse_rankings(&bm25_ids, &cosine, top_k as usize);
+    let by_id: std::collections::HashMap<i64, crate::managers::history::RagHit> = candidates
+        .into_iter()
+        .map(|hit| (hit.chunk_id, hit))
+        .collect();
+    fused
+        .into_iter()
+        .filter_map(|id| by_id.get(&id))
+        .map(|hit| RagPassage {
+            title: hit.title.clone(),
+            uri: hit.uri.clone(),
+            snippet: hit.snippet.clone(),
         })
         .collect()
 }
@@ -155,5 +254,28 @@ mod tests {
         let block = render_context_block(&passages).expect("block");
         assert!(block.len() <= MAX_RAG_CONTEXT_CHARS + 200);
         assert!(block.contains("truncated"));
+    }
+
+    #[test]
+    fn rrf_prefers_items_ranked_well_by_both_signals() {
+        // id 1 leads BM25, id 3 leads cosine: fusion must surface both
+        // above id 2 (weak in both).
+        let fused = fuse_rankings(&[1, 2, 3], &[(3, 0.9), (1, 0.5), (2, 0.1)], 3);
+        assert_eq!(fused.len(), 3);
+        assert!(fused[0] == 1 || fused[0] == 3);
+        assert_eq!(fused[2], 2);
+    }
+
+    #[test]
+    fn rrf_without_cosine_keeps_bm25_order() {
+        let fused = fuse_rankings(&[7, 8, 9], &[], 2);
+        assert_eq!(fused, vec![7, 8]);
+    }
+
+    #[test]
+    fn rrf_cosine_only_items_still_surface() {
+        // A chunk with no BM25 rank (id 5) but top cosine still fuses in.
+        let fused = fuse_rankings(&[1], &[(5, 0.99), (1, 0.1)], 2);
+        assert!(fused.contains(&5));
     }
 }

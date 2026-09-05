@@ -127,6 +127,13 @@ static MIGRATIONS: &[M] = &[
             INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
         END;",
     ),
+    // --- semantic RAG: per-chunk embedding vectors (NULL = not yet embedded) ---
+    // Stored as little-endian f32 bytes (see `llm_client::encode_embedding`);
+    // cosine similarity is computed in Rust over FTS candidates, so no
+    // native vector extension is needed. `embedding_model` guards against
+    // mixing vectors from different models in one ranking.
+    M::up("ALTER TABLE rag_chunks ADD COLUMN embedding BLOB;"),
+    M::up("ALTER TABLE rag_chunks ADD COLUMN embedding_model TEXT;"),
 ];
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
@@ -1119,6 +1126,13 @@ pub struct RagHit {
     pub rank: f64,
 }
 
+/// One chunk row needed for vector backfill: id + text + current model tag.
+#[derive(Clone, Debug)]
+pub struct RagChunkForEmbedding {
+    pub chunk_id: i64,
+    pub content: String,
+}
+
 impl HistoryManager {
     /// Create a chat for `agent_id` and return it.
     pub fn create_agent_chat(&self, agent_id: &str, title: &str) -> Result<AgentChat> {
@@ -1333,7 +1347,78 @@ impl HistoryManager {
         Ok(())
     }
 
-    /// BM25 full-text search over indexed chunks. Never fails the chat when
+    /// Chunks still missing an embedding for `model` (or tagged with a
+    /// different model), oldest first, capped for bounded background jobs.
+    pub fn rag_chunks_missing_embedding(
+        &self,
+        model: &str,
+        limit: u32,
+    ) -> Result<Vec<RagChunkForEmbedding>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, content FROM rag_chunks
+             WHERE embedding IS NULL OR embedding_model IS NULL OR embedding_model != ?1
+             ORDER BY id ASC LIMIT ?2",
+        )?;
+        let rows = stmt.query_map(params![model, limit.max(1) as i64], |row| {
+            Ok(RagChunkForEmbedding {
+                chunk_id: row.get(0)?,
+                content: row.get(1)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for row in rows {
+            out.push(row?);
+        }
+        Ok(out)
+    }
+
+    /// Store one chunk embedding (bytes from
+    /// [`crate::llm_client::encode_embedding`]) tagged with its model.
+    pub fn store_chunk_embedding(
+        &self,
+        chunk_id: i64,
+        model: &str,
+        embedding: &[u8],
+    ) -> Result<()> {
+        let conn = self.get_connection()?;
+        conn.execute(
+            "UPDATE rag_chunks SET embedding = ?1, embedding_model = ?2 WHERE id = ?3",
+            params![embedding, model, chunk_id],
+        )?;
+        Ok(())
+    }
+
+    /// Counts for the Agents-page status line: (total chunks, embedded with
+    /// `model`). `model` empty/`None` counts any embedding.
+    pub fn rag_embedding_stats(&self, model: Option<&str>) -> (u64, u64) {
+        let conn = match self.get_connection() {
+            Ok(conn) => conn,
+            Err(_) => return (0, 0),
+        };
+        let total: u64 = conn
+            .query_row("SELECT count(*) FROM rag_chunks", [], |row| row.get(0))
+            .unwrap_or(0);
+        let embedded: u64 = match model {
+            Some(model) if !model.trim().is_empty() => conn
+                .query_row(
+                    "SELECT count(*) FROM rag_chunks WHERE embedding IS NOT NULL AND embedding_model = ?1",
+                    params![model],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0),
+            _ => conn
+                .query_row(
+                    "SELECT count(*) FROM rag_chunks WHERE embedding IS NOT NULL",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0),
+        };
+        (total, embedded)
+    }
+
+    /// Hybrid retrieval: BM25 full-text search over indexed chunks. Never fails the chat when
     /// the index is missing/empty: returns an empty vec instead.
     pub fn rag_search(&self, query: &str, top_k: u32) -> Vec<RagHit> {
         let query = query.trim();
@@ -1382,6 +1467,46 @@ impl HistoryManager {
             Err(_) => return Vec::new(),
         };
         rows.filter_map(|r| r.ok()).collect()
+    }
+
+    /// Fetch stored embeddings for `chunk_ids` tagged with `model`, as
+    /// `(chunk_id, vector)`. Chunks without a matching embedding are absent;
+    /// callers fuse with the BM25 ranking (RRF) instead of failing.
+    pub fn rag_chunk_embeddings(&self, chunk_ids: &[i64], model: &str) -> Vec<(i64, Vec<f32>)> {
+        if chunk_ids.is_empty() {
+            return Vec::new();
+        }
+        let conn = match self.get_connection() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        let placeholders: Vec<String> = chunk_ids.iter().map(|_| "?".to_string()).collect();
+        let sql = format!(
+            "SELECT id, embedding FROM rag_chunks WHERE embedding_model = ?1 AND id IN ({})",
+            placeholders.join(",")
+        );
+        let mut params: Vec<&dyn rusqlite::ToSql> = Vec::with_capacity(chunk_ids.len() + 1);
+        params.push(&model);
+        for id in chunk_ids {
+            params.push(id);
+        }
+        let mut stmt = match conn.prepare(&sql) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params.as_slice(), |row| {
+            let id: i64 = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            Ok((id, blob))
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|row| row.ok())
+            .filter_map(|(id, blob)| {
+                crate::llm_client::decode_embedding(&blob).map(|vector| (id, vector))
+            })
+            .collect()
     }
 }
 
@@ -1627,5 +1752,56 @@ mod tests {
             .expect("empty rename");
         let chats = manager.list_agent_chats(None).expect("list");
         assert_eq!(chats[0].title, "New title");
+    }
+
+    #[test]
+    fn rag_embedding_backfill_and_hybrid_lookup() {
+        use crate::llm_client;
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = AppPaths {
+            data_dir: temp_dir.path().to_path_buf(),
+            resource_dir: temp_dir.path().to_path_buf(),
+            log_dir: temp_dir.path().to_path_buf(),
+        };
+        let manager = HistoryManager::new(&paths, EventBus::new()).expect("manager");
+        manager
+            .index_rag_document(
+                "suite_doc",
+                "9",
+                "Vector Doc",
+                "otush://suite_doc/9",
+                &[
+                    "Rust ownership moves values between scopes.".to_string(),
+                    "Sourdough starter needs daily feeding.".to_string(),
+                ],
+            )
+            .expect("index doc");
+
+        // Fresh chunks miss embeddings for the model.
+        let missing = manager
+            .rag_chunks_missing_embedding("test-model", 100)
+            .expect("missing");
+        assert_eq!(missing.len(), 2);
+        let (total, embedded) = manager.rag_embedding_stats(Some("test-model"));
+        assert_eq!((total, embedded), (2, 0));
+
+        // Store one vector; stats and filtered lookup follow.
+        let bytes = llm_client::encode_embedding(&[1.0, 0.0, 0.0]);
+        manager
+            .store_chunk_embedding(missing[0].chunk_id, "test-model", &bytes)
+            .expect("store");
+        let (_, embedded) = manager.rag_embedding_stats(Some("test-model"));
+        assert_eq!(embedded, 1);
+        let missing = manager
+            .rag_chunks_missing_embedding("test-model", 100)
+            .expect("missing");
+        assert_eq!(missing.len(), 1);
+        // Other models don't see this vector (no cross-model mixing).
+        assert!(manager
+            .rag_chunk_embeddings(&[missing[0].chunk_id], "other-model")
+            .is_empty());
+        let got = manager.rag_chunk_embeddings(&[missing[0].chunk_id - 1], "test-model");
+        assert_eq!(got.len(), 1);
+        assert_eq!(got[0].1, vec![1.0f32, 0.0, 0.0]);
     }
 }

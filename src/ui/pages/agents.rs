@@ -199,10 +199,28 @@ fn build_rag_group(ctx: &AppContext, page: &libadwaita::PreferencesPage) {
     // RAG knowledge group: index parsed documents into the local store.
     let rag_group = libadwaita::PreferencesGroup::new();
     rag_group.set_title("Local Knowledge (RAG)");
+    rag_group.set_hexpand(true);
+
+    // Status line: FTS5 always on; vectors depend on provider config.
+    let (total, embedded, model) = crate::commands::agents::rag_embedding_status(ctx);
+    let status_row = libadwaita::ActionRow::new();
+    status_row.set_title("Index status");
+    let status_subtitle = match model {
+        Some(model) => format!(
+            "{total} passages ({embedded} with vectors via {model}); retrieval is hybrid keyword + semantic"
+        ),
+        None => format!(
+            "{total} passages indexed; retrieval is keyword-only (set an Embeddings Model in Providers for semantic search)"
+        ),
+    };
+    status_row.set_subtitle(&status_subtitle);
+    status_row.set_activatable(false);
+    let status_icon = gtk4::Image::from_icon_name("info-outline-symbolic");
+    status_row.add_prefix(&status_icon);
+    rag_group.add(&status_row);
     rag_group.set_description(Some(
         "Index parsed documents so agents can cite them. Retrieval is local full-text search (FTS5).",
     ));
-    rag_group.set_hexpand(true);
 
     let index_row = libadwaita::ActionRow::new();
     index_row.set_title("Index all parsed documents");

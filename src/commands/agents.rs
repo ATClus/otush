@@ -386,6 +386,8 @@ pub fn export_chat_markdown(ctx: &AppContext, chat_id: i64) -> CommandResult<Str
 }
 
 /// Index parsed suite documents (`suite_docs` ids) into the RAG store.
+/// Chunks land without embeddings; when a provider configures an
+/// `embeddings_model`, a background backfill is kicked off automatically.
 pub fn index_suite_docs(ctx: &AppContext, doc_ids: &[i64]) -> CommandResult<usize> {
     let docs = ctx.history.list_docs().map_err(CommandError::Backend)?;
     let wanted: Vec<_> = docs
@@ -401,10 +403,109 @@ pub fn index_suite_docs(ctx: &AppContext, doc_ids: &[i64]) -> CommandResult<usiz
             )
         })
         .collect();
-    crate::agents::rebuild_index_for_docs(ctx, &wanted).map_err(CommandError::ToolFailed)
+    let indexed =
+        crate::agents::rebuild_index_for_docs(ctx, &wanted).map_err(CommandError::ToolFailed)?;
+    backfill_embeddings(ctx);
+    Ok(indexed)
 }
 
 /// Clear the whole RAG index.
 pub fn clear_rag_index(ctx: &AppContext) -> CommandResult<()> {
     ctx.history.clear_rag_index().map_err(CommandError::Backend)
+}
+
+/// Embedding status for the Agents page: (total chunks, embedded chunks,
+/// active model or `None`).
+pub fn rag_embedding_status(ctx: &AppContext) -> (u64, u64, Option<String>) {
+    let settings = ctx.settings();
+    let model = settings
+        .post_process_providers
+        .iter()
+        .filter(|p| p.enabled)
+        .filter_map(|p| {
+            p.embeddings_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+                .map(|m| (p.id.clone(), m.to_string()))
+        })
+        .next()
+        .map(|(_, model)| model);
+    let (total, embedded) = ctx.history.rag_embedding_stats(model.as_deref());
+    (total, embedded, model)
+}
+
+/// Kick off a bounded background job embedding chunks that miss vectors for
+/// the first enabled provider with an `embeddings_model`. No-op when no
+/// provider configures one (pure FTS5 mode) or when nothing is missing.
+/// Batches of 32, at most 256 chunks per kick, so a huge re-index cannot
+/// stall the runtime; the next kick (next indexing or chat turn) continues.
+pub fn backfill_embeddings(ctx: &AppContext) {
+    let settings = ctx.settings();
+    let Some((provider, model, api_key)) = settings
+        .post_process_providers
+        .iter()
+        .filter(|p| p.enabled)
+        .filter_map(|p| {
+            let model = p
+                .embeddings_model
+                .as_deref()
+                .map(str::trim)
+                .filter(|m| !m.is_empty())?;
+            let key = settings
+                .post_process_api_keys
+                .get(&p.id)
+                .cloned()
+                .unwrap_or_default();
+            Some((p.clone(), model.to_string(), key))
+        })
+        .next()
+    else {
+        return;
+    };
+    if api_key.trim().is_empty() && provider.id != "custom" && provider.id != "ollama" {
+        return;
+    }
+    let missing = ctx
+        .history
+        .rag_chunks_missing_embedding(&model, 256)
+        .unwrap_or_default();
+    if missing.is_empty() {
+        return;
+    }
+    let task_ctx = ctx.clone();
+    crate::runtime::spawn(async move {
+        for batch in missing.chunks(32) {
+            let inputs: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+            let vectors = match crate::llm_client::fetch_embeddings(
+                &provider,
+                api_key.clone(),
+                &model,
+                &inputs,
+            )
+            .await
+            {
+                Ok(vectors) => vectors,
+                Err(err) => {
+                    task_ctx.report_error("rag_embeddings", err);
+                    return;
+                }
+            };
+            for (chunk, vector) in batch.iter().zip(vectors.iter()) {
+                let bytes = crate::llm_client::encode_embedding(vector);
+                if let Err(err) =
+                    task_ctx
+                        .history
+                        .store_chunk_embedding(chunk.chunk_id, &model, &bytes)
+                {
+                    task_ctx.report_error("rag_embeddings", err);
+                    return;
+                }
+            }
+        }
+        task_ctx.bus.send(AppEvent::SettingsChanged {
+            setting: "rag_index".to_string(),
+            value: serde_json::json!({ "embedded": true }),
+        });
+    });
 }
