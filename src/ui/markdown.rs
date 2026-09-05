@@ -191,37 +191,28 @@ pub fn ensure_tags(table: &gtk4::TextTagTable) {
     let light_blue = gtk4::gdk::RGBA::parse("#62a0ea").unwrap_or(gtk4::gdk::RGBA::BLUE);
 
     let defs: Vec<(&str, gtk4::TextTag)> = vec![
-        (
-            "md_h1",
-            gtk4::TextTag::builder().scale(1.4).weight(700).build(),
-        ),
-        (
-            "md_h2",
-            gtk4::TextTag::builder().scale(1.2).weight(700).build(),
-        ),
-        (
-            "md_h3",
-            gtk4::TextTag::builder().scale(1.1).weight(700).build(),
-        ),
-        ("md_bold", gtk4::TextTag::builder().weight(700).build()),
+        ("md_h1", tag_builder("md_h1").scale(1.4).weight(700).build()),
+        ("md_h2", tag_builder("md_h2").scale(1.2).weight(700).build()),
+        ("md_h3", tag_builder("md_h3").scale(1.1).weight(700).build()),
+        ("md_bold", tag_builder("md_bold").weight(700).build()),
         (
             "md_italic",
-            gtk4::TextTag::builder().style(pango::Style::Italic).build(),
+            tag_builder("md_italic").style(pango::Style::Italic).build(),
         ),
         (
             "md_code",
-            gtk4::TextTag::builder().family("monospace").build(),
+            tag_builder("md_code").family("monospace").build(),
         ),
         (
             "md_codeblock",
-            gtk4::TextTag::builder()
+            tag_builder("md_codeblock")
                 .family("monospace")
                 .left_margin(12)
                 .build(),
         ),
         (
             "md_quote",
-            gtk4::TextTag::builder()
+            tag_builder("md_quote")
                 .style(pango::Style::Italic)
                 .foreground_rgba(&gray)
                 .left_margin(12)
@@ -229,34 +220,39 @@ pub fn ensure_tags(table: &gtk4::TextTagTable) {
         ),
         (
             "md_link",
-            gtk4::TextTag::builder().foreground_rgba(&blue).build(),
+            tag_builder("md_link").foreground_rgba(&blue).build(),
         ),
         (
             "md_hashtag",
-            gtk4::TextTag::builder()
+            tag_builder("md_hashtag")
                 .weight(700)
                 .foreground_rgba(&blue)
                 .build(),
         ),
         (
             "md_bullet",
-            gtk4::TextTag::builder()
+            tag_builder("md_bullet")
                 .weight(700)
                 .foreground_rgba(&light_blue)
                 .build(),
         ),
         (
             "md_dim",
-            gtk4::TextTag::builder().foreground_rgba(&gray).build(),
+            tag_builder("md_dim").foreground_rgba(&gray).build(),
         ),
     ];
     for (name, tag) in defs {
         if table.lookup(name).is_some() {
             continue;
         }
-        tag.set_property("name", name);
         table.add(&tag);
     }
+}
+
+/// Builder pre-named: `GtkTextTag:name` is construct-only, so the name must
+/// travel with construction — setting it afterwards aborts the process.
+fn tag_builder(name: &str) -> gtk4::builders::TextTagBuilder {
+    gtk4::TextTag::builder().name(name)
 }
 
 /// Render `markdown` into `buffer`, replacing its content. Tags are ensured
