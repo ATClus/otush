@@ -5,6 +5,7 @@
 //! derivation from the first line of the note, optional hashtag parsing,
 //! and a collapsible sidebar complement to browse and search saved notes.
 
+use super::markdown as md;
 use crate::context::AppContext;
 use gdk4::prelude::*;
 use gtk4::prelude::*;
@@ -221,6 +222,13 @@ fn build_and_present_notes_palette(ctx: &AppContext) {
     pin_btn.add_css_class("flat");
     header_bar.pack_end(&pin_btn);
 
+    // Markdown Preview Toggle (renders headings, lists, code, links…)
+    let preview_toggle = gtk4::ToggleButton::new();
+    preview_toggle.set_icon_name("eye-open-negative-filled-symbolic");
+    preview_toggle.set_tooltip_text(Some("Preview rendered Markdown"));
+    preview_toggle.add_css_class("flat");
+    header_bar.pack_end(&preview_toggle);
+
     main_box.append(&header_bar);
 
     // ========================================================================
@@ -284,6 +292,14 @@ fn build_and_present_notes_palette(ctx: &AppContext) {
     text_view.set_bottom_margin(20);
     editor_scrolled.set_child(Some(&text_view));
     editor_box.append(&editor_scrolled);
+
+    // Read-only rendered preview (shares the editor's content; the editor
+    // buffer stays the single source of truth for auto-save).
+    let preview_view = md::markdown_textview("");
+    preview_view.set_left_margin(24);
+    preview_view.set_right_margin(24);
+    preview_view.set_top_margin(20);
+    preview_view.set_bottom_margin(20);
 
     // Subtle bottom status bar
     let status_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
@@ -587,6 +603,38 @@ fn build_and_present_notes_palette(ctx: &AppContext) {
         });
     }
 
+    // Markdown preview toggle: swap the scrolled child between the editor
+    // and a rendered read-only view of the same content. The editor buffer
+    // is untouched, so auto-save keeps working while previewing.
+    let refresh_preview = {
+        let edit_view = text_view.clone();
+        let rendered = preview_view.clone();
+        let scrolled = editor_scrolled.clone();
+        let toggle_btn = preview_toggle.clone();
+        Rc::new(move || {
+            let buf = edit_view.buffer();
+            let (start, end) = buf.bounds();
+            let content = buf.text(&start, &end, true).to_string();
+            md::render_into_buffer(&rendered.buffer(), &content);
+            if toggle_btn.is_active() {
+                scrolled.set_child(Some(&rendered));
+            } else {
+                scrolled.set_child(Some(&edit_view));
+            }
+        })
+    };
+    {
+        let refresh = refresh_preview.clone();
+        let edit_back = text_view.clone();
+        let toggle = preview_toggle.clone();
+        preview_toggle.connect_toggled(move |_| {
+            refresh();
+            if !toggle.is_active() {
+                edit_back.grab_focus();
+            }
+        });
+    }
+
     // Connect text buffer changed for debounced auto-save and stats
     {
         let buf = buffer.clone();
@@ -596,6 +644,10 @@ fn build_and_present_notes_palette(ctx: &AppContext) {
         let stats_lbl = stats_label.clone();
         let flush = do_flush_save.clone();
         let suppress_changed_watch = suppress_changed.clone();
+        // Live preview refresh while typing (only re-renders when the
+        // preview is visible; the editor buffer is the source of truth).
+        let live_preview = refresh_preview.clone();
+        let preview_visible = preview_toggle.clone();
 
         buffer.connect_changed(move |_| {
             if suppress_changed_watch.get() {
@@ -606,6 +658,9 @@ fn build_and_present_notes_palette(ctx: &AppContext) {
             let text = buf.text(&start, &end, true).to_string();
 
             stats_lbl.set_text(&format_note_stats(&text));
+            if preview_visible.is_active() {
+                live_preview();
+            }
 
             // Dynamic title from first line
             let (title, _) = parse_note_content(&text);

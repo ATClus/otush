@@ -11,6 +11,7 @@
 //! [`AppEvent`](crate::context::AppEvent) marshaled with
 //! `glib::MainContext::default().invoke`.
 
+use super::markdown as md;
 use crate::context::{AppContext, AppEvent};
 use crate::settings;
 use gtk4::prelude::*;
@@ -671,7 +672,7 @@ fn build_chat_page(
                                     .and_then(|w| w.into_weak_ref().upgrade());
                             }
                             if let Some(label) = live {
-                                label.set_text(&message.content);
+                                promote_live_label_to_markdown(&label, &message.content);
                                 return;
                             }
                             if let Some(transcript) = transcript_weak.into_weak_ref().upgrade() {
@@ -1026,16 +1027,27 @@ fn append_bubble(transcript: &gtk4::ListBox, who: &str, text: &str, is_agent: bo
     let card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     card.add_css_class("card");
     card.set_margin_bottom(2);
-    let body = gtk4::Label::new(Some(text));
-    body.set_wrap(true);
-    body.set_wrap_mode(gtk4::pango::WrapMode::Word);
-    body.set_selectable(true);
-    body.set_xalign(0.0);
-    body.set_margin_start(12);
-    body.set_margin_end(12);
-    body.set_margin_top(10);
-    body.set_margin_bottom(10);
-    card.append(&body);
+    if is_agent {
+        // Assistant answers are markdown: render headings, emphasis, code,
+        // lists, quotes, and links into a read-only TextView.
+        let body = md::markdown_textview(text);
+        body.set_margin_start(12);
+        body.set_margin_end(12);
+        body.set_margin_top(10);
+        body.set_margin_bottom(10);
+        card.append(&body);
+    } else {
+        let body = gtk4::Label::new(Some(text));
+        body.set_wrap(true);
+        body.set_wrap_mode(gtk4::pango::WrapMode::Word);
+        body.set_selectable(true);
+        body.set_xalign(0.0);
+        body.set_margin_start(12);
+        body.set_margin_end(12);
+        body.set_margin_top(10);
+        body.set_margin_bottom(10);
+        card.append(&body);
+    }
 
     if is_agent {
         let actions = gtk4::Box::new(gtk4::Orientation::Horizontal, 4);
@@ -1055,6 +1067,26 @@ fn append_bubble(transcript: &gtk4::ListBox, who: &str, text: &str, is_agent: bo
 
     row.append(&card);
     transcript.append(&row);
+}
+
+/// Swap a live plain-text body label for a rendered markdown view, keeping
+/// its position inside `card`. The streaming label stays plain text (fast
+/// appends); the final pass renders markdown once per turn.
+fn promote_live_label_to_markdown(label: &gtk4::Label, text: &str) {
+    let parent = match label.parent().and_downcast::<gtk4::Box>() {
+        Some(parent) => parent,
+        None => {
+            label.set_text(text);
+            return;
+        }
+    };
+    let view = md::markdown_textview(text);
+    view.set_margin_start(12);
+    view.set_margin_end(12);
+    view.set_margin_top(10);
+    view.set_margin_bottom(10);
+    parent.insert_child_after(&view, Some(label));
+    parent.remove(label);
 }
 
 /// Append an empty agent bubble and return its body label for token fills.
@@ -1102,6 +1134,8 @@ fn st_live_bubble(state: &Arc<Mutex<ChatUi>>, transcript: &gtk4::ListBox) {
 }
 
 /// Replace the last assistant bubble text (placeholder "…" → final answer).
+/// The placeholder is a plain label; the final answer renders markdown, so
+/// the old label is swapped for a rendered view in place.
 fn replace_last_assistant(transcript: &gtk4::ListBox, text: &str) {
     let mut last_body: Option<gtk4::Label> = None;
     let mut child = transcript.first_child();
@@ -1112,7 +1146,7 @@ fn replace_last_assistant(transcript: &gtk4::ListBox, text: &str) {
         collect_labels(&row, &mut last_body);
     }
     if let Some(label) = last_body {
-        label.set_text(text);
+        promote_live_label_to_markdown(&label, text);
     } else {
         append_bubble(transcript, "Assistant", text, true);
     }
