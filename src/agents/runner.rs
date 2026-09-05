@@ -7,7 +7,7 @@
 //!
 //! The LLM and tool executor are injectable so the loop is unit-testable
 //! without network access; production wires
-//! [`crate::llm_client::send_chat_messages_streamed`] and [`crate::agents::tools`].
+//! `llm_client::send_chat_messages_streamed` and [`crate::agents::tools`].
 
 use crate::agents::rag;
 use crate::agents::types::{AgentResolved, ResolvedTool};
@@ -46,7 +46,7 @@ pub struct RunOutcome {
 }
 
 /// LLM backend for the loop. Production uses
-/// [`crate::llm_client::send_chat_messages_streamed`]; the optional
+/// `llm_client::send_chat_messages_streamed`; the optional
 /// `stream` sink receives SSE content deltas for live UI rendering.
 pub trait LlmBackend: Send + Sync {
     fn chat(

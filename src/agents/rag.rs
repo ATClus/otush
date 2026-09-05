@@ -2,7 +2,7 @@
 //!
 //! Documents are split into ~600-char chunks (120-char overlap) and indexed
 //! in the `rag_*` tables of the history database (see
-//! [`crate::managers::history::HistoryManager`]). Retrieval fuses two
+//! `HistoryManager` (see `managers::history`)). Retrieval fuses two
 //! signals with reciprocal rank fusion (RRF):
 //! - BM25 over the FTS5 index (always available, no network);
 //! - cosine similarity over per-chunk embeddings (only when a provider has
@@ -62,20 +62,6 @@ pub struct RagPassage {
     pub title: String,
     pub uri: String,
     pub snippet: String,
-}
-
-/// BM25 search over the local index. Returns at most `top_k` passages;
-/// an empty vec means "no local context" (the chat proceeds regardless).
-pub fn rag_search(ctx: &AppContext, query: &str, top_k: u32) -> Vec<RagPassage> {
-    ctx.history
-        .rag_search(query, top_k)
-        .into_iter()
-        .map(|hit| RagPassage {
-            title: hit.title,
-            uri: hit.uri,
-            snippet: hit.snippet,
-        })
-        .collect()
 }
 
 /// RRF smoothing constant (standard 60).
