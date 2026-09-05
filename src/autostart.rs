@@ -8,13 +8,121 @@
 use crate::context::AppContext;
 
 const AUTOSTART_DIR: &str = "autostart";
-const DESKTOP_FILE: &str = "otush.desktop";
+/// Canonical autostart entry: matches the application ID so GNOME Tweaks,
+/// `gnome-session-properties`, and the `.deb`-installed desktop entry all
+/// refer to the same file.
+const DESKTOP_FILE: &str = "com.clusterat.otush.desktop";
+/// Pre-rebrand name (pre-1.x). Migrated automatically; never written again.
+const LEGACY_DESKTOP_FILE: &str = "otush.desktop";
 
 fn autostart_file_path() -> Option<std::path::PathBuf> {
     let config_dir = std::env::var_os("XDG_CONFIG_HOME")
         .map(std::path::PathBuf::from)
         .or_else(dirs::config_dir)?;
     Some(config_dir.join(AUTOSTART_DIR).join(DESKTOP_FILE))
+}
+
+fn legacy_autostart_file_path() -> Option<std::path::PathBuf> {
+    let config_dir = std::env::var_os("XDG_CONFIG_HOME")
+        .map(std::path::PathBuf::from)
+        .or_else(dirs::config_dir)?;
+    Some(config_dir.join(AUTOSTART_DIR).join(LEGACY_DESKTOP_FILE))
+}
+
+/// Read the effective autostart state from the file, honoring the XDG keys
+/// the desktop reads: missing file or `Hidden=true` means off, anything
+/// else means on. `X-GNOME-Autostart-enabled` is GNOME-specific; absence
+/// does not mean disabled.
+fn read_autostart_file_state(path: &std::path::Path) -> Option<bool> {
+    let content = std::fs::read_to_string(path).ok()?;
+    for line in content.lines() {
+        let line = line.trim();
+        if line.eq_ignore_ascii_case("Hidden=true") {
+            return Some(false);
+        }
+    }
+    Some(true)
+}
+
+/// Reconcile the autostart entry with the in-app setting at startup.
+///
+/// Called on every launch (before the GTK shell). Handles all four cases:
+/// - setting on + file present: refresh the entry (repairs `Exec` after a
+///   `.deb` upgrade moves the binary).
+/// - setting on + file missing: recreate it. This is the reported bug: the
+///   user enables autostart in GNOME Tweaks/System Settings, which writes
+///   `Hidden=false` (or its own copy of the entry); a later `.deb` upgrade
+///   refreshes `/usr/share/applications` and GNOME resets the override —
+///   the in-app setting was already off, so nothing recreated the file.
+///   Now the in-app setting is the source of truth and always wins.
+/// - setting off + file present: remove it (external tool re-enabled it).
+/// - setting off + file missing: nothing to do.
+///
+/// Also migrates the pre-rebrand `otush.desktop` to the canonical
+/// `com.clusterat.otush.desktop` (same name as the application ID and the
+/// `.deb`-installed entry), so Tweaks and the app manage one file.
+pub fn ensure_autostart_consistency(ctx: &AppContext) {
+    // One-way migration first: legacy file wins over absence, then goes away.
+    if let (Some(legacy), Some(current)) = (legacy_autostart_file_path(), autostart_file_path()) {
+        if legacy.exists() && !current.exists() {
+            if let Some(parent) = current.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            if std::fs::rename(&legacy, &current).is_err() {
+                let _ = std::fs::copy(&legacy, &current);
+                let _ = std::fs::remove_file(&legacy);
+            }
+            log::info!("Migrated autostart entry to {}", current.display());
+        } else if legacy.exists() {
+            let _ = std::fs::remove_file(&legacy);
+        }
+    }
+
+    let wanted = ctx.settings().autostart_enabled;
+    let path = match autostart_file_path() {
+        Some(path) => path,
+        None => {
+            log::warn!("Could not resolve the autostart directory");
+            return;
+        }
+    };
+    let present = path.exists();
+    let file_enabled = present && read_autostart_file_state(&path).unwrap_or(false);
+    match reconcile_decision(wanted, present, file_enabled) {
+        ReconcileAction::Refresh => apply_autostart(ctx, true),
+        ReconcileAction::Recreate => {
+            log::info!("Recreating missing autostart entry (setting is on)");
+            apply_autostart(ctx, true);
+        }
+        ReconcileAction::Remove => {
+            log::info!("Removing external autostart entry (setting is off)");
+            apply_autostart(ctx, false);
+        }
+        ReconcileAction::Nothing => {}
+    }
+}
+
+/// Startup reconciliation outcome. Pure decision table over (setting,
+/// file present, file enabled) — unit-tested below without touching disk.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ReconcileAction {
+    /// Setting on + healthy file: rewrite so `Exec` tracks the binary.
+    Refresh,
+    /// Setting on + missing/disabled file: recreate.
+    Recreate,
+    /// Setting off + enabled file: remove.
+    Remove,
+    /// Setting off + no file: nothing to do.
+    Nothing,
+}
+
+fn reconcile_decision(wanted: bool, present: bool, file_enabled: bool) -> ReconcileAction {
+    match (wanted, present, file_enabled) {
+        (true, true, true) => ReconcileAction::Refresh,
+        (true, _, _) => ReconcileAction::Recreate,
+        (false, true, true) => ReconcileAction::Remove,
+        (false, _, _) => ReconcileAction::Nothing,
+    }
 }
 
 /// Apply the user's autostart preference by writing (or removing) the XDG
@@ -158,4 +266,67 @@ pub fn ensure_desktop_entry_registered() {
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+
+    #[test]
+    fn decision_table_covers_all_states() {
+        // Setting on: healthy file refreshes, anything else recreates.
+        assert_eq!(
+            reconcile_decision(true, true, true),
+            ReconcileAction::Refresh
+        );
+        assert_eq!(
+            reconcile_decision(true, false, false),
+            ReconcileAction::Recreate
+        );
+        assert_eq!(
+            reconcile_decision(true, true, false),
+            ReconcileAction::Recreate
+        );
+        // Setting off: enabled file is removed, otherwise nothing.
+        assert_eq!(
+            reconcile_decision(false, true, true),
+            ReconcileAction::Remove
+        );
+        assert_eq!(
+            reconcile_decision(false, false, false),
+            ReconcileAction::Nothing
+        );
+        assert_eq!(
+            reconcile_decision(false, true, false),
+            ReconcileAction::Nothing
+        );
+    }
+
+    #[test]
+    fn hidden_true_reads_as_disabled() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("entry.desktop");
+        let mut file = std::fs::File::create(&path).expect("create");
+        writeln!(file, "[Desktop Entry]\nHidden=true").expect("write");
+        assert_eq!(read_autostart_file_state(&path), Some(false));
+    }
+
+    #[test]
+    fn plain_entry_reads_as_enabled() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("entry.desktop");
+        let mut file = std::fs::File::create(&path).expect("create");
+        writeln!(file, "[Desktop Entry]\nHidden=false").expect("write");
+        assert_eq!(read_autostart_file_state(&path), Some(true));
+    }
+
+    #[test]
+    fn missing_file_reads_as_none() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        assert_eq!(
+            read_autostart_file_state(&dir.path().join("nope.desktop")),
+            None
+        );
+    }
 }

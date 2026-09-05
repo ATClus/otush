@@ -393,10 +393,9 @@ pub fn run(cli_args: CliArgs) {
     glib::set_prgname(Some("com.clusterat.otush"));
     autostart::ensure_desktop_entry_registered();
 
-    // Ensure autostart entry is synchronized if enabled in settings
-    if ctx.settings().autostart_enabled {
-        autostart::apply_autostart(&ctx, true);
-    }
+    // Ensure autostart entry agrees with the in-app setting (recreates it
+    // when a .deb upgrade or an external toggle removed it behind our back).
+    autostart::ensure_autostart_consistency(&ctx);
 
     // Non-headless: run the native GNOME shell (GTK4/libadwaita).
     crate::app::run_gtk(ctx, &cli_args);
