@@ -6,7 +6,7 @@
 
 pub mod evdev;
 mod handler;
-mod portal;
+pub mod portal;
 pub mod ptt;
 
 use crate::context::{AppContext, AppEvent};
@@ -16,7 +16,7 @@ use crate::settings::{
     VadBackend,
 };
 use crate::tray;
-use log::{debug, error, warn};
+use log::{error, warn};
 use serde::Serialize;
 
 /// Initialize shortcuts using XDG Desktop Portal and Direct Evdev Keyboard Listener
@@ -43,6 +43,11 @@ pub fn register_shortcut(ctx: &AppContext, binding: ShortcutBinding) -> Result<(
 /// Unregister a shortcut
 pub fn unregister_shortcut(ctx: &AppContext, binding: ShortcutBinding) -> Result<(), String> {
     portal::unregister_shortcut(ctx, binding)
+}
+
+/// Open GNOME System Settings to configure shortcuts directly
+pub fn open_gnome_settings(ctx: &AppContext) {
+    portal::open_gnome_settings(ctx);
 }
 
 // ============================================================================
@@ -169,7 +174,9 @@ pub fn change_binding(
     settings.bindings.insert(id, updated_binding.clone());
 
     // Save the settings
-    settings::write_settings(ctx, settings);
+    settings::write_settings(ctx, settings.clone());
+    portal::sync_bindings_to_gnome_gsettings(ctx);
+    portal::sync_desired_bindings(&settings);
     ctx.notify_setting_changed("bindings", serde_json::json!(&updated_binding));
 
     // Return the updated binding
@@ -228,7 +235,9 @@ pub fn add_custom_binding(
     }
 
     settings.bindings.insert(id, shortcut_binding.clone());
-    settings::write_settings(ctx, settings);
+    settings::write_settings(ctx, settings.clone());
+    portal::sync_bindings_to_gnome_gsettings(ctx);
+    portal::sync_desired_bindings(&settings);
     ctx.notify_setting_changed("bindings", serde_json::json!(&shortcut_binding));
 
     Ok(BindingResponse {
@@ -242,48 +251,26 @@ pub fn remove_custom_binding(ctx: &AppContext, id: &str) -> Result<(), String> {
     let mut settings = settings::get_settings(ctx);
     if let Some(binding) = settings.bindings.remove(id) {
         let _ = unregister_shortcut(ctx, binding);
+        settings::write_settings(ctx, settings.clone());
+        portal::sync_bindings_to_gnome_gsettings(ctx);
+        portal::sync_desired_bindings(&settings);
         ctx.notify_setting_changed("bindings", serde_json::json!(&settings.bindings));
-        settings::write_settings(ctx, settings);
     }
     Ok(())
 }
 
-/// Unregister every binding while the user is recording a new shortcut in
-/// the UI, so no existing shortcut can fire — or swallow the keystrokes —
-/// mid-capture. The "cancel" binding is untouched: it is managed dynamically
-/// by the recording lifecycle.
-pub fn suspend_all_shortcuts(ctx: &AppContext) {
+/// Temporarily suspend global shortcut execution while the user is recording a new shortcut in
+/// the UI, so no existing shortcut can fire mid-capture.
+pub fn suspend_all_shortcuts(_ctx: &AppContext) {
     handler::set_shortcuts_suspended(true);
-    for (id, binding) in settings::get_bindings(ctx) {
-        if id == "cancel" {
-            continue;
-        }
-        if let Err(e) = unregister_shortcut(ctx, binding) {
-            debug!(
-                "suspend_all_shortcuts: could not unregister '{}': {}",
-                id, e
-            );
-        }
-    }
 }
 
-/// Re-register every binding from settings after shortcut recording ends.
-/// Registering an already-registered shortcut fails cleanly in both
-/// implementations, so this is idempotent and safe on every exit path.
+/// Re-enable shortcut execution after shortcut recording ends and synchronize bindings.
 pub fn resume_all_shortcuts(ctx: &AppContext) {
     handler::set_shortcuts_suspended(false);
     let settings = get_settings(ctx);
-    for (id, binding) in &settings.bindings {
-        if id == "cancel" {
-            continue;
-        }
-        if id == "transcribe_with_post_process" && !settings.post_process_enabled {
-            continue;
-        }
-        if let Err(e) = register_shortcut(ctx, binding.clone()) {
-            debug!("resume_all_shortcuts: could not register '{}': {}", id, e);
-        }
-    }
+    portal::sync_bindings_to_gnome_gsettings(ctx);
+    portal::sync_desired_bindings(&settings);
 }
 
 /// Temporarily unregister all bindings while the user is recording a
@@ -1074,6 +1061,10 @@ pub fn move_post_process_provider_priority(
 
     settings::write_settings(ctx, settings);
     ctx.notify_setting_changed("post_process_providers", serde_json::json!("reordered"));
+    ctx.notify_setting_changed(
+        "post_process_providers_reordered",
+        serde_json::json!(provider_id),
+    );
     Ok(())
 }
 
@@ -1090,7 +1081,11 @@ pub fn toggle_post_process_provider_enabled(
     {
         p.enabled = enabled;
         settings::write_settings(ctx, settings);
-        ctx.notify_setting_changed("post_process_providers", serde_json::json!(provider_id));
+        ctx.notify_setting_changed("post_process_providers", serde_json::json!(&provider_id));
+        ctx.notify_setting_changed(
+            "post_process_provider_enabled",
+            serde_json::json!(&provider_id),
+        );
         Ok(())
     } else {
         Err(format!("Provider '{}' not found", provider_id))
@@ -1343,11 +1338,11 @@ pub fn toggle_transcription_provider_enabled(
     let mut settings = settings::get_settings(ctx);
     if let Some(p) = settings.transcription_provider_mut(&provider_id) {
         p.enabled = enabled;
+        settings::write_settings(ctx, settings);
         ctx.notify_setting_changed(
             "transcription_provider_enabled",
             serde_json::json!(&provider_id),
         );
-        settings::write_settings(ctx, settings);
         Ok(())
     } else {
         Err(format!(
@@ -1366,8 +1361,8 @@ pub fn change_transcription_api_key_setting(
     settings
         .transcription_api_keys
         .insert(provider_id.clone(), key);
-    ctx.notify_setting_changed("transcription_api_keys", serde_json::json!(&provider_id));
     settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("transcription_api_keys", serde_json::json!(&provider_id));
     Ok(())
 }
 
@@ -1383,8 +1378,8 @@ pub fn change_transcription_model_setting(
     settings
         .transcription_models
         .insert(provider_id.clone(), model);
-    ctx.notify_setting_changed("transcription_models", serde_json::json!(&provider_id));
     settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("transcription_models", serde_json::json!(&provider_id));
     Ok(())
 }
 
@@ -1396,11 +1391,33 @@ pub fn change_transcription_base_url_setting(
     let mut settings = settings::get_settings(ctx);
     if let Some(p) = settings.transcription_provider_mut(&provider_id) {
         p.base_url = base_url;
+        settings::write_settings(ctx, settings);
         ctx.notify_setting_changed(
             "transcription_provider_base_url",
             serde_json::json!(&provider_id),
         );
+        Ok(())
+    } else {
+        Err(format!(
+            "Transcription provider '{}' not found",
+            provider_id
+        ))
+    }
+}
+
+pub fn change_transcription_timeout_setting(
+    ctx: &AppContext,
+    provider_id: String,
+    timeout_seconds: u32,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings.transcription_provider_mut(&provider_id) {
+        p.timeout_seconds = timeout_seconds;
         settings::write_settings(ctx, settings);
+        ctx.notify_setting_changed(
+            "transcription_provider_timeout",
+            serde_json::json!(&provider_id),
+        );
         Ok(())
     } else {
         Err(format!(
@@ -1419,8 +1436,8 @@ pub fn update_deepgram_config(
         let mut cfg = p.deepgram.clone().unwrap_or_default();
         update_fn(&mut cfg);
         p.deepgram = Some(cfg);
-        ctx.notify_setting_changed("deepgram_config", serde_json::json!("deepgram"));
         settings::write_settings(ctx, settings);
+        ctx.notify_setting_changed("deepgram_config", serde_json::json!("deepgram"));
         Ok(())
     } else {
         Err("Transcription provider 'deepgram' not found".to_string())
@@ -1451,6 +1468,124 @@ pub async fn test_transcription_provider_connection(
     let language = &settings.selected_language;
 
     crate::stt_client::test_transcription_provider(provider, api_key, &model, language).await
+}
+
+pub fn toggle_web_provider_enabled(
+    ctx: &AppContext,
+    provider_id: String,
+    enabled: bool,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings
+        .web_providers
+        .iter_mut()
+        .find(|p| p.id == provider_id)
+    {
+        p.enabled = enabled;
+        settings::write_settings(ctx, settings);
+        ctx.notify_setting_changed("web_provider_enabled", serde_json::json!(provider_id));
+        Ok(())
+    } else {
+        Err(format!("Web provider '{}' not found", provider_id))
+    }
+}
+
+pub fn change_web_provider_api_key_setting(
+    ctx: &AppContext,
+    provider_id: String,
+    api_key: String,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    settings.web_api_keys.insert(provider_id.clone(), api_key);
+    settings::write_settings(ctx, settings);
+    ctx.notify_setting_changed("web_provider_api_key", serde_json::json!(provider_id));
+    Ok(())
+}
+
+pub fn change_web_provider_base_url_setting(
+    ctx: &AppContext,
+    provider_id: String,
+    base_url: String,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings
+        .web_providers
+        .iter_mut()
+        .find(|p| p.id == provider_id)
+    {
+        p.base_url = base_url;
+        settings::write_settings(ctx, settings);
+        ctx.notify_setting_changed("web_provider_base_url", serde_json::json!(provider_id));
+        Ok(())
+    } else {
+        Err(format!("Web provider '{}' not found", provider_id))
+    }
+}
+
+pub fn change_web_provider_timeout_setting(
+    ctx: &AppContext,
+    provider_id: String,
+    timeout_seconds: u32,
+) -> Result<(), String> {
+    let mut settings = settings::get_settings(ctx);
+    if let Some(p) = settings
+        .web_providers
+        .iter_mut()
+        .find(|p| p.id == provider_id)
+    {
+        p.timeout_seconds = timeout_seconds;
+        settings::write_settings(ctx, settings);
+        ctx.notify_setting_changed("web_provider_timeout", serde_json::json!(provider_id));
+        Ok(())
+    } else {
+        Err(format!("Web provider '{}' not found", provider_id))
+    }
+}
+
+pub async fn test_web_provider_connection(
+    ctx: &AppContext,
+    provider_id: String,
+) -> Result<(String, u128), String> {
+    let settings = settings::get_settings(ctx);
+    let provider = settings
+        .web_providers
+        .iter()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| format!("Web provider '{}' not found", provider_id))?;
+
+    let api_key = settings
+        .web_api_keys
+        .get(&provider_id)
+        .cloned()
+        .unwrap_or_default();
+
+    match provider.id.as_str() {
+        "tavily" => crate::web_client::tavily_test_connection(&provider.base_url, &api_key).await,
+        "firecrawl" => {
+            crate::web_client::firecrawl_test_connection(&provider.base_url, &api_key).await
+        }
+        _ => Err(format!("Unknown web provider: {}", provider.id)),
+    }
+}
+
+pub async fn fetch_llm_provider_models(
+    ctx: &AppContext,
+    provider_id: String,
+) -> Result<Vec<String>, String> {
+    let settings = settings::get_settings(ctx);
+    let provider = settings
+        .post_process_providers
+        .iter()
+        .find(|p| p.id == provider_id)
+        .ok_or_else(|| format!("Provider '{}' not found", provider_id))?;
+
+    let api_key = settings
+        .post_process_api_keys
+        .get(&provider_id)
+        .cloned()
+        .unwrap_or_default();
+
+    crate::llm_client::fetch_models(provider, api_key).await
 }
 
 pub fn change_audio_input_gain_setting(ctx: &AppContext, gain: f32) -> Result<(), String> {

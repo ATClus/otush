@@ -4,39 +4,101 @@
 
 use crate::context::AppContext;
 use crate::settings::LLMPrompt;
+use gdk4::prelude::*;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use log::{info, warn};
 use std::sync::{LazyLock, Mutex};
+use std::time::Duration;
 
 static PALETTE_WINDOW: LazyLock<Mutex<Option<glib::SendWeakRef<libadwaita::Window>>>> =
+    LazyLock::new(|| Mutex::new(None));
+static LAST_PALETTE_TOGGLE: LazyLock<Mutex<Option<std::time::Instant>>> =
     LazyLock::new(|| Mutex::new(None));
 
 /// Show the Quick Prompt Palette centered on screen.
 pub fn show_prompt_palette(ctx: &AppContext) {
-    let ctx_clone = ctx.clone();
-    crate::runtime::spawn_blocking(move || {
-        // Capture environment context off the main thread before presenting the palette window
-        let pre_captured_text = match crate::clipboard::capture_selected_text() {
-            Ok(text) if !text.trim().is_empty() => Some(text),
-            _ => None,
-        };
-        let pre_captured_window = crate::template::get_active_window_title();
-        let pre_captured_clipboard = match crate::clipboard::read_clipboard_text() {
-            Ok(text) if !text.trim().is_empty() => Some(text),
-            _ => None,
+    toggle_prompt_palette(ctx);
+}
+
+/// Toggle display of the Quick Prompt Palette.
+pub fn toggle_prompt_palette(ctx: &AppContext) {
+    let now = std::time::Instant::now();
+    if let Ok(mut last) = LAST_PALETTE_TOGGLE.lock() {
+        if let Some(prev) = *last {
+            if now.duration_since(prev) < Duration::from_millis(300) {
+                return;
+            }
+        }
+        *last = Some(now);
+    }
+
+    let ctx = ctx.clone();
+    glib::MainContext::default().invoke(move || {
+        // Check if window is already open and toggle close safely on the GTK main thread
+        let existing_win = {
+            let mut guard = match PALETTE_WINDOW.lock() {
+                Ok(g) => g,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            guard.take().and_then(|w| w.into_weak_ref().upgrade())
         };
 
-        let ctx_for_main = ctx_clone.clone();
-        glib::MainContext::default().invoke(move || {
-            build_and_present_palette(
-                &ctx_for_main,
-                pre_captured_text,
-                pre_captured_window,
-                pre_captured_clipboard,
-            );
+        if let Some(win) = existing_win {
+            if !win.in_destruction() {
+                if win.is_visible() {
+                    win.close();
+                } else {
+                    win.present();
+                    if let Ok(mut guard) = PALETTE_WINDOW.lock() {
+                        *guard = Some(glib::SendWeakRef::from(win.downgrade()));
+                    }
+                }
+                return;
+            }
+        }
+
+        let ctx_clone = ctx.clone();
+        crate::runtime::spawn_blocking(move || {
+            // Capture environment context off the main thread before presenting the palette window
+            let pre_captured_text = match crate::clipboard::capture_selected_text() {
+                Ok(text) if !text.trim().is_empty() => Some(text),
+                _ => None,
+            };
+            let pre_captured_window = crate::template::get_active_window_title();
+            let pre_captured_clipboard = match crate::clipboard::read_clipboard_text() {
+                Ok(text) if !text.trim().is_empty() => Some(text),
+                _ => None,
+            };
+
+            let ctx_for_main = ctx_clone.clone();
+            glib::MainContext::default().invoke(move || {
+                build_and_present_palette(
+                    &ctx_for_main,
+                    pre_captured_text,
+                    pre_captured_window,
+                    pre_captured_clipboard,
+                );
+            });
         });
     });
+}
+
+fn get_prompt_icon_name(name: &str) -> &'static str {
+    let lower = name.to_lowercase();
+    if lower.contains("translat") {
+        "globe-symbolic"
+    } else if lower.contains("summar") {
+        "format-justify-left-symbolic"
+    } else if lower.contains("fix") || lower.contains("grammar") || lower.contains("proof") {
+        "format-text-symbolic"
+    } else if lower.contains("code") || lower.contains("refactor") {
+        "application-x-executable-symbolic"
+    } else if lower.contains("email") || lower.contains("reply") {
+        "mail-send-symbolic"
+    } else {
+        "starred-symbolic"
+    }
 }
 
 fn build_and_present_palette(
@@ -45,43 +107,101 @@ fn build_and_present_palette(
     pre_captured_window: Option<String>,
     pre_captured_clipboard: Option<String>,
 ) {
-    // If a palette is already open, focus it
-    if let Ok(guard) = PALETTE_WINDOW.lock() {
-        if let Some(ref weak) = *guard {
-            if let Some(win) = weak.clone().into_weak_ref().upgrade() {
-                win.present();
-                return;
-            }
-        }
-    }
-
     let settings = ctx.settings();
     let prompts = settings.post_process_prompts;
 
     let window = libadwaita::Window::new();
-    window.set_title(Some("Transform Text"));
-    window.set_default_size(500, 380);
+    window.set_title(Some("Transform Selection"));
+    window.set_default_size(560, 480);
     window.set_modal(true);
     window.set_resizable(false);
     window.set_deletable(true);
     window.add_css_class("dialog");
+
+    {
+        let mut guard = match PALETTE_WINDOW.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = Some(glib::SendWeakRef::from(window.downgrade()));
+    }
 
     let toast_overlay = libadwaita::ToastOverlay::new();
     let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
     toast_overlay.set_child(Some(&main_box));
     window.set_content(Some(&toast_overlay));
 
-    // Header bar with title
+    // ========================================================================
+    // Header Bar
+    // ========================================================================
     let header_bar = libadwaita::HeaderBar::new();
     header_bar.set_show_end_title_buttons(true);
-    header_bar.set_title_widget(Some(&gtk4::Label::new(Some("Transform Text"))));
+
+    let window_title = libadwaita::WindowTitle::new("Transform Selection", "AI Prompt Palette");
+    header_bar.set_title_widget(Some(&window_title));
     main_box.append(&header_bar);
 
-    // Search / Custom Prompt Entry
+    // ========================================================================
+    // Selection Preview Strip (Visual feedback of captured text)
+    // ========================================================================
+    let preview_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    preview_box.set_margin_start(16);
+    preview_box.set_margin_end(16);
+    preview_box.set_margin_top(10);
+    preview_box.set_margin_bottom(4);
+    preview_box.add_css_class("card");
+
+    let preview_icon = gtk4::Image::new();
+    preview_icon.set_margin_start(10);
+    preview_icon.set_margin_top(8);
+    preview_icon.set_margin_bottom(8);
+
+    let preview_label = gtk4::Label::new(None);
+    preview_label.set_hexpand(true);
+    preview_label.set_xalign(0.0);
+    preview_label.set_ellipsize(gtk4::pango::EllipsizeMode::End);
+    preview_label.set_margin_top(8);
+    preview_label.set_margin_bottom(8);
+
+    let stats_badge = gtk4::Label::new(None);
+    stats_badge.add_css_class("caption");
+    stats_badge.add_css_class("dim-label");
+    stats_badge.set_margin_end(10);
+    stats_badge.set_margin_top(8);
+    stats_badge.set_margin_bottom(8);
+
+    if let Some(ref text) = pre_captured_text {
+        preview_icon.set_icon_name(Some("edit-select-symbolic"));
+        let first_line = text.lines().find(|l| !l.trim().is_empty()).unwrap_or(text);
+        let preview_snippet = if first_line.len() > 60 {
+            format!("“{}…”", &first_line[..60])
+        } else {
+            format!("“{}”", first_line.trim())
+        };
+        preview_label.set_text(&preview_snippet);
+
+        let words = text.split_whitespace().count();
+        let word_lbl = if words == 1 { "word" } else { "words" };
+        stats_badge.set_text(&format!("{words} {word_lbl}"));
+    } else {
+        preview_icon.set_icon_name(Some("edit-paste-symbolic"));
+        preview_label.set_text("No text selected • Will transform clipboard text");
+        preview_label.add_css_class("dim-label");
+        stats_badge.set_text("Clipboard");
+    }
+
+    preview_box.append(&preview_icon);
+    preview_box.append(&preview_label);
+    preview_box.append(&stats_badge);
+    main_box.append(&preview_box);
+
+    // ========================================================================
+    // Search / Custom Instruction Entry
+    // ========================================================================
     let search_box = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     search_box.set_margin_start(16);
     search_box.set_margin_end(16);
-    search_box.set_margin_top(8);
+    search_box.set_margin_top(6);
     search_box.set_margin_bottom(8);
 
     let search_entry = gtk4::SearchEntry::new();
@@ -89,11 +209,13 @@ fn build_and_present_palette(
     search_box.append(&search_entry);
     main_box.append(&search_box);
 
-    // Scrolled list of prompts
+    // ========================================================================
+    // Scrolled List of Prompts (Boxed List pattern)
+    // ========================================================================
     let scrolled = gtk4::ScrolledWindow::new();
     scrolled.set_vexpand(true);
     scrolled.set_hexpand(true);
-    scrolled.set_min_content_height(250);
+    scrolled.set_min_content_height(280);
 
     let list_box = gtk4::ListBox::new();
     list_box.set_selection_mode(gtk4::SelectionMode::Single);
@@ -102,7 +224,7 @@ fn build_and_present_palette(
     list_box.set_margin_end(16);
     list_box.set_margin_bottom(16);
 
-    // Dynamic Custom Instruction Row (visible when user types a query)
+    // Dynamic Custom Instruction Row (visible when user types in search entry)
     let custom_action_row = libadwaita::ActionRow::new();
     custom_action_row.set_title("Run custom instruction");
     custom_action_row.set_subtitle("Send custom instruction to AI");
@@ -123,20 +245,29 @@ fn build_and_present_palette(
 
     for (i, prompt) in prompts.iter().enumerate() {
         let row = libadwaita::ActionRow::new();
+        row.set_use_markup(false);
         row.set_title(&prompt.name);
 
         let shortcut_num = if i < 9 {
             format!("{}", i + 1)
         } else {
-            "".to_string()
+            String::new()
         };
+
+        // Icon prefix
+        let icon_name = get_prompt_icon_name(&prompt.name);
+        let prefix_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let icon_img = gtk4::Image::from_icon_name(icon_name);
+        icon_img.set_pixel_size(16);
+        prefix_box.append(&icon_img);
 
         if !shortcut_num.is_empty() {
             let badge = gtk4::Label::new(Some(&format!("[{}]", shortcut_num)));
             badge.add_css_class("caption");
             badge.add_css_class("dim-label");
-            row.add_prefix(&badge);
+            prefix_box.append(&badge);
         }
+        row.add_prefix(&prefix_box);
 
         let preview = prompt
             .prompt
@@ -166,7 +297,9 @@ fn build_and_present_palette(
         list_box.select_row(Some(first_row));
     }
 
-    // Execution dispatcher
+    // ========================================================================
+    // Execution Dispatcher
+    // ========================================================================
     let ctx_exec = ctx.clone();
     let win_weak = glib::SendWeakRef::from(window.downgrade());
     let pre_cap_text = pre_captured_text.clone();
@@ -255,7 +388,7 @@ fn build_and_present_palette(
                 }
             }
 
-            // If no templates match, automatically select custom row; otherwise ensure selection stays on a visible row
+            // If no templates match, automatically select custom row; otherwise select first match
             if let Some(list) = list_weak_filter.clone().into_weak_ref().upgrade() {
                 if matched_template_count == 0 {
                     list.select_row(Some(&custom_row_filter));
@@ -304,8 +437,6 @@ fn build_and_present_palette(
         }
 
         // Check if user pressed 1-9
-        // - Always works if Alt is held (Alt+1..9)
-        // - Works with raw 1..9 ONLY when the search entry is empty, so typing numbers in custom prompts works naturally
         let is_empty_query = search_entry_for_key.text().trim().is_empty();
         if is_alt || is_empty_query {
             let name = keyval.name().unwrap_or_default();
@@ -347,7 +478,7 @@ fn build_and_present_palette(
                 }
             }
 
-            // Fallback: If no row is selected or all template rows hidden, execute custom query if non-empty
+            // Fallback: execute custom query if non-empty
             if !query.is_empty() {
                 let custom_prompt = LLMPrompt {
                     id: "custom_ad_hoc".to_string(),
@@ -366,14 +497,14 @@ fn build_and_present_palette(
     window.add_controller(key_controller);
 
     window.connect_destroy(|_| {
-        if let Ok(mut guard) = PALETTE_WINDOW.lock() {
-            *guard = None;
-        }
+        let mut guard = match PALETTE_WINDOW.lock() {
+            Ok(g) => g,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *guard = None;
     });
 
-    if let Ok(mut guard) = PALETTE_WINDOW.lock() {
-        *guard = Some(glib::SendWeakRef::from(window.downgrade()));
-    }
+    search_entry.grab_focus();
     window.present();
 }
 

@@ -1145,6 +1145,54 @@ impl ShortcutAction for ShowHistoryAction {
     fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
 }
 
+#[derive(Debug)]
+pub struct SearchOverlayAction;
+
+impl ShortcutAction for SearchOverlayAction {
+    fn start(&self, ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {
+        log::info!("SearchOverlayAction triggered");
+        crate::ui::search_overlay::show_search_overlay(ctx);
+    }
+
+    fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
+}
+
+#[derive(Debug)]
+pub struct QuickNoteAction;
+
+impl ShortcutAction for QuickNoteAction {
+    fn start(&self, ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {
+        log::info!("QuickNoteAction triggered");
+        crate::ui::notes_palette::show_notes_palette(ctx);
+    }
+
+    fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
+}
+
+#[derive(Debug)]
+pub struct TodoPaletteAction;
+
+impl ShortcutAction for TodoPaletteAction {
+    fn start(&self, ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {
+        log::info!("TodoPaletteAction triggered");
+        crate::ui::todo_palette::show_todo_palette(ctx);
+    }
+
+    fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
+}
+
+#[derive(Debug)]
+pub struct DocParserAction;
+
+impl ShortcutAction for DocParserAction {
+    fn start(&self, ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {
+        log::info!("DocParserAction triggered");
+        crate::ui::doc_parser::show_doc_parser(ctx);
+    }
+
+    fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
+}
+
 // Static Action Map
 pub static ACTION_MAP: LazyLock<HashMap<String, Arc<dyn ShortcutAction>>> = LazyLock::new(|| {
     let mut map = HashMap::new();
@@ -1173,6 +1221,22 @@ pub static ACTION_MAP: LazyLock<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy
     map.insert(
         "show_history".to_string(),
         Arc::new(ShowHistoryAction) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "search_overlay".to_string(),
+        Arc::new(SearchOverlayAction) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "quick_note".to_string(),
+        Arc::new(QuickNoteAction) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "todo_palette".to_string(),
+        Arc::new(TodoPaletteAction) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "doc_parser".to_string(),
+        Arc::new(DocParserAction) as Arc<dyn ShortcutAction>,
     );
     map.insert(
         "cancel".to_string(),
@@ -1277,6 +1341,11 @@ mod tests {
         assert!(super::ACTION_MAP.contains_key("transcribe_with_post_process"));
         assert!(super::ACTION_MAP.contains_key("transcribe_meeting"));
         assert!(super::ACTION_MAP.contains_key("transform_selection"));
+        assert!(super::ACTION_MAP.contains_key("show_history"));
+        assert!(super::ACTION_MAP.contains_key("search_overlay"));
+        assert!(super::ACTION_MAP.contains_key("quick_note"));
+        assert!(super::ACTION_MAP.contains_key("todo_palette"));
+        assert!(super::ACTION_MAP.contains_key("doc_parser"));
         assert!(super::ACTION_MAP.contains_key("cancel"));
     }
 }

@@ -74,6 +74,16 @@ fn build_reasoning_params(
                 }),
                 ..Default::default()
             }
+        } else if provider.id == "meta" || base_url.contains("api.meta.ai") {
+            // Meta Muse Spark does NOT support "none" — omit reasoning_effort
+            ReasoningParams::default()
+        } else if provider.id == "anthropic" || base_url.contains("anthropic.com") {
+            // Anthropic extended thinking is disabled simply by omitting thinking parameter
+            ReasoningParams::default()
+        } else if provider.id == "gemini" || base_url.contains("generativelanguage.googleapis.com")
+        {
+            // Google Gemini openai-compatible endpoint does not accept reasoning_effort: "none"
+            ReasoningParams::default()
         } else {
             ReasoningParams {
                 reasoning_effort: Some("none".to_string()),
@@ -82,17 +92,20 @@ fn build_reasoning_params(
         }
     } else {
         let effort_str = match effort {
+            ReasoningEffort::Minimal => "minimal",
             ReasoningEffort::Low => "low",
             ReasoningEffort::Medium => "medium",
             ReasoningEffort::High => "high",
+            ReasoningEffort::XHigh => "xhigh",
             ReasoningEffort::None => "none",
         };
 
         if provider.id == "anthropic" || base_url.contains("anthropic.com") {
             let budget = provider.reasoning.budget_tokens.unwrap_or(match effort {
-                ReasoningEffort::Low => 1024,
+                ReasoningEffort::Minimal | ReasoningEffort::Low => 1024,
                 ReasoningEffort::Medium => 2048,
                 ReasoningEffort::High => 4096,
+                ReasoningEffort::XHigh => 8192,
                 ReasoningEffort::None => 0,
             });
             ReasoningParams {
@@ -106,13 +119,31 @@ fn build_reasoning_params(
             ReasoningParams {
                 reasoning: Some(ReasoningConfig {
                     effort: Some(effort_str.to_string()),
-                    exclude: Some(true),
+                    exclude: Some(false),
                 }),
                 ..Default::default()
             }
-        } else {
+        } else if provider.id == "deepseek" || base_url.contains("api.deepseek.com") {
+            ReasoningParams {
+                thinking: Some(serde_json::json!({ "type": "enabled" })),
+                ..Default::default()
+            }
+        } else if provider.id == "meta" || base_url.contains("api.meta.ai") {
+            // Official Meta Model API (Muse Spark) supports "minimal", "low", "medium", "high", "xhigh"
             ReasoningParams {
                 reasoning_effort: Some(effort_str.to_string()),
+                ..Default::default()
+            }
+        } else {
+            // OpenAI o1/o3/o4 and standard OpenAI-compatible endpoints support "low", "medium", "high"
+            let openai_effort = match effort {
+                ReasoningEffort::Minimal | ReasoningEffort::Low => "low",
+                ReasoningEffort::Medium => "medium",
+                ReasoningEffort::High | ReasoningEffort::XHigh => "high",
+                ReasoningEffort::None => "none",
+            };
+            ReasoningParams {
+                reasoning_effort: Some(openai_effort.to_string()),
                 ..Default::default()
             }
         }
@@ -155,8 +186,22 @@ struct ChatCompletionRequest {
 }
 
 #[derive(Debug, Deserialize)]
+struct CompletionTokensDetails {
+    #[serde(default)]
+    reasoning_tokens: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct UsageResponse {
+    #[serde(default)]
+    completion_tokens_details: Option<CompletionTokensDetails>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ChatCompletionResponse {
     choices: Vec<ChatChoice>,
+    #[serde(default)]
+    usage: Option<UsageResponse>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -575,10 +620,27 @@ pub async fn send_chat_completion_with_schema(
     let completion: ChatCompletionResponse = serde_json::from_str(&raw_response)
         .map_err(|e| format!("Failed to parse API response JSON: {e}"))?;
 
-    let content = completion
+    let mut content = completion
         .choices
         .first()
         .and_then(|choice| choice.message.content.clone());
+
+    let reasoning_tokens = completion
+        .usage
+        .as_ref()
+        .and_then(|u| u.completion_tokens_details.as_ref())
+        .and_then(|d| d.reasoning_tokens);
+
+    if let Some(tokens) = reasoning_tokens {
+        info!("LLM completion reasoning tokens: {}", tokens);
+        if let Some(text) = content {
+            if text.contains("Connected successfully") && tokens > 0 {
+                content = Some(format!("{} ({} reasoning tokens)", text, tokens));
+            } else {
+                content = Some(text);
+            }
+        }
+    }
 
     info!("LLM parsed content from first choice: {:?}", content);
 
@@ -651,6 +713,14 @@ pub async fn fetch_models(
             }
         }
     }
+    // 2b. Ollama tags format: { tags: [ { name: "..." }, ... ] }
+    else if let Some(tags_list) = parsed.get("tags").and_then(|t| t.as_array()) {
+        for entry in tags_list {
+            if let Some(name) = entry.get("name").and_then(|n| n.as_str()) {
+                models.push(name.to_string());
+            }
+        }
+    }
     // 3. Direct array format: [ "model1", "model2", ... ]
     else if let Some(array) = parsed.as_array() {
         for entry in array {
@@ -692,6 +762,75 @@ pub async fn test_provider_connection(
         Some(text) => Ok((text.trim().to_string(), elapsed)),
         None => Err("Provider returned an empty response".to_string()),
     }
+}
+
+/// Send an image to a multimodal vision LLM (OpenAI GPT-4o, Google Gemini, Claude 3.7, Pixtral) for OCR and text extraction.
+pub async fn send_vision_ocr(
+    provider: &PostProcessProvider,
+    api_key: String,
+    model: &str,
+    image_bytes: &[u8],
+    mime_type: &str,
+    prompt: Option<&str>,
+) -> Result<String, String> {
+    use base64::Engine;
+    let b64 = base64::engine::general_purpose::STANDARD.encode(image_bytes);
+    let data_url = format!("data:{};base64,{}", mime_type, b64);
+    let base_url = provider.base_url.trim_end_matches('/');
+    let url = format!("{}/chat/completions", base_url);
+
+    let prompt_text = prompt.unwrap_or(
+        "Extract all readable text, tables, and structured data from this document/image. Preserve formatting as clean Markdown without conversational preamble.",
+    );
+
+    let client = cached_client(provider, &api_key)?;
+
+    let request_body = serde_json::json!({
+        "model": model,
+        "messages": [
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": prompt_text
+                    },
+                    {
+                        "type": "image_url",
+                        "image_url": {
+                            "url": data_url
+                        }
+                    }
+                ]
+            }
+        ],
+        "stream": false
+    });
+
+    let response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| report_reqwest_error("Vision OCR request failed", &e))?;
+
+    let status = response.status();
+    if !status.is_success() {
+        let err_text = response.text().await.unwrap_or_default();
+        return Err(format!("Vision OCR API error ({status}): {err_text}"));
+    }
+
+    let parsed: serde_json::Value = response
+        .json()
+        .await
+        .map_err(|e| report_reqwest_error("Failed to parse Vision OCR response", &e))?;
+
+    let content = parsed
+        .pointer("/choices/0/message/content")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "No text returned from Vision OCR".to_string())?;
+
+    Ok(content.trim().to_string())
 }
 
 #[cfg(test)]
@@ -914,5 +1053,41 @@ mod tests {
         assert!(is_known_rejected(&key));
         // A different model on the same endpoint is tracked separately
         assert!(!is_known_rejected(&endpoint_key(&deepseek, "other-model")));
+    }
+
+    #[test]
+    fn meta_provider_omits_reasoning_when_disabled_or_none() {
+        let mut prov = provider("meta", "https://api.meta.ai/v1");
+        prov.reasoning.effort = ReasoningEffort::None;
+        let params = build_reasoning_params(&prov, true);
+        let json = request_json(params);
+        assert!(json.get("reasoning_effort").is_none());
+        assert!(json.get("reasoning").is_none());
+        assert!(json.get("thinking").is_none());
+    }
+
+    #[test]
+    fn meta_provider_supports_all_muse_spark_reasoning_levels() {
+        let mut prov = provider("meta", "https://api.meta.ai/v1");
+
+        prov.reasoning.effort = ReasoningEffort::Minimal;
+        let json = request_json(build_reasoning_params(&prov, false));
+        assert_eq!(json["reasoning_effort"], "minimal");
+
+        prov.reasoning.effort = ReasoningEffort::Low;
+        let json = request_json(build_reasoning_params(&prov, false));
+        assert_eq!(json["reasoning_effort"], "low");
+
+        prov.reasoning.effort = ReasoningEffort::Medium;
+        let json = request_json(build_reasoning_params(&prov, false));
+        assert_eq!(json["reasoning_effort"], "medium");
+
+        prov.reasoning.effort = ReasoningEffort::High;
+        let json = request_json(build_reasoning_params(&prov, false));
+        assert_eq!(json["reasoning_effort"], "high");
+
+        prov.reasoning.effort = ReasoningEffort::XHigh;
+        let json = request_json(build_reasoning_params(&prov, false));
+        assert_eq!(json["reasoning_effort"], "xhigh");
     }
 }

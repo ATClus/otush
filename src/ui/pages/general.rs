@@ -1,15 +1,16 @@
-//! General settings page: Language, Overlay, Keyboard & Pasting, and System Behavior.
+//! General settings page: Language, Overlay HUD, Pasting, and System Behavior.
 
 use crate::context::AppContext;
 use crate::settings::{AutoSubmitKey, PasteMethod, Theme, TypingTool};
 use crate::shortcut;
+use gtk4::prelude::*;
 use libadwaita::prelude::*;
 
 /// Build the General preferences page.
 pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let page = libadwaita::PreferencesPage::new();
     page.set_title("General");
-    page.set_icon_name(Some("emblem-default-symbolic"));
+    page.set_icon_name(Some("preferences-other-symbolic"));
 
     let settings = ctx.settings();
 
@@ -19,12 +20,16 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let language_group = libadwaita::PreferencesGroup::new();
     language_group.set_title("Language &amp; Localization");
     language_group.set_description(Some(
-        "Transcription language. Select a regional preset or specify any custom BCP-47 language tag.",
+        "Spoken language for transcription. Select a regional preset or specify any custom BCP-47 language tag.",
     ));
+    language_group.set_hexpand(true);
 
     let language_row = libadwaita::ComboRow::new();
     language_row.set_title("Transcription Language");
     language_row.set_subtitle("Select language preset or choose Custom");
+
+    let lang_icon = gtk4::Image::from_icon_name("preferences-desktop-locale-symbolic");
+    language_row.add_prefix(&lang_icon);
 
     let preset_labels: &[(&str, &str)] = &[
         ("auto", "Automatic Detection (auto)"),
@@ -59,20 +64,27 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         .unwrap_or(preset_labels.len() - 1);
     language_row.set_selected(current_index as u32);
 
+    let is_custom_selected = current_index == preset_labels.len() - 1;
+
     let custom_lang_row = libadwaita::EntryRow::new();
     custom_lang_row.set_title("Custom Language Code (e.g. pt-BR, en-US)");
     custom_lang_row.set_text(&current);
+    custom_lang_row.set_visible(is_custom_selected);
 
     let custom_row_weak = glib::SendWeakRef::from(custom_lang_row.downgrade());
     let language_ctx = ctx.clone();
     language_row.connect_selected_notify(move |row| {
         let selected = row.selected() as usize;
         if let Some(&(code, _)) = preset_labels.get(selected) {
-            if code != "custom" {
-                if let Some(r) = custom_row_weak.clone().into_weak_ref().upgrade() {
+            if let Some(r) = custom_row_weak.clone().into_weak_ref().upgrade() {
+                if code == "custom" {
+                    r.set_visible(true);
+                } else {
+                    r.set_visible(false);
                     r.set_text(code);
+                    let _ =
+                        shortcut::change_selected_language_setting(&language_ctx, code.to_string());
                 }
-                let _ = shortcut::change_selected_language_setting(&language_ctx, code.to_string());
             }
         }
     });
@@ -94,6 +106,8 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     translate_row.set_subtitle(
         "Automatically translate foreign speech to English during local transcription",
     );
+    let trans_icon = gtk4::Image::from_icon_name("accessories-dictionary-symbolic");
+    translate_row.add_prefix(&trans_icon);
     translate_row.set_active(settings.translate_to_english);
     let trans_ctx = ctx.clone();
     translate_row.connect_active_notify(move |row| {
@@ -113,9 +127,13 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     overlay_group.set_description(Some(
         "A transparent HUD element displayed on screen during voice recording and processing.",
     ));
+    overlay_group.set_hexpand(true);
 
     let overlay_style_row = libadwaita::ComboRow::new();
     overlay_style_row.set_title("Overlay Style");
+    let style_icon = gtk4::Image::from_icon_name("display-symbolic");
+    overlay_style_row.add_prefix(&style_icon);
+
     let style_labels = [
         ("none", "None (Hidden)"),
         ("minimal", "Minimal Pill"),
@@ -134,16 +152,12 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         crate::settings::OverlayStyle::Minimal => 1,
         crate::settings::OverlayStyle::Live => 2,
     });
-    let ctx1 = ctx.clone();
-    overlay_style_row.connect_selected_notify(move |row| {
-        if let Some((id, _)) = style_labels.get(row.selected() as usize) {
-            let _ = shortcut::change_overlay_style_setting(&ctx1, id.to_string());
-        }
-    });
-    overlay_group.add(&overlay_style_row);
 
     let overlay_position_row = libadwaita::ComboRow::new();
     overlay_position_row.set_title("Overlay Screen Position");
+    let pos_icon = gtk4::Image::from_icon_name("format-justify-center-symbolic");
+    overlay_position_row.add_prefix(&pos_icon);
+
     let position_labels = [("bottom", "Bottom Center"), ("top", "Top Center")];
     let model = gtk4::StringList::new(
         &position_labels
@@ -156,6 +170,20 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         crate::settings::OverlayPosition::Top => 1,
         crate::settings::OverlayPosition::Bottom => 0,
     });
+    overlay_position_row.set_visible(current_style != crate::settings::OverlayStyle::None);
+
+    let ctx1 = ctx.clone();
+    let pos_row_weak = glib::SendWeakRef::from(overlay_position_row.downgrade());
+    overlay_style_row.connect_selected_notify(move |row| {
+        if let Some((id, _)) = style_labels.get(row.selected() as usize) {
+            let _ = shortcut::change_overlay_style_setting(&ctx1, id.to_string());
+            if let Some(pos_row) = pos_row_weak.clone().into_weak_ref().upgrade() {
+                pos_row.set_visible(*id != "none");
+            }
+        }
+    });
+    overlay_group.add(&overlay_style_row);
+
     let ctx2 = ctx.clone();
     overlay_position_row.connect_selected_notify(move |row| {
         if let Some((id, _)) = position_labels.get(row.selected() as usize) {
@@ -170,13 +198,17 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     // 3. Pasting & Keyboard Input
     // ========================================================================
     let paste_group = libadwaita::PreferencesGroup::new();
-    paste_group.set_title("Pasting &amp; Keyboard Input");
+    paste_group.set_title("Pasting &amp; Text Insertion");
     paste_group.set_description(Some(
-        "Configure how transcribed text is automatically pasted into active applications.",
+        "Configure how transcribed text is automatically pasted into active desktop applications.",
     ));
+    paste_group.set_hexpand(true);
 
     let paste_method_row = libadwaita::ComboRow::new();
     paste_method_row.set_title("Paste Method");
+    let paste_icon = gtk4::Image::from_icon_name("edit-paste-symbolic");
+    paste_method_row.add_prefix(&paste_icon);
+
     let method_labels = [
         ("direct", "Direct (Virtual Keyboard Typing)"),
         ("ctrl_v", "Ctrl+V"),
@@ -200,17 +232,13 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         PasteMethod::None => 4,
         PasteMethod::ExternalScript => 5,
     });
-    let ctx3 = ctx.clone();
-    paste_method_row.connect_selected_notify(move |row| {
-        if let Some((id, _)) = method_labels.get(row.selected() as usize) {
-            let _ = shortcut::change_paste_method_setting(&ctx3, id.to_string());
-        }
-    });
-    paste_group.add(&paste_method_row);
 
     let typing_tool_row = libadwaita::ComboRow::new();
-    typing_tool_row.set_title("Direct Typing Tool");
-    typing_tool_row.set_subtitle("Virtual keystroke injector backend for Wayland/X11");
+    typing_tool_row.set_title("Direct Typing Backend");
+    typing_tool_row.set_subtitle("Virtual keystroke injector tool for Wayland/X11");
+    let typing_icon = gtk4::Image::from_icon_name("input-keyboard-symbolic");
+    typing_tool_row.add_prefix(&typing_icon);
+
     let tool_labels = [
         ("auto", "Auto (Detect Environment)"),
         ("wtype", "wtype (Wayland standard)"),
@@ -234,6 +262,20 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         TypingTool::Dotool => 4,
         TypingTool::Kwtype => 5,
     });
+    typing_tool_row.set_visible(settings.paste_method == PasteMethod::Direct);
+
+    let ctx3 = ctx.clone();
+    let typing_weak = glib::SendWeakRef::from(typing_tool_row.downgrade());
+    paste_method_row.connect_selected_notify(move |row| {
+        if let Some((id, _)) = method_labels.get(row.selected() as usize) {
+            let _ = shortcut::change_paste_method_setting(&ctx3, id.to_string());
+            if let Some(typing_row) = typing_weak.clone().into_weak_ref().upgrade() {
+                typing_row.set_visible(*id == "direct");
+            }
+        }
+    });
+    paste_group.add(&paste_method_row);
+
     let ctx4 = ctx.clone();
     typing_tool_row.connect_selected_notify(move |row| {
         if let Some((id, _)) = tool_labels.get(row.selected() as usize) {
@@ -247,12 +289,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     auto_submit_row.set_title("Auto-Submit After Pasting");
     auto_submit_row
         .set_subtitle("Automatically press Enter to submit chat messages or search bars");
+    let submit_icon = gtk4::Image::from_icon_name("input-keyboard-symbolic");
+    auto_submit_row.add_prefix(&submit_icon);
     auto_submit_row.set_active(settings.auto_submit);
-    let submit_ctx = ctx.clone();
-    auto_submit_row.connect_active_notify(move |row| {
-        let _ = shortcut::change_auto_submit_setting(&submit_ctx, row.is_active());
-    });
-    paste_group.add(&auto_submit_row);
 
     let submit_key_row = libadwaita::ComboRow::new();
     submit_key_row.set_title("Auto-Submit Key");
@@ -273,6 +312,19 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         AutoSubmitKey::CtrlEnter => 1,
         AutoSubmitKey::CmdEnter => 2,
     });
+    submit_key_row.set_visible(settings.auto_submit);
+
+    let submit_ctx = ctx.clone();
+    let submit_key_weak = glib::SendWeakRef::from(submit_key_row.downgrade());
+    auto_submit_row.connect_active_notify(move |row| {
+        let is_active = row.is_active();
+        let _ = shortcut::change_auto_submit_setting(&submit_ctx, is_active);
+        if let Some(key_row) = submit_key_weak.clone().into_weak_ref().upgrade() {
+            key_row.set_visible(is_active);
+        }
+    });
+    paste_group.add(&auto_submit_row);
+
     let key_ctx = ctx.clone();
     submit_key_row.connect_selected_notify(move |row| {
         if let Some((id, _)) = key_labels.get(row.selected() as usize) {
@@ -284,6 +336,8 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let trailing_space_row = libadwaita::SwitchRow::new();
     trailing_space_row.set_title("Append Trailing Space");
     trailing_space_row.set_subtitle("Add a space after transcribed text for continuous dictation");
+    let space_icon = gtk4::Image::from_icon_name("format-indent-more-symbolic");
+    trailing_space_row.add_prefix(&space_icon);
     trailing_space_row.set_active(settings.append_trailing_space);
     let ts_ctx = ctx.clone();
     trailing_space_row.connect_active_notify(move |row| {
@@ -298,9 +352,13 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     // ========================================================================
     let system_group = libadwaita::PreferencesGroup::new();
     system_group.set_title("Appearance &amp; System Integration");
+    system_group.set_hexpand(true);
 
     let theme_row = libadwaita::ComboRow::new();
     theme_row.set_title("Color Scheme");
+    let theme_icon = gtk4::Image::from_icon_name("preferences-desktop-theme-symbolic");
+    theme_row.add_prefix(&theme_icon);
+
     let theme_labels = [
         ("system", "Follow System"),
         ("light", "Light"),
@@ -331,7 +389,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
     let tray_row = libadwaita::SwitchRow::new();
     tray_row.set_title("Show System Tray Icon");
-    tray_row.set_subtitle("Show Otush status indicator in the top panel tray");
+    tray_row.set_subtitle("Display status icon in the top system tray");
+    let tray_icon = gtk4::Image::from_icon_name("application-certificate-symbolic");
+    tray_row.add_prefix(&tray_icon);
     tray_row.set_active(settings.show_tray_icon);
     let tray_ctx = ctx.clone();
     tray_row.connect_active_notify(move |row| {
@@ -342,6 +402,8 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let autostart_row = libadwaita::SwitchRow::new();
     autostart_row.set_title("Launch at Login");
     autostart_row.set_subtitle("Start Otush in the background when logging into your desktop");
+    let auto_icon = gtk4::Image::from_icon_name("system-run-symbolic");
+    autostart_row.add_prefix(&auto_icon);
     autostart_row.set_active(settings.autostart_enabled);
     let auto_ctx = ctx.clone();
     autostart_row.connect_active_notify(move |row| {
@@ -352,6 +414,8 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let update_row = libadwaita::SwitchRow::new();
     update_row.set_title("Check for Updates");
     update_row.set_subtitle("Notify when a new version of Otush is released on GitHub");
+    let upd_icon = gtk4::Image::from_icon_name("software-update-available-symbolic");
+    update_row.add_prefix(&upd_icon);
     update_row.set_active(settings.update_checks_enabled);
     let upd_ctx = ctx.clone();
     update_row.connect_active_notify(move |row| {
@@ -361,5 +425,109 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
     page.add(&system_group);
 
+    // ========================================================================
+    // 5. Global Keyboard Shortcuts
+    // ========================================================================
+    let shortcuts_group = libadwaita::PreferencesGroup::new();
+    shortcuts_group.set_title("Global Keyboard Shortcuts");
+    shortcuts_group.set_description(Some(
+        "Hotkeys are managed natively via GNOME System Settings to ensure seamless Wayland desktop integration.",
+    ));
+    shortcuts_group.set_hexpand(true);
+
+    let configure_row = libadwaita::ActionRow::new();
+    configure_row.set_title("System Shortcuts");
+    configure_row.set_subtitle(
+        "Open GNOME System Settings to view and customize hotkeys for voice dictation, meeting mode, notes, tasks, and palettes",
+    );
+    let shortcut_icon = gtk4::Image::from_icon_name("input-keyboard-symbolic");
+    configure_row.add_prefix(&shortcut_icon);
+
+    let config_btn = gtk4::Button::with_label("Configure in GNOME");
+    config_btn.set_valign(gtk4::Align::Center);
+    config_btn.add_css_class("suggested-action");
+    let ctx_btn = ctx.clone();
+    config_btn.connect_clicked(move |_| {
+        shortcut::open_gnome_settings(&ctx_btn);
+    });
+    configure_row.add_suffix(&config_btn);
+    configure_row.set_activatable_widget(Some(&config_btn));
+    shortcuts_group.add(&configure_row);
+
+    // Active shortcuts overview
+    let expander = libadwaita::ExpanderRow::new();
+    expander.set_title("Active Shortcuts Overview");
+    expander.set_subtitle("View current key combinations across the Otush suite");
+    let list_icon = gtk4::Image::from_icon_name("view-list-bullet-symbolic");
+    expander.add_prefix(&list_icon);
+
+    let mut bindings: Vec<_> = settings.bindings.values().cloned().collect();
+    bindings.sort_by(|a, b| a.id.cmp(&b.id));
+
+    for binding in bindings {
+        if binding.id == "cancel" || binding.current_binding.trim().is_empty() {
+            continue;
+        }
+        let row = libadwaita::ActionRow::new();
+        row.set_use_markup(false);
+        row.set_title(&binding.name);
+        let badge = format_shortcut_badge_string(&binding.current_binding);
+        row.set_subtitle(&badge);
+        row.set_activatable(false);
+
+        let icon_name = match binding.id.as_str() {
+            "transcribe" => "audio-input-microphone-symbolic",
+            "transcribe_with_post_process" => "starred-symbolic",
+            "transcribe_meeting" => "system-users-symbolic",
+            "transform_selection" => "edit-select-symbolic",
+            "show_history" => "document-open-recent-symbolic",
+            "search_overlay" => "system-search-symbolic",
+            "quick_note" => "text-editor-symbolic",
+            "todo_palette" => "checkbox-checked-symbolic",
+            "doc_parser" => "x-office-document-symbolic",
+            _ => "applications-accessories-symbolic",
+        };
+        let icon = gtk4::Image::from_icon_name(icon_name);
+        row.add_prefix(&icon);
+        expander.add_row(&row);
+    }
+
+    shortcuts_group.add(&expander);
+    page.add(&shortcuts_group);
+
     page.upcast::<gtk4::Widget>()
+}
+
+fn format_shortcut_badge_string(raw: &str) -> String {
+    let tokens: Vec<String> = raw
+        .split('+')
+        .map(|t| match t.trim().to_lowercase().as_str() {
+            "ctrl" | "control" => "Ctrl".to_string(),
+            "alt" | "opt" => "Alt".to_string(),
+            "shift" => "Shift".to_string(),
+            "super" | "win" | "meta" | "cmd" => "Super".to_string(),
+            "space" => "Space".to_string(),
+            "esc" | "escape" => "Esc".to_string(),
+            "enter" | "return" => "Enter".to_string(),
+            "tab" => "Tab".to_string(),
+            "backspace" => "Backspace".to_string(),
+            "delete" => "Delete".to_string(),
+            "insert" => "Insert".to_string(),
+            "pause" => "Pause".to_string(),
+            "home" => "Home".to_string(),
+            "end" => "End".to_string(),
+            "pageup" => "Page Up".to_string(),
+            "pagedown" => "Page Down".to_string(),
+            "scroll_lock" => "Scroll Lock".to_string(),
+            other if other.len() == 1 => other.to_uppercase(),
+            other => {
+                let mut c = other.chars();
+                match c.next() {
+                    Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+                    None => other.to_string(),
+                }
+            }
+        })
+        .collect();
+    tokens.join(" + ")
 }

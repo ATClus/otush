@@ -74,9 +74,35 @@ pub struct ShortcutBinding {
 pub enum ReasoningEffort {
     #[default]
     None,
+    Minimal,
     Low,
     Medium,
     High,
+    XHigh,
+}
+
+impl ReasoningEffort {
+    pub fn from_index(idx: u32) -> Self {
+        match idx {
+            1 => ReasoningEffort::Minimal,
+            2 => ReasoningEffort::Low,
+            3 => ReasoningEffort::Medium,
+            4 => ReasoningEffort::High,
+            5 => ReasoningEffort::XHigh,
+            _ => ReasoningEffort::None,
+        }
+    }
+
+    pub fn to_index(self) -> u32 {
+        match self {
+            ReasoningEffort::None => 0,
+            ReasoningEffort::Minimal => 1,
+            ReasoningEffort::Low => 2,
+            ReasoningEffort::Medium => 3,
+            ReasoningEffort::High => 4,
+            ReasoningEffort::XHigh => 5,
+        }
+    }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Default)]
@@ -190,6 +216,56 @@ pub struct TranscriptionProvider {
 
 fn default_stt_provider_timeout() -> u32 {
     15
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct WebProvider {
+    pub id: String,
+    pub label: String,
+    pub base_url: String,
+    #[serde(default = "default_provider_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_base_url_edit: bool,
+    #[serde(default = "default_web_provider_timeout")]
+    pub timeout_seconds: u32,
+    #[serde(default)]
+    pub custom_headers: HashMap<String, String>,
+}
+
+fn default_web_provider_timeout() -> u32 {
+    60
+}
+
+pub fn default_web_providers() -> Vec<WebProvider> {
+    vec![
+        WebProvider {
+            id: "tavily".to_string(),
+            label: "Tavily".to_string(),
+            base_url: "https://api.tavily.com".to_string(),
+            enabled: true,
+            allow_base_url_edit: false,
+            timeout_seconds: 60,
+            custom_headers: HashMap::new(),
+        },
+        WebProvider {
+            id: "firecrawl".to_string(),
+            label: "Firecrawl".to_string(),
+            base_url: "https://api.firecrawl.dev/v2".to_string(),
+            enabled: true,
+            allow_base_url_edit: true,
+            timeout_seconds: 60,
+            custom_headers: HashMap::new(),
+        },
+    ]
+}
+
+pub fn default_web_api_keys() -> SecretMap {
+    let mut map = HashMap::new();
+    for provider in default_web_providers() {
+        map.insert(provider.id, String::new());
+    }
+    SecretMap(map)
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq)]
@@ -521,6 +597,10 @@ pub struct AppSettings {
     pub post_process_api_keys: SecretMap,
     #[serde(default = "default_post_process_models")]
     pub post_process_models: HashMap<String, String>,
+    #[serde(default = "default_web_providers")]
+    pub web_providers: Vec<WebProvider>,
+    #[serde(default = "default_web_api_keys")]
+    pub web_api_keys: SecretMap,
     #[serde(default = "default_post_process_prompts")]
     pub post_process_prompts: Vec<LLMPrompt>,
     #[serde(default)]
@@ -778,7 +858,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
         },
         PostProcessProvider {
             id: "gemini".to_string(),
-            label: "Google Gemini".to_string(),
+            label: "Google".to_string(),
             base_url: "https://generativelanguage.googleapis.com/v1beta/openai".to_string(),
             allow_base_url_edit: false,
             models_endpoint: Some("/models".to_string()),
@@ -861,8 +941,44 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
             timeout_seconds: 120,
         },
         PostProcessProvider {
+            id: "moonshot".to_string(),
+            label: "Moonshot AI".to_string(),
+            base_url: "https://api.moonshot.ai/v1".to_string(),
+            allow_base_url_edit: false,
+            models_endpoint: Some("/models".to_string()),
+            supports_structured_output: true,
+            reasoning: ProviderReasoningConfig::default(),
+            enabled: true,
+            custom_headers: HashMap::new(),
+            timeout_seconds: 120,
+        },
+        PostProcessProvider {
+            id: "meta".to_string(),
+            label: "Meta".to_string(),
+            base_url: "https://api.meta.ai/v1".to_string(),
+            allow_base_url_edit: true,
+            models_endpoint: Some("/models".to_string()),
+            supports_structured_output: true,
+            reasoning: ProviderReasoningConfig::default(),
+            enabled: true,
+            custom_headers: HashMap::new(),
+            timeout_seconds: 120,
+        },
+        PostProcessProvider {
+            id: "local_slm".to_string(),
+            label: "Local SLM".to_string(),
+            base_url: "http://localhost:11434/v1".to_string(),
+            allow_base_url_edit: true,
+            models_endpoint: Some("/models".to_string()),
+            supports_structured_output: false,
+            reasoning: ProviderReasoningConfig::default(),
+            enabled: true,
+            custom_headers: HashMap::new(),
+            timeout_seconds: 120,
+        },
+        PostProcessProvider {
             id: "ollama".to_string(),
-            label: "Ollama (Local)".to_string(),
+            label: "Ollama".to_string(),
             base_url: "http://localhost:11434/v1".to_string(),
             allow_base_url_edit: true,
             models_endpoint: Some("/models".to_string()),
@@ -877,7 +993,7 @@ fn default_post_process_providers() -> Vec<PostProcessProvider> {
     // AWS Bedrock via Mantle (OpenAI-compatible endpoint)
     providers.push(PostProcessProvider {
         id: "bedrock_mantle".to_string(),
-        label: "AWS Bedrock (Mantle)".to_string(),
+        label: "AWS Bedrock".to_string(),
         base_url: "https://bedrock-mantle.us-east-1.api.aws/v1".to_string(),
         allow_base_url_edit: false,
         models_endpoint: Some("/models".to_string()),
@@ -946,7 +1062,7 @@ pub fn default_transcription_providers() -> Vec<TranscriptionProvider> {
         },
         TranscriptionProvider {
             id: "gemini".to_string(),
-            label: "Google AI Studio (Gemini)".to_string(),
+            label: "Google".to_string(),
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
             model: "gemini-2.0-flash".to_string(),
             enabled: true,
@@ -956,8 +1072,30 @@ pub fn default_transcription_providers() -> Vec<TranscriptionProvider> {
             deepgram: None,
         },
         TranscriptionProvider {
+            id: "gladia".to_string(),
+            label: "Gladia".to_string(),
+            base_url: "https://api.gladia.io/v2".to_string(),
+            model: "solaria-1".to_string(),
+            enabled: true,
+            allow_base_url_edit: false,
+            timeout_seconds: 25,
+            custom_headers: HashMap::new(),
+            deepgram: None,
+        },
+        TranscriptionProvider {
+            id: "assemblyai".to_string(),
+            label: "AssemblyAI".to_string(),
+            base_url: "https://api.assemblyai.com/v2".to_string(),
+            model: "best".to_string(),
+            enabled: true,
+            allow_base_url_edit: false,
+            timeout_seconds: 25,
+            custom_headers: HashMap::new(),
+            deepgram: None,
+        },
+        TranscriptionProvider {
             id: "custom".to_string(),
-            label: "Custom STT".to_string(),
+            label: "Custom".to_string(),
             base_url: "http://localhost:8000/v1".to_string(),
             model: "whisper-1".to_string(),
             enabled: true,
@@ -993,8 +1131,11 @@ fn default_post_process_api_keys() -> SecretMap {
     SecretMap(map)
 }
 
-pub fn default_model_for_provider(_provider_id: &str) -> String {
-    String::new()
+pub fn default_model_for_provider(provider_id: &str) -> String {
+    match provider_id {
+        "meta" => "muse-spark-1.3".to_string(),
+        _ => String::new(),
+    }
 }
 
 fn default_post_process_models() -> HashMap<String, String> {
@@ -1078,6 +1219,25 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
             .find(|p| p.id == provider.id)
         {
             Some(existing) => {
+                // Migrate legacy Meta provider configuration
+                if provider.id == "meta" && existing.base_url == "https://api.llama.com/v1" {
+                    info!(
+                        "Migrating Meta provider base_url from https://api.llama.com/v1 to https://api.meta.ai/v1"
+                    );
+                    existing.base_url = "https://api.meta.ai/v1".to_string();
+                    changed = true;
+                }
+
+                // Sync provider label so it only informs the provider name (no model mentions)
+                if existing.label != provider.label {
+                    info!(
+                        "Updating label for provider '{}' from '{}' to '{}'",
+                        provider.id, existing.label, provider.label
+                    );
+                    existing.label = provider.label.clone();
+                    changed = true;
+                }
+
                 // Sync supports_structured_output field for existing providers (migration)
                 if existing.supports_structured_output != provider.supports_structured_output {
                     debug!(
@@ -1109,6 +1269,15 @@ fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
             Some(existing) => {
                 if existing.is_empty() && !default_model.is_empty() {
                     *existing = default_model.clone();
+                    changed = true;
+                } else if provider.id == "meta"
+                    && (existing.to_lowercase().starts_with("llama") || existing.is_empty())
+                {
+                    info!(
+                        "Migrating Meta model from legacy '{}' to 'muse-spark-1.3'",
+                        existing
+                    );
+                    *existing = "muse-spark-1.3".to_string();
                     changed = true;
                 }
             }
@@ -1145,6 +1314,16 @@ fn ensure_transcription_provider_defaults(settings: &mut AppSettings) -> bool {
             .find(|p| p.id == provider.id)
         {
             Some(existing) => {
+                // Sync provider label so it only informs the provider name (no model mentions)
+                if existing.label != provider.label {
+                    info!(
+                        "Updating label for transcription provider '{}' from '{}' to '{}'",
+                        provider.id, existing.label, provider.label
+                    );
+                    existing.label = provider.label.clone();
+                    changed = true;
+                }
+
                 if existing.id == "deepgram" && existing.deepgram.is_none() {
                     existing.deepgram = Some(DeepgramConfig::default());
                     changed = true;
@@ -1258,6 +1437,50 @@ pub fn get_default_settings() -> AppSettings {
         },
     );
 
+    bindings.insert(
+        "search_overlay".to_string(),
+        ShortcutBinding {
+            id: "search_overlay".to_string(),
+            name: "Search & Deep Research".to_string(),
+            description: "Opens quick web search & deep research overlay.".to_string(),
+            default_binding: "ctrl+alt+s".to_string(),
+            current_binding: "ctrl+alt+s".to_string(),
+        },
+    );
+
+    bindings.insert(
+        "quick_note".to_string(),
+        ShortcutBinding {
+            id: "quick_note".to_string(),
+            name: "Quick Note & Idea Capture".to_string(),
+            description: "Opens quick note scratchpad overlay.".to_string(),
+            default_binding: "ctrl+alt+n".to_string(),
+            current_binding: "ctrl+alt+n".to_string(),
+        },
+    );
+
+    bindings.insert(
+        "todo_palette".to_string(),
+        ShortcutBinding {
+            id: "todo_palette".to_string(),
+            name: "Todo & Tasks".to_string(),
+            description: "Opens task checklist & voice todo palette.".to_string(),
+            default_binding: "ctrl+alt+t".to_string(),
+            current_binding: "ctrl+alt+t".to_string(),
+        },
+    );
+
+    bindings.insert(
+        "doc_parser".to_string(),
+        ShortcutBinding {
+            id: "doc_parser".to_string(),
+            name: "Document Parser & OCR".to_string(),
+            description: "Opens document parser & vision OCR dialog.".to_string(),
+            default_binding: "ctrl+alt+d".to_string(),
+            current_binding: "ctrl+alt+d".to_string(),
+        },
+    );
+
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
         bindings,
@@ -1302,6 +1525,8 @@ pub fn get_default_settings() -> AppSettings {
         post_process_providers: default_post_process_providers(),
         post_process_api_keys: default_post_process_api_keys(),
         post_process_models: default_post_process_models(),
+        web_providers: default_web_providers(),
+        web_api_keys: default_web_api_keys(),
         post_process_prompts: default_post_process_prompts(),
         post_process_selected_prompt_id: None,
         mute_while_recording: false,
@@ -1647,6 +1872,103 @@ fn apply_settings_migrations(
             },
         );
         updated = true;
+    }
+
+    let suite_bindings = [
+        (
+            "search_overlay",
+            "Search & Deep Research",
+            "Opens quick web search & deep research overlay.",
+            "ctrl+alt+s",
+        ),
+        (
+            "quick_note",
+            "Quick Note & Idea Capture",
+            "Opens quick note scratchpad overlay.",
+            "ctrl+alt+n",
+        ),
+        (
+            "todo_palette",
+            "Todo & Tasks",
+            "Opens task checklist & voice todo palette.",
+            "ctrl+alt+t",
+        ),
+        (
+            "doc_parser",
+            "Document Parser & OCR",
+            "Opens document parser & vision OCR dialog.",
+            "ctrl+alt+d",
+        ),
+    ];
+
+    for (id, name, desc, def) in suite_bindings {
+        if !settings.bindings.contains_key(id) {
+            settings.bindings.insert(
+                id.to_string(),
+                ShortcutBinding {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    description: desc.to_string(),
+                    default_binding: def.to_string(),
+                    current_binding: def.to_string(),
+                },
+            );
+            updated = true;
+        }
+    }
+
+    // Merge any missing default transcription providers
+    for default_p in default_transcription_providers() {
+        if !settings
+            .transcription_providers
+            .iter()
+            .any(|p| p.id == default_p.id)
+        {
+            settings.transcription_providers.push(default_p);
+            updated = true;
+        }
+    }
+
+    // Merge any missing default post process providers
+    for default_p in default_post_process_providers() {
+        if !settings
+            .post_process_providers
+            .iter()
+            .any(|p| p.id == default_p.id)
+        {
+            settings.post_process_providers.push(default_p);
+            updated = true;
+        }
+    }
+
+    // Initialize web providers if empty
+    if settings.web_providers.is_empty() {
+        settings.web_providers = default_web_providers();
+        updated = true;
+    }
+
+    // Upgrade Firecrawl base URL from /v1 to /v2 if present
+    for wp in &mut settings.web_providers {
+        if wp.id == "firecrawl"
+            && (wp.base_url == "https://api.firecrawl.dev/v1"
+                || wp.base_url == "https://api.firecrawl.dev")
+        {
+            wp.base_url = "https://api.firecrawl.dev/v2".to_string();
+            updated = true;
+        }
+    }
+
+    // Auto-heal any corrupted or legacy shortcut bindings (e.g. ones with "press <...>")
+    for binding in settings.bindings.values_mut() {
+        let cur = binding.current_binding.trim();
+        if cur.to_lowercase().starts_with("press ") || cur.contains('<') {
+            if let Some(cleaned) = crate::shortcut::portal::portal_trigger_to_otush_binding(cur) {
+                if cleaned != binding.current_binding {
+                    binding.current_binding = cleaned;
+                    updated = true;
+                }
+            }
+        }
     }
 
     updated
@@ -2140,6 +2462,37 @@ mod tests {
             parent_mode, 0o700,
             "Settings store parent dir must have 0700 permissions, got {:o}",
             parent_mode
+        );
+    }
+
+    #[test]
+    fn test_meta_provider_migrates_to_muse_spark_and_meta_ai_v1() {
+        let mut settings = get_default_settings();
+        // Simulate legacy store with Meta (Llama)
+        if let Some(meta_p) = settings
+            .post_process_providers
+            .iter_mut()
+            .find(|p| p.id == "meta")
+        {
+            meta_p.label = "Meta (Llama)".to_string();
+            meta_p.base_url = "https://api.llama.com/v1".to_string();
+        }
+        settings
+            .post_process_models
+            .insert("meta".to_string(), "llama-3.3-70b-instruct".to_string());
+
+        assert!(ensure_post_process_defaults(&mut settings));
+
+        let meta_p = settings
+            .post_process_providers
+            .iter()
+            .find(|p| p.id == "meta")
+            .unwrap();
+        assert_eq!(meta_p.label, "Meta");
+        assert_eq!(meta_p.base_url, "https://api.meta.ai/v1");
+        assert_eq!(
+            settings.post_process_models.get("meta").unwrap(),
+            "muse-spark-1.3"
         );
     }
 }

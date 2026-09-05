@@ -32,7 +32,71 @@ static MIGRATIONS: &[M] = &[
     M::up("CREATE INDEX IF NOT EXISTS idx_history_saved_timestamp ON transcription_history (saved, timestamp DESC);"),
     M::up("ALTER TABLE transcription_history ADD COLUMN entry_kind TEXT NOT NULL DEFAULT 'transcription';"),
     M::up("UPDATE transcription_history SET entry_kind = 'post_process' WHERE post_process_requested = 1;"),
+    M::up(
+        "CREATE TABLE IF NOT EXISTS suite_notes (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            content TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL,
+            tags TEXT NOT NULL DEFAULT '',
+            pinned BOOLEAN NOT NULL DEFAULT 0
+        );",
+    ),
+    M::up(
+        "CREATE TABLE IF NOT EXISTS suite_todos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            task TEXT NOT NULL,
+            completed BOOLEAN NOT NULL DEFAULT 0,
+            created_at INTEGER NOT NULL,
+            completed_at INTEGER,
+            priority INTEGER NOT NULL DEFAULT 0,
+            due_date INTEGER
+        );",
+    ),
+    M::up(
+        "CREATE TABLE IF NOT EXISTS suite_docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            title TEXT NOT NULL,
+            file_name TEXT NOT NULL,
+            parsed_content TEXT NOT NULL,
+            doc_type TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );",
+    ),
 ];
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuiteNote {
+    pub id: i64,
+    pub title: String,
+    pub content: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+    pub tags: String,
+    pub pinned: bool,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuiteTodo {
+    pub id: i64,
+    pub task: String,
+    pub completed: bool,
+    pub created_at: i64,
+    pub completed_at: Option<i64>,
+    pub priority: i32,
+    pub due_date: Option<i64>,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct SuiteDoc {
+    pub id: i64,
+    pub title: String,
+    pub file_name: String,
+    pub parsed_content: String,
+    pub doc_type: String,
+    pub created_at: i64,
+}
 
 fn default_entry_kind() -> String {
     "transcription".to_string()
@@ -671,6 +735,294 @@ impl HistoryManager {
             format!("Recording {}", timestamp)
         }
     }
+
+    // ========================================================================
+    // Suite Notes Methods
+    // ========================================================================
+
+    pub fn save_note(
+        &self,
+        title: String,
+        content: String,
+        tags: Option<String>,
+    ) -> Result<SuiteNote> {
+        let conn = self.get_connection()?;
+        let now = Utc::now().timestamp();
+        let tags_str = tags.unwrap_or_default();
+        let title_clean = if title.trim().is_empty() {
+            "Untitled Note".to_string()
+        } else {
+            title.trim().to_string()
+        };
+
+        conn.execute(
+            "INSERT INTO suite_notes (title, content, created_at, updated_at, tags, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+            params![title_clean, content, now, now, tags_str],
+        )?;
+
+        let id = conn.last_insert_rowid();
+        Ok(SuiteNote {
+            id,
+            title: title_clean,
+            content,
+            created_at: now,
+            updated_at: now,
+            tags: tags_str,
+            pinned: false,
+        })
+    }
+
+    pub fn update_note(
+        &self,
+        id: i64,
+        title: String,
+        content: String,
+        tags: Option<String>,
+    ) -> Result<()> {
+        let conn = self.get_connection()?;
+        let now = Utc::now().timestamp();
+        let tags_str = tags.unwrap_or_default();
+        let title_clean = if title.trim().is_empty() {
+            "Untitled Note".to_string()
+        } else {
+            title.trim().to_string()
+        };
+
+        conn.execute(
+            "UPDATE suite_notes SET title = ?1, content = ?2, updated_at = ?3, tags = ?4 WHERE id = ?5",
+            params![title_clean, content, now, tags_str, id],
+        )?;
+        Ok(())
+    }
+
+    pub fn delete_note(&self, id: i64) -> Result<()> {
+        let conn = self.get_connection()?;
+        conn.execute("DELETE FROM suite_notes WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn toggle_pin_note(&self, id: i64) -> Result<bool> {
+        let conn = self.get_connection()?;
+        let current: bool = conn.query_row(
+            "SELECT pinned FROM suite_notes WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let new_state = !current;
+        conn.execute(
+            "UPDATE suite_notes SET pinned = ?1 WHERE id = ?2",
+            params![new_state, id],
+        )?;
+        Ok(new_state)
+    }
+
+    pub fn list_notes(&self, query: Option<&str>) -> Result<Vec<SuiteNote>> {
+        let conn = self.get_connection()?;
+        let mut notes = Vec::new();
+        match query {
+            Some(q) if !q.trim().is_empty() => {
+                let pattern = format!("%{}%", q.trim());
+                let mut stmt = conn.prepare(
+                    "SELECT id, title, content, created_at, updated_at, tags, pinned
+                     FROM suite_notes
+                     WHERE title LIKE ?1 OR content LIKE ?1 OR tags LIKE ?1
+                     ORDER BY pinned DESC, updated_at DESC",
+                )?;
+                let rows = stmt.query_map(params![pattern], |row| {
+                    Ok(SuiteNote {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        content: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        tags: row.get(5)?,
+                        pinned: row.get(6)?,
+                    })
+                })?;
+                for r in rows {
+                    notes.push(r?);
+                }
+                Ok(notes)
+            }
+            _ => {
+                let mut stmt = conn.prepare(
+                    "SELECT id, title, content, created_at, updated_at, tags, pinned
+                     FROM suite_notes
+                     ORDER BY pinned DESC, updated_at DESC",
+                )?;
+                let rows = stmt.query_map([], |row| {
+                    Ok(SuiteNote {
+                        id: row.get(0)?,
+                        title: row.get(1)?,
+                        content: row.get(2)?,
+                        created_at: row.get(3)?,
+                        updated_at: row.get(4)?,
+                        tags: row.get(5)?,
+                        pinned: row.get(6)?,
+                    })
+                })?;
+                for r in rows {
+                    notes.push(r?);
+                }
+                Ok(notes)
+            }
+        }
+    }
+
+    // ========================================================================
+    // Suite Todos Methods
+    // ========================================================================
+
+    pub fn save_todo(
+        &self,
+        task: String,
+        priority: i32,
+        due_date: Option<i64>,
+    ) -> Result<SuiteTodo> {
+        let conn = self.get_connection()?;
+        let now = Utc::now().timestamp();
+        let task_clean = task.trim().to_string();
+
+        conn.execute(
+            "INSERT INTO suite_todos (task, completed, created_at, priority, due_date)
+             VALUES (?1, 0, ?2, ?3, ?4)",
+            params![task_clean, now, priority, due_date],
+        )?;
+
+        let id = conn.last_insert_rowid();
+        Ok(SuiteTodo {
+            id,
+            task: task_clean,
+            completed: false,
+            created_at: now,
+            completed_at: None,
+            priority,
+            due_date,
+        })
+    }
+
+    pub fn toggle_todo(&self, id: i64) -> Result<bool> {
+        let conn = self.get_connection()?;
+        let current: bool = conn.query_row(
+            "SELECT completed FROM suite_todos WHERE id = ?1",
+            params![id],
+            |row| row.get(0),
+        )?;
+        let new_state = !current;
+        let now = if new_state {
+            Some(Utc::now().timestamp())
+        } else {
+            None
+        };
+        conn.execute(
+            "UPDATE suite_todos SET completed = ?1, completed_at = ?2 WHERE id = ?3",
+            params![new_state, now, id],
+        )?;
+        Ok(new_state)
+    }
+
+    pub fn delete_todo(&self, id: i64) -> Result<()> {
+        let conn = self.get_connection()?;
+        conn.execute("DELETE FROM suite_todos WHERE id = ?1", params![id])?;
+        Ok(())
+    }
+
+    pub fn list_todos(&self, include_completed: bool) -> Result<Vec<SuiteTodo>> {
+        let conn = self.get_connection()?;
+        let mut todos = Vec::new();
+        let sql = if include_completed {
+            "SELECT id, task, completed, created_at, completed_at, priority, due_date
+             FROM suite_todos
+             ORDER BY completed ASC, priority DESC, created_at DESC"
+        } else {
+            "SELECT id, task, completed, created_at, completed_at, priority, due_date
+             FROM suite_todos
+             WHERE completed = 0
+             ORDER BY priority DESC, created_at DESC"
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SuiteTodo {
+                id: row.get(0)?,
+                task: row.get(1)?,
+                completed: row.get(2)?,
+                created_at: row.get(3)?,
+                completed_at: row.get(4)?,
+                priority: row.get(5)?,
+                due_date: row.get(6)?,
+            })
+        })?;
+        for r in rows {
+            todos.push(r?);
+        }
+        Ok(todos)
+    }
+
+    pub fn clear_completed_todos(&self) -> Result<usize> {
+        let conn = self.get_connection()?;
+        let affected = conn.execute("DELETE FROM suite_todos WHERE completed = 1", [])?;
+        Ok(affected)
+    }
+
+    // ========================================================================
+    // Suite Docs Methods
+    // ========================================================================
+
+    pub fn save_doc(
+        &self,
+        title: String,
+        file_name: String,
+        parsed_content: String,
+        doc_type: String,
+    ) -> Result<SuiteDoc> {
+        let conn = self.get_connection()?;
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO suite_docs (title, file_name, parsed_content, doc_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![title, file_name, parsed_content, doc_type, now],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(SuiteDoc {
+            id,
+            title,
+            file_name,
+            parsed_content,
+            doc_type,
+            created_at: now,
+        })
+    }
+
+    pub fn list_docs(&self) -> Result<Vec<SuiteDoc>> {
+        let conn = self.get_connection()?;
+        let mut docs = Vec::new();
+        let mut stmt = conn.prepare(
+            "SELECT id, title, file_name, parsed_content, doc_type, created_at
+             FROM suite_docs
+             ORDER BY created_at DESC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok(SuiteDoc {
+                id: row.get(0)?,
+                title: row.get(1)?,
+                file_name: row.get(2)?,
+                parsed_content: row.get(3)?,
+                doc_type: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        for r in rows {
+            docs.push(r?);
+        }
+        Ok(docs)
+    }
+
+    pub fn delete_doc(&self, id: i64) -> Result<()> {
+        let conn = self.get_connection()?;
+        conn.execute("DELETE FROM suite_docs WHERE id = ?1", params![id])?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -772,5 +1124,66 @@ mod tests {
         assert_eq!(entry.timestamp, 100);
         assert_eq!(entry.transcription_text, "completed");
         assert_eq!(entry.entry_kind, "transcription");
+    }
+
+    #[test]
+    fn test_suite_migrations_and_crud() {
+        let mut conn = Connection::open_in_memory().expect("open in-memory db");
+        let migrations = Migrations::new(MIGRATIONS.to_vec());
+        migrations
+            .to_latest(&mut conn)
+            .expect("apply migrations to latest");
+
+        // Test notes
+        conn.execute(
+            "INSERT INTO suite_notes (title, content, created_at, updated_at, tags, pinned)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "Meeting Idea",
+                "Build GNOME suite",
+                1000,
+                1000,
+                "work",
+                true
+            ],
+        )
+        .expect("insert note");
+
+        let note_count: i64 = conn
+            .query_row("SELECT count(*) FROM suite_notes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(note_count, 1);
+
+        // Test todos
+        conn.execute(
+            "INSERT INTO suite_todos (task, completed, created_at, priority, due_date)
+             VALUES (?1, 0, ?2, 1, NULL)",
+            params!["Review pull request", 1000],
+        )
+        .expect("insert todo");
+
+        let todo_count: i64 = conn
+            .query_row("SELECT count(*) FROM suite_todos", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(todo_count, 1);
+
+        // Test docs
+        conn.execute(
+            "INSERT INTO suite_docs (title, file_name, parsed_content, doc_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                "Architecture",
+                "arch.pdf",
+                "# Markdown Content",
+                "pdf",
+                1000
+            ],
+        )
+        .expect("insert doc");
+
+        let doc_count: i64 = conn
+            .query_row("SELECT count(*) FROM suite_docs", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(doc_count, 1);
     }
 }

@@ -34,6 +34,7 @@ mod tray_i18n;
 mod ui;
 mod updater;
 mod utils;
+pub mod web_client;
 
 pub use cli::CliArgs;
 pub use context::{AppContext, AppEvent, AppPaths, EventBus};
@@ -303,9 +304,42 @@ fn run_headless_transcription(ctx: &AppContext, args: &CliArgs) -> i32 {
     0
 }
 
+#[cfg(target_os = "linux")]
+unsafe extern "C" fn noop_alsa_error_handler(
+    _file: *const std::os::raw::c_char,
+    _line: std::os::raw::c_int,
+    _func: *const std::os::raw::c_char,
+    _err: std::os::raw::c_int,
+    _fmt: *const std::os::raw::c_char,
+) {
+    // Silence ALSA library stderr error spew (e.g. "Unknown PCM pulse/jack/oss")
+}
+
+#[cfg(target_os = "linux")]
+pub fn silence_alsa_logging() {
+    unsafe {
+        type SndLibErrorHandler = unsafe extern "C" fn(
+            *const std::os::raw::c_char,
+            std::os::raw::c_int,
+            *const std::os::raw::c_char,
+            std::os::raw::c_int,
+            *const std::os::raw::c_char,
+        );
+        extern "C" {
+            fn snd_lib_error_set_handler(handler: SndLibErrorHandler) -> std::os::raw::c_int;
+        }
+        snd_lib_error_set_handler(noop_alsa_error_handler);
+    }
+}
+
+#[cfg(not(target_os = "linux"))]
+pub fn silence_alsa_logging() {}
+
 /// Application entry point. Headless one-shot flags run without any GUI; the
 /// GUI shell (GTK4/libadwaita) is initialized by `app.rs` once it lands.
 pub fn run(cli_args: CliArgs) {
+    silence_alsa_logging();
+
     // Pin glibc's dynamic mmap threshold before the first large allocation,
     // so per-dictation transient buffers are returned to the OS on free
     // instead of accumulating in malloc arenas (#1792).

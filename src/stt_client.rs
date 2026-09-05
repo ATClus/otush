@@ -598,6 +598,278 @@ async fn transcribe_google_gemini(
     Ok(text.trim().to_string())
 }
 
+/// Transcribe audio using Gladia API v2.
+async fn transcribe_gladia(
+    provider: &TranscriptionProvider,
+    api_key: &str,
+    _model: &str,
+    language: &str,
+    wav_bytes: Vec<u8>,
+) -> Result<String, String> {
+    let base_url = provider.base_url.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(provider.timeout_seconds.max(30) as u64))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    // Step 1: Upload audio file
+    let upload_url = format!("{}/upload", base_url);
+    let part = reqwest::multipart::Part::bytes(wav_bytes)
+        .file_name("audio.wav")
+        .mime_str("audio/wav")
+        .map_err(|e| format!("Failed to build multipart payload: {e}"))?;
+
+    let form = reqwest::multipart::Form::new().part("audio", part);
+    let upload_resp = client
+        .post(&upload_url)
+        .header("x-gladia-key", api_key)
+        .header(USER_AGENT, "Otush/1.0 (+https://github.com/ATClus/otush)")
+        .multipart(form)
+        .send()
+        .await
+        .map_err(|e| format!("Gladia upload failed: {e}"))?;
+
+    if !upload_resp.status().is_success() {
+        let err_text = upload_resp.text().await.unwrap_or_default();
+        return Err(format!("Gladia upload error: {err_text}"));
+    }
+
+    let upload_json: Value = upload_resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Gladia upload response: {e}"))?;
+
+    let audio_url = upload_json
+        .get("audio_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "Gladia response missing audio_url".to_string())?;
+
+    // Step 2: Request transcription
+    let prerecorded_url = format!("{}/pre-recorded", base_url);
+    let mut payload = serde_json::json!({
+        "audio_url": audio_url,
+        "diarization": false
+    });
+
+    let lang_clean = language.trim();
+    if !lang_clean.is_empty() && !lang_clean.eq_ignore_ascii_case("auto") {
+        let code = lang_clean.split('-').next().unwrap_or(lang_clean);
+        payload["language"] = serde_json::Value::String(code.to_string());
+    }
+
+    let start_resp = client
+        .post(&prerecorded_url)
+        .header("x-gladia-key", api_key)
+        .header(CONTENT_TYPE, "application/json")
+        .header(USER_AGENT, "Otush/1.0 (+https://github.com/ATClus/otush)")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("Gladia pre-recorded request failed: {e}"))?;
+
+    if !start_resp.status().is_success() {
+        let err_text = start_resp.text().await.unwrap_or_default();
+        return Err(format!("Gladia transcription request error: {err_text}"));
+    }
+
+    let start_json: Value = start_resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse Gladia pre-recorded response: {e}"))?;
+
+    let poll_url = if let Some(r_url) = start_json.get("result_url").and_then(|v| v.as_str()) {
+        r_url.to_string()
+    } else if let Some(id) = start_json.get("id").and_then(|v| v.as_str()) {
+        format!("{}/pre-recorded/{}", base_url, id)
+    } else {
+        return Err("Gladia response missing result_url or id".to_string());
+    };
+
+    // Step 3: Poll for completion
+    let poll_interval = Duration::from_millis(500);
+    let max_polls = 60; // Up to 30 seconds
+
+    for _ in 0..max_polls {
+        tokio::time::sleep(poll_interval).await;
+        let poll_resp = client
+            .get(&poll_url)
+            .header("x-gladia-key", api_key)
+            .send()
+            .await
+            .map_err(|e| format!("Gladia poll failed: {e}"))?;
+
+        if !poll_resp.status().is_success() {
+            continue;
+        }
+
+        let poll_json: Value = poll_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse Gladia poll response: {e}"))?;
+
+        let status = poll_json
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if status.eq_ignore_ascii_case("done") {
+            let transcript = poll_json
+                .pointer("/result/transcription/full_transcript")
+                .and_then(|v| v.as_str())
+                .or_else(|| {
+                    poll_json
+                        .pointer("/result/transcription/transcript")
+                        .and_then(|v| v.as_str())
+                })
+                .or_else(|| {
+                    poll_json
+                        .pointer("/transcription/full_transcript")
+                        .and_then(|v| v.as_str())
+                })
+                .unwrap_or_default();
+            return Ok(transcript.trim().to_string());
+        } else if status.eq_ignore_ascii_case("error") {
+            let err_msg = poll_json
+                .pointer("/error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+            return Err(format!("Gladia processing failed: {err_msg}"));
+        }
+    }
+
+    Err("Gladia transcription timed out waiting for results".to_string())
+}
+
+/// Transcribe audio using AssemblyAI API v2.
+async fn transcribe_assemblyai(
+    provider: &TranscriptionProvider,
+    api_key: &str,
+    model: &str,
+    language: &str,
+    wav_bytes: Vec<u8>,
+) -> Result<String, String> {
+    let base_url = provider.base_url.trim_end_matches('/');
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(provider.timeout_seconds.max(30) as u64))
+        .build()
+        .map_err(|e| format!("Failed to create HTTP client: {e}"))?;
+
+    // Step 1: Upload audio file
+    let upload_url = format!("{}/upload", base_url);
+    let upload_resp = client
+        .post(&upload_url)
+        .header(AUTHORIZATION, api_key)
+        .header(CONTENT_TYPE, "application/octet-stream")
+        .header(USER_AGENT, "Otush/1.0 (+https://github.com/ATClus/otush)")
+        .body(wav_bytes)
+        .send()
+        .await
+        .map_err(|e| format!("AssemblyAI upload failed: {e}"))?;
+
+    if !upload_resp.status().is_success() {
+        let err_text = upload_resp.text().await.unwrap_or_default();
+        return Err(format!("AssemblyAI upload error: {err_text}"));
+    }
+
+    let upload_json: Value = upload_resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse AssemblyAI upload response: {e}"))?;
+
+    let upload_url_str = upload_json
+        .get("upload_url")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "AssemblyAI response missing upload_url".to_string())?;
+
+    // Step 2: Request transcription
+    let transcript_url = format!("{}/transcript", base_url);
+    let effective_model = if model.trim().is_empty() {
+        "best"
+    } else {
+        model.trim()
+    };
+    let mut payload = serde_json::json!({
+        "audio_url": upload_url_str,
+        "speech_model": effective_model
+    });
+
+    let lang_clean = language.trim();
+    if !lang_clean.is_empty() && !lang_clean.eq_ignore_ascii_case("auto") {
+        let code = lang_clean.split('-').next().unwrap_or(lang_clean);
+        payload["language_code"] = serde_json::Value::String(code.to_string());
+    }
+
+    let start_resp = client
+        .post(&transcript_url)
+        .header(AUTHORIZATION, api_key)
+        .header(CONTENT_TYPE, "application/json")
+        .header(USER_AGENT, "Otush/1.0 (+https://github.com/ATClus/otush)")
+        .json(&payload)
+        .send()
+        .await
+        .map_err(|e| format!("AssemblyAI transcript request failed: {e}"))?;
+
+    if !start_resp.status().is_success() {
+        let err_text = start_resp.text().await.unwrap_or_default();
+        return Err(format!("AssemblyAI transcript request error: {err_text}"));
+    }
+
+    let start_json: Value = start_resp
+        .json()
+        .await
+        .map_err(|e| format!("Failed to parse AssemblyAI transcript response: {e}"))?;
+
+    let transcript_id = start_json
+        .get("id")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| "AssemblyAI response missing transcript id".to_string())?;
+
+    // Step 3: Poll for completion
+    let poll_url = format!("{}/transcript/{}", base_url, transcript_id);
+    let poll_interval = Duration::from_millis(500);
+    let max_polls = 60; // Up to 30 seconds
+
+    for _ in 0..max_polls {
+        tokio::time::sleep(poll_interval).await;
+        let poll_resp = client
+            .get(&poll_url)
+            .header(AUTHORIZATION, api_key)
+            .send()
+            .await
+            .map_err(|e| format!("AssemblyAI poll failed: {e}"))?;
+
+        if !poll_resp.status().is_success() {
+            continue;
+        }
+
+        let poll_json: Value = poll_resp
+            .json()
+            .await
+            .map_err(|e| format!("Failed to parse AssemblyAI poll response: {e}"))?;
+
+        let status = poll_json
+            .get("status")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+
+        if status.eq_ignore_ascii_case("completed") {
+            let text = poll_json
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            return Ok(text.trim().to_string());
+        } else if status.eq_ignore_ascii_case("error") {
+            let err_msg = poll_json
+                .get("error")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Unknown error");
+            return Err(format!("AssemblyAI processing failed: {err_msg}"));
+        }
+    }
+
+    Err("AssemblyAI transcription timed out waiting for results".to_string())
+}
+
 /// Transcribe audio samples using the cloud providers in priority order with automatic fallback.
 pub async fn transcribe_with_fallback(
     settings: &AppSettings,
@@ -651,6 +923,12 @@ pub async fn transcribe_with_fallback(
             "gemini" => {
                 transcribe_google_gemini(provider, &api_key, &model, language, wav_bytes.clone())
                     .await
+            }
+            "gladia" => {
+                transcribe_gladia(provider, &api_key, &model, language, wav_bytes.clone()).await
+            }
+            "assemblyai" => {
+                transcribe_assemblyai(provider, &api_key, &model, language, wav_bytes.clone()).await
             }
             _ => {
                 transcribe_openai_compatible(
@@ -706,6 +984,8 @@ pub async fn test_transcription_provider(
     let result = match provider.id.as_str() {
         "deepgram" => transcribe_deepgram(provider, &api_key, model, language, wav_bytes).await,
         "gemini" => transcribe_google_gemini(provider, &api_key, model, language, wav_bytes).await,
+        "gladia" => transcribe_gladia(provider, &api_key, model, language, wav_bytes).await,
+        "assemblyai" => transcribe_assemblyai(provider, &api_key, model, language, wav_bytes).await,
         _ => transcribe_openai_compatible(provider, &api_key, model, language, wav_bytes).await,
     };
 
@@ -743,12 +1023,14 @@ mod tests {
     #[test]
     fn test_default_transcription_providers_structure() {
         let providers = crate::settings::default_transcription_providers();
-        assert_eq!(providers.len(), 5);
+        assert_eq!(providers.len(), 7);
         assert_eq!(providers[0].id, "deepgram");
         assert_eq!(providers[1].id, "groq");
         assert_eq!(providers[2].id, "openai");
         assert_eq!(providers[3].id, "gemini");
-        assert_eq!(providers[4].id, "custom");
+        assert_eq!(providers[4].id, "gladia");
+        assert_eq!(providers[5].id, "assemblyai");
+        assert_eq!(providers[6].id, "custom");
 
         let dg = &providers[0];
         assert!(dg.deepgram.is_some());

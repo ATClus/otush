@@ -2,10 +2,15 @@
 
 pub mod advanced;
 pub mod audio;
+pub mod docs;
 pub mod general;
 pub mod history;
 pub mod models;
+pub mod notes;
+pub mod providers;
 pub mod providers_llm;
+pub mod research;
+pub mod todos;
 
 use crate::context::AppContext;
 use libadwaita::prelude::*;
@@ -44,8 +49,13 @@ pub fn build_page(id: &str, ctx: &AppContext) -> gtk4::Widget {
     match id {
         "general" => general::build(ctx),
         "audio" => audio::build(ctx),
-        "models" | "transcription" | "providers" => models::build(ctx),
-        "post_processing" | "prompts" => providers_llm::build(ctx),
+        "models" | "transcription" | "speech" => models::build(ctx),
+        "post_processing" | "prompts" | "ai" => providers_llm::build(ctx),
+        "providers" | "cloud" => providers::build(ctx),
+        "notes" => notes::build(ctx),
+        "todos" => todos::build(ctx),
+        "docs" => docs::build(ctx),
+        "research" => research::build(ctx),
         "history" => history::build(ctx),
         "advanced" | "debug" | "about" => advanced::build(ctx),
         other => placeholder(other, ""),

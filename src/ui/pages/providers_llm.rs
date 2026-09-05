@@ -1,14 +1,12 @@
-//! AI & Prompts settings page: consolidating AI Post-Processing configuration,
-//! prompt templates management, and LLM provider fallback chains into one suite.
+//! AI & Prompts settings page: AI Post-Processing configuration,
+//! prompt templates management, and custom LLM prompt workflows.
 
 use crate::context::{AppContext, AppEvent};
-use crate::settings;
 use crate::shortcut;
+use gtk4::prelude::*;
 use libadwaita::prelude::*;
-use std::collections::HashSet;
-use std::sync::{Arc, Mutex};
 
-/// Build the unified AI & Prompts preferences page.
+/// Build the AI & Prompts preferences page.
 pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let page = libadwaita::PreferencesPage::new();
     page.set_title("AI &amp; Prompts");
@@ -17,10 +15,11 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     // --- 1. AI Master Mode & Active Template ---
     let post_process_group = libadwaita::PreferencesGroup::new();
     post_process_group.set_widget_name("post_processing_mode_group");
-    post_process_group.set_title("AI Post-Processing &amp; Mode");
+    post_process_group.set_title("AI Post-Processing");
     post_process_group.set_description(Some(
-        "Automatically refine, format, or translate transcripts using Large Language Models.",
+        "Automatically refine, summarize, format, or translate transcripts using Large Language Models.",
     ));
+    post_process_group.set_hexpand(true);
     page.add(&post_process_group);
 
     // --- 2. Prompt Templates ---
@@ -28,38 +27,24 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     prompts_group.set_widget_name("prompts_templates_group");
     prompts_group.set_title("Prompt Templates");
     prompts_group.set_description(Some(
-        "Manage reusable prompt templates. Variables: ${output}, ${selected_text}, ${clipboard}, ${active_window}, ${date}, ${language}.",
+        "Reusable prompt templates. Available variables: ${output}, ${selected_text}, ${clipboard}, ${active_window}, ${date}, ${language}.",
     ));
+    prompts_group.set_hexpand(true);
     page.add(&prompts_group);
-
-    // --- 3. LLM Providers & Fallback Chain ---
-    let providers_group = libadwaita::PreferencesGroup::new();
-    providers_group.set_widget_name("post_processing_providers_group");
-    providers_group.set_title("LLM Providers &amp; Fallback Chain");
-    providers_group.set_description(Some(
-        "Providers are queried in order of priority as a resilient fallback chain on rate limits or errors.",
-    ));
-    page.add(&providers_group);
-
-    let expanded_providers: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Initial render
     refresh_master_group(ctx, &post_process_group);
     refresh_prompts_group(ctx, &prompts_group);
-    refresh_providers_group(ctx, &providers_group, &expanded_providers);
 
     // Live refresh on bus events
     let post_weak = glib::SendWeakRef::from(post_process_group.downgrade());
     let prompts_weak = glib::SendWeakRef::from(prompts_group.downgrade());
-    let prov_weak = glib::SendWeakRef::from(providers_group.downgrade());
     let ctx_bus = ctx.clone();
 
     ctx.bus.subscribe(move |event| {
         let ctx = ctx_bus.clone();
         let post_weak = post_weak.clone();
         let prompts_weak = prompts_weak.clone();
-        let prov_weak = prov_weak.clone();
-        let exp_prov = expanded_providers.clone();
 
         glib::MainContext::default().invoke(move || {
             if let AppEvent::SettingsChanged { setting, .. } = event {
@@ -72,18 +57,14 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     }
                 } else if setting == "post_process_prompts"
                     || setting == "post_process_prompts_structure"
+                    || setting == "post_process_providers"
+                    || setting == "post_process_providers_reordered"
                 {
                     if let Some(grp) = prompts_weak.into_weak_ref().upgrade() {
                         refresh_prompts_group(&ctx, &grp);
                     }
                     if let Some(grp) = post_weak.into_weak_ref().upgrade() {
                         refresh_master_group(&ctx, &grp);
-                    }
-                } else if setting == "post_process_providers_reordered"
-                    || setting == "post_process_provider_models"
-                {
-                    if let Some(grp) = prov_weak.into_weak_ref().upgrade() {
-                        refresh_providers_group(&ctx, &grp, &exp_prov);
                     }
                 }
             }
@@ -102,19 +83,17 @@ fn refresh_master_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) 
     let master_switch = libadwaita::SwitchRow::new();
     master_switch.set_title("Enable AI Post-Processing");
     master_switch.set_subtitle("Apply LLM transformations automatically upon speech capture");
+    let star_icon = gtk4::Image::from_icon_name("starred-symbolic");
+    master_switch.add_prefix(&star_icon);
     master_switch.set_active(settings.post_process_enabled);
-
-    let switch_ctx = ctx.clone();
-    master_switch.connect_active_notify(move |row| {
-        let _ = shortcut::change_post_process_enabled_setting(&switch_ctx, row.is_active());
-    });
-    group.add(&master_switch);
-    crate::ui::pages::track_row(group, &master_switch);
 
     // Default Prompt Selector
     let prompt_row = libadwaita::ComboRow::new();
     prompt_row.set_title("Active Default Prompt");
-    prompt_row.set_subtitle("Default template used for speech transcription post-processing");
+    prompt_row.set_subtitle("Template executed for speech dictation post-processing");
+    let prompt_icon = gtk4::Image::from_icon_name("document-open-symbolic");
+    prompt_row.add_prefix(&prompt_icon);
+    prompt_row.set_visible(settings.post_process_enabled);
 
     let prompt_names: Vec<String> = settings
         .post_process_prompts
@@ -145,6 +124,20 @@ fn refresh_master_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) 
             let _ = shortcut::set_post_process_selected_prompt(&p_ctx, id.clone());
         }
     });
+
+    let switch_ctx = ctx.clone();
+    let prompt_row_weak = glib::SendWeakRef::from(prompt_row.downgrade());
+    master_switch.connect_active_notify(move |row| {
+        let is_active = row.is_active();
+        let _ = shortcut::change_post_process_enabled_setting(&switch_ctx, is_active);
+        if let Some(pr) = prompt_row_weak.clone().into_weak_ref().upgrade() {
+            pr.set_visible(is_active);
+        }
+    });
+
+    group.add(&master_switch);
+    crate::ui::pages::track_row(group, &master_switch);
+
     group.add(&prompt_row);
     crate::ui::pages::track_row(group, &prompt_row);
 }
@@ -171,6 +164,13 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
         row.set_title(&prompt.name);
         row.set_subtitle(&prompt.id);
 
+        let icon = gtk4::Image::from_icon_name(if prompt.id.starts_with("default_") {
+            "starred-symbolic"
+        } else {
+            "accessories-text-editor-symbolic"
+        });
+        row.add_prefix(&icon);
+
         // Delete Button (only for custom prompts)
         if !prompt.id.starts_with("default_") {
             let del_btn = gtk4::Button::from_icon_name("user-trash-symbolic");
@@ -188,6 +188,8 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
         // 1. Name Row
         let name_row = libadwaita::EntryRow::new();
         name_row.set_title("Prompt Name");
+        let name_icon = gtk4::Image::from_icon_name("document-edit-symbolic");
+        name_row.add_prefix(&name_icon);
         name_row.set_text(&prompt.name);
         let n_ctx = ctx.clone();
         let n_id = prompt.id.clone();
@@ -209,6 +211,8 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
         // 2. Preferred Provider Row
         let pref_prov_row = libadwaita::ComboRow::new();
         pref_prov_row.set_title("Preferred Provider");
+        let prov_icon = gtk4::Image::from_icon_name("network-server-symbolic");
+        pref_prov_row.add_prefix(&prov_icon);
         let prov_list = gtk4::StringList::new(
             &provider_names
                 .iter()
@@ -296,10 +300,18 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
     let add_row = libadwaita::ActionRow::new();
     add_row.set_title("Create New Custom Prompt Template");
     add_row.set_subtitle("Add a custom prompt instruction with dynamic variables like ${output}");
+    let add_icon = gtk4::Image::from_icon_name("list-add-symbolic");
+    add_row.add_prefix(&add_icon);
 
-    let add_btn = gtk4::Button::with_label("Add Prompt");
+    let add_btn = gtk4::Button::new();
+    let add_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    let add_btn_icon = gtk4::Image::from_icon_name("list-add-symbolic");
+    add_box.append(&add_btn_icon);
+    add_box.append(&gtk4::Label::new(Some("Add Prompt")));
+    add_btn.set_child(Some(&add_box));
     add_btn.set_valign(gtk4::Align::Center);
     add_btn.add_css_class("suggested-action");
+
     let add_ctx = ctx.clone();
     add_btn.connect_clicked(move |_| {
         let _ = shortcut::add_post_process_prompt(
@@ -311,243 +323,4 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
     add_row.add_suffix(&add_btn);
     group.add(&add_row);
     crate::ui::pages::track_row(group, &add_row);
-}
-
-fn refresh_providers_group(
-    ctx: &AppContext,
-    group: &libadwaita::PreferencesGroup,
-    expanded_ids: &Arc<Mutex<HashSet<String>>>,
-) {
-    crate::ui::pages::clear_group_rows(group);
-
-    let settings = settings::get_settings(ctx);
-    let total_providers = settings.post_process_providers.len();
-
-    for (idx, provider) in settings.post_process_providers.iter().enumerate() {
-        let row = libadwaita::ExpanderRow::new();
-        row.set_title(&format!("#{}: {}", idx + 1, provider.label));
-
-        let current_model = settings
-            .post_process_models
-            .get(&provider.id)
-            .cloned()
-            .unwrap_or_default();
-
-        let subtitle = if provider.allow_base_url_edit {
-            format!("Model: {} • Base URL: {}", current_model, provider.base_url)
-        } else {
-            format!("Model: {}", current_model)
-        };
-        row.set_subtitle(&subtitle);
-
-        let is_expanded = expanded_ids
-            .lock()
-            .map(|set| set.contains(&provider.id))
-            .unwrap_or(false);
-        row.set_expanded(is_expanded);
-
-        let exp_track = expanded_ids.clone();
-        let exp_pid = provider.id.clone();
-        row.connect_expanded_notify(move |r| {
-            if let Ok(mut set) = exp_track.lock() {
-                if r.is_expanded() {
-                    set.insert(exp_pid.clone());
-                } else {
-                    set.remove(&exp_pid);
-                }
-            }
-        });
-
-        // Priority Move Up button
-        if idx > 0 {
-            let up_btn = gtk4::Button::from_icon_name("go-up-symbolic");
-            up_btn.set_valign(gtk4::Align::Center);
-            up_btn.add_css_class("flat");
-            up_btn.set_tooltip_text(Some("Increase priority"));
-            let up_ctx = ctx.clone();
-            let up_pid = provider.id.clone();
-            up_btn.connect_clicked(move |_| {
-                let _ = shortcut::move_post_process_provider_priority(&up_ctx, &up_pid, true);
-            });
-            row.add_suffix(&up_btn);
-        }
-
-        // Priority Move Down button
-        if idx + 1 < total_providers {
-            let down_btn = gtk4::Button::from_icon_name("go-down-symbolic");
-            down_btn.set_valign(gtk4::Align::Center);
-            down_btn.add_css_class("flat");
-            down_btn.set_tooltip_text(Some("Decrease priority"));
-            let down_ctx = ctx.clone();
-            let down_pid = provider.id.clone();
-            down_btn.connect_clicked(move |_| {
-                let _ = shortcut::move_post_process_provider_priority(&down_ctx, &down_pid, false);
-            });
-            row.add_suffix(&down_btn);
-        }
-
-        // Enable / Disable switch
-        let enable_switch = gtk4::Switch::new();
-        enable_switch.set_active(provider.enabled);
-        enable_switch.set_valign(gtk4::Align::Center);
-        enable_switch.set_tooltip_text(Some("Enable/disable provider in fallback chain"));
-        let en_ctx = ctx.clone();
-        let en_id = provider.id.clone();
-        enable_switch.connect_active_notify(move |sw| {
-            let _ = shortcut::toggle_post_process_provider_enabled(
-                &en_ctx,
-                en_id.clone(),
-                sw.is_active(),
-            );
-        });
-        row.add_suffix(&enable_switch);
-
-        // Inner Settings:
-        // 1. API Key Row
-        let api_key_row = libadwaita::PasswordEntryRow::new();
-        api_key_row.set_title("API Key");
-        let api_key = settings
-            .post_process_api_keys
-            .get(&provider.id)
-            .cloned()
-            .unwrap_or_default();
-        api_key_row.set_text(&api_key);
-
-        let key_ctx = ctx.clone();
-        let key_id = provider.id.clone();
-        api_key_row.connect_changed(move |r| {
-            let _ = shortcut::change_post_process_api_key_setting(
-                &key_ctx,
-                key_id.clone(),
-                r.text().to_string(),
-            );
-        });
-        row.add_row(&api_key_row);
-
-        // 2. Model Row
-        let model_row = libadwaita::EntryRow::new();
-        model_row.set_title("Model");
-        model_row.set_text(&current_model);
-
-        let model_ctx = ctx.clone();
-        let model_id = provider.id.clone();
-        model_row.connect_changed(move |r| {
-            let _ = shortcut::change_post_process_model_setting(
-                &model_ctx,
-                model_id.clone(),
-                r.text().to_string(),
-            );
-        });
-        row.add_row(&model_row);
-
-        // 3. Base URL Row (if editable)
-        if provider.allow_base_url_edit {
-            let url_row = libadwaita::EntryRow::new();
-            url_row.set_title("Base URL");
-            url_row.set_text(&provider.base_url);
-
-            let url_ctx = ctx.clone();
-            let url_id = provider.id.clone();
-            url_row.connect_changed(move |r| {
-                let _ = shortcut::change_post_process_base_url_setting(
-                    &url_ctx,
-                    url_id.clone(),
-                    r.text().to_string(),
-                );
-            });
-            row.add_row(&url_row);
-        }
-
-        // 4. Request Timeout Row (SpinRow)
-        let timeout_adj = gtk4::Adjustment::new(
-            provider.timeout_seconds.max(15) as f64,
-            15.0,
-            600.0,
-            15.0,
-            30.0,
-            0.0,
-        );
-        let timeout_row = libadwaita::SpinRow::new(Some(&timeout_adj), 15.0, 0);
-        timeout_row.set_title("Request Timeout (seconds)");
-        timeout_row.set_subtitle(
-            "Recommended 120s+ for large transcripts, reasoning models or slow providers",
-        );
-        timeout_row.set_snap_to_ticks(true);
-        timeout_row.set_numeric(true);
-
-        let timeout_ctx = ctx.clone();
-        let timeout_id = provider.id.clone();
-        timeout_adj.connect_value_changed(move |adj| {
-            let val = adj.value().round() as u32;
-            let _ = shortcut::change_post_process_timeout_setting(
-                &timeout_ctx,
-                timeout_id.clone(),
-                val,
-            );
-        });
-        row.add_row(&timeout_row);
-
-        // 5. Test Connection Row
-        let test_row = libadwaita::ActionRow::new();
-        test_row.set_title("Connection Test");
-        test_row.set_subtitle("Send a short test query to verify API key and model availability");
-
-        let test_btn = gtk4::Button::with_label("Test Connection");
-        test_btn.set_valign(gtk4::Align::Center);
-        test_btn.add_css_class("suggested-action");
-
-        let test_ctx = ctx.clone();
-        let test_id = provider.id.clone();
-        let test_row_weak = glib::SendWeakRef::from(test_row.downgrade());
-        let test_btn_weak = glib::SendWeakRef::from(test_btn.downgrade());
-
-        test_btn.connect_clicked(move |_| {
-            if let Some(btn) = test_btn_weak.clone().into_weak_ref().upgrade() {
-                btn.set_sensitive(false);
-                btn.set_label("Testing…");
-            }
-            if let Some(r) = test_row_weak.clone().into_weak_ref().upgrade() {
-                r.set_subtitle("Connecting to LLM provider endpoint…");
-            }
-
-            let t_ctx = test_ctx.clone();
-            let t_id = test_id.clone();
-            let t_row_weak = test_row_weak.clone();
-            let t_btn_weak = test_btn_weak.clone();
-
-            crate::runtime::spawn(async move {
-                let res = shortcut::test_post_process_provider_connection(&t_ctx, t_id).await;
-                glib::MainContext::default().invoke(move || {
-                    if let Some(btn) = t_btn_weak.into_weak_ref().upgrade() {
-                        btn.set_sensitive(true);
-                        btn.set_label("Test Connection");
-                    }
-                    if let Some(r) = t_row_weak.into_weak_ref().upgrade() {
-                        match res {
-                            Ok((content, ms)) => {
-                                let label = if content.is_empty() {
-                                    format!("<span foreground=\"#2ec27e\">✓ Connected! Response latency: {}ms</span>", ms)
-                                } else {
-                                    format!("<span foreground=\"#2ec27e\">✓ Connected ({}ms): \"{}\"</span>", ms, glib::markup_escape_text(&content))
-                                };
-                                r.set_subtitle(&label);
-                            }
-                            Err(e) => {
-                                r.set_subtitle(&format!(
-                                    "<span foreground=\"#e01b24\">✗ Connection failed: {}</span>",
-                                    glib::markup_escape_text(&e)
-                                ));
-                            }
-                        }
-                    }
-                });
-            });
-        });
-
-        test_row.add_suffix(&test_btn);
-        row.add_row(&test_row);
-
-        group.add(&row);
-        crate::ui::pages::track_row(group, &row);
-    }
 }

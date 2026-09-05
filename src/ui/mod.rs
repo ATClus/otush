@@ -1,7 +1,9 @@
-//! GTK4/libadwaita UI.
-
+pub mod doc_parser;
 pub mod file_transcription;
 pub mod history_palette;
+pub mod notes_palette;
 pub mod pages;
 pub mod prompt_palette;
+pub mod search_overlay;
+pub mod todo_palette;
 pub mod window;

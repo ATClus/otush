@@ -1,5 +1,5 @@
-//! History settings page: global application history covering standard
-//! voice transcriptions, meeting minutes, AI prompt processings, and file transcriptions.
+//! History page: global application activity covering standard
+//! voice transcriptions, meeting minutes, AI prompt transformations, and file transcriptions.
 
 use crate::commands::history as history_cmds;
 use crate::context::{AppContext, AppEvent};
@@ -71,66 +71,67 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     page.set_title("History");
     page.set_icon_name(Some("document-open-recent-symbolic"));
 
-    // --- 1. Retention group ---
-    let retention_group = libadwaita::PreferencesGroup::new();
-    retention_group.set_title("Retention");
-
-    let limit_adjustment = gtk4::Adjustment::new(
-        ctx.settings().history_limit as f64,
-        1.0,
-        100.0,
-        1.0,
-        10.0,
-        0.0,
-    );
-    let limit_row = libadwaita::SpinRow::new(Some(&limit_adjustment), 0.0, 0);
-    limit_row.set_title("History limit");
-    limit_row.set_subtitle("Entries kept before the oldest are trimmed");
-    limit_row.set_snap_to_ticks(true);
-    limit_row.set_numeric(true);
-    let limit_ctx = ctx.clone();
-    limit_adjustment.connect_value_changed(move |adj| {
-        let ctx = limit_ctx.clone();
-        let value = adj.value() as usize;
-        glib::spawn_future_local(async move {
-            let _ = history_cmds::update_history_limit(&ctx, value).await;
-        });
-    });
-    retention_group.add(&limit_row);
-    page.add(&retention_group);
-
-    // --- 2. Filter & Search Controls ---
+    // ========================================================================
+    // 1. Filter & Search Controls (Top priority for workspace exploration)
+    // ========================================================================
     let filter_group = libadwaita::PreferencesGroup::new();
     filter_group.set_title("Filter &amp; Search");
+    filter_group.set_hexpand(true);
 
-    let controls_box = gtk4::Box::new(gtk4::Orientation::Vertical, 8);
+    let controls_box = gtk4::Box::new(gtk4::Orientation::Vertical, 10);
     controls_box.set_margin_top(4);
     controls_box.set_margin_bottom(8);
+    controls_box.set_hexpand(true);
 
     let search_entry = gtk4::SearchEntry::new();
     search_entry.set_placeholder_text(Some("Search transcripts, meeting minutes, or AI text…"));
+    search_entry.set_hexpand(true);
     controls_box.append(&search_entry);
 
-    let filter_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+    // Segmented linked toggle bar with native GNOME symbolic icons
+    let filter_row = gtk4::Box::new(gtk4::Orientation::Horizontal, 0);
+    filter_row.add_css_class("linked");
     filter_row.set_halign(gtk4::Align::Center);
+    filter_row.set_margin_top(2);
+    filter_row.set_margin_bottom(2);
 
     let filter_categories = [
-        (CategoryFilter::All, "All"),
-        (CategoryFilter::Voice, "🎙️ Voice"),
-        (CategoryFilter::Meeting, "👥 Meetings"),
-        (CategoryFilter::PostProcess, "✨ AI Polish"),
-        (CategoryFilter::File, "📁 Files"),
+        (CategoryFilter::All, "All", "view-grid-symbolic"),
+        (
+            CategoryFilter::Voice,
+            "Voice",
+            "audio-input-microphone-symbolic",
+        ),
+        (CategoryFilter::Meeting, "Meetings", "system-users-symbolic"),
+        (CategoryFilter::PostProcess, "AI Polish", "starred-symbolic"),
+        (CategoryFilter::File, "Files", "document-open-symbolic"),
     ];
 
-    let mut cat_buttons = Vec::new();
-    for (cat, label) in filter_categories {
-        let btn = gtk4::Button::with_label(label);
-        btn.add_css_class("flat");
-        if cat == CategoryFilter::All {
-            btn.add_css_class("suggested-action");
+    let mut group_btn: Option<gtk4::ToggleButton> = None;
+    for (cat, label, icon_name) in filter_categories {
+        let btn = gtk4::ToggleButton::new();
+        btn.set_group(group_btn.as_ref());
+        if group_btn.is_none() {
+            group_btn = Some(btn.clone());
+            btn.set_active(true);
         }
+
+        let btn_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        let icon = gtk4::Image::from_icon_name(icon_name);
+        icon.set_pixel_size(16);
+        btn_box.append(&icon);
+        let lbl = gtk4::Label::new(Some(label));
+        btn_box.append(&lbl);
+        btn.set_child(Some(&btn_box));
+
+        btn.connect_toggled(move |b| {
+            if b.is_active() {
+                HISTORY_FILTER.with(|f| *f.borrow_mut() = cat);
+                apply_history_filter();
+            }
+        });
+
         filter_row.append(&btn);
-        cat_buttons.push((cat, btn));
     }
     controls_box.append(&filter_row);
 
@@ -138,8 +139,11 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let overlay_action_row = libadwaita::ActionRow::new();
     overlay_action_row.set_title("Quick History Overlay");
     overlay_action_row
-        .set_subtitle("Open the floating quick-access history palette (Shortcut: Ctrl+Alt+H)");
+        .set_subtitle("Open floating quick-access history palette (Shortcut: Ctrl+Alt+H)");
     overlay_action_row.set_activatable(true);
+
+    let overlay_icon = gtk4::Image::from_icon_name("window-new-symbolic");
+    overlay_action_row.add_prefix(&overlay_icon);
 
     let open_overlay_btn = gtk4::Button::from_icon_name("window-new-symbolic");
     open_overlay_btn.set_tooltip_text(Some("Open History Overlay"));
@@ -160,30 +164,49 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     filter_group.add(&overlay_action_row);
     page.add(&filter_group);
 
-    // --- 3. Entries group ---
+    // ========================================================================
+    // 2. Entries Group (Main Activity Records)
+    // ========================================================================
     let entries_group = libadwaita::PreferencesGroup::new();
     entries_group.set_widget_name("history-list");
-    entries_group.set_title("Global Activity &amp; Records");
+    entries_group.set_title("Activity &amp; Transcripts");
     entries_group.set_description(Some(
-        "All voice recordings, meeting notes, AI transformations, and media transcripts.",
+        "Recorded voice dictations, meeting summaries, AI transformations, and media files.",
     ));
+    entries_group.set_hexpand(true);
     page.add(&entries_group);
 
-    // Category button click handlers
-    for (cat, btn) in cat_buttons.clone() {
-        let cat_buttons = cat_buttons.clone();
-        btn.connect_clicked(move |_| {
-            HISTORY_FILTER.with(|f| *f.borrow_mut() = cat);
-            for (c, b) in &cat_buttons {
-                if *c == cat {
-                    b.add_css_class("suggested-action");
-                } else {
-                    b.remove_css_class("suggested-action");
-                }
-            }
-            apply_history_filter();
+    // ========================================================================
+    // 3. Retention Group (Secondary preference placed neatly at the bottom)
+    // ========================================================================
+    let retention_group = libadwaita::PreferencesGroup::new();
+    retention_group.set_title("Storage &amp; Retention");
+    retention_group.set_hexpand(true);
+
+    let limit_adjustment = gtk4::Adjustment::new(
+        ctx.settings().history_limit as f64,
+        1.0,
+        100.0,
+        1.0,
+        10.0,
+        0.0,
+    );
+    let limit_row = libadwaita::SpinRow::new(Some(&limit_adjustment), 0.0, 0);
+    limit_row.set_title("History Retention Limit");
+    limit_row
+        .set_subtitle("Number of entries preserved before oldest items are automatically trimmed");
+    limit_row.set_snap_to_ticks(true);
+    limit_row.set_numeric(true);
+    let limit_ctx = ctx.clone();
+    limit_adjustment.connect_value_changed(move |adj| {
+        let ctx = limit_ctx.clone();
+        let value = adj.value() as usize;
+        glib::spawn_future_local(async move {
+            let _ = history_cmds::update_history_limit(&ctx, value).await;
         });
-    }
+    });
+    retention_group.add(&limit_row);
+    page.add(&retention_group);
 
     // Search entry handler
     search_entry.connect_search_changed(move |entry| {
@@ -232,22 +255,36 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
             };
             match result {
                 Ok(paginated) => {
+                    if paginated.entries.is_empty() {
+                        let empty_row = libadwaita::ActionRow::new();
+                        empty_row.set_title("No history entries yet");
+                        empty_row.set_subtitle(
+                            "Voice dictations, meetings, and AI transformations will appear here.",
+                        );
+                        let empty_icon =
+                            gtk4::Image::from_icon_name("document-open-recent-symbolic");
+                        empty_row.add_prefix(&empty_icon);
+                        empty_row.set_activatable(false);
+                        group.add(&empty_row);
+                        crate::ui::pages::track_row(&group, &empty_row);
+                        return;
+                    }
+
                     let mut new_tracked = Vec::new();
                     for entry in paginated.entries {
                         let row = libadwaita::ExpanderRow::new();
                         row.set_widget_name(&entry.id.to_string());
 
-                        // Category Badge
-                        let (kind_label, badge_style) = match entry.entry_kind.as_str() {
-                            "meeting" => ("👥 Meeting", "accent"),
-                            "post_process" => ("✨ AI Polish", "accent"),
-                            "file" => ("📁 File", "dim-label"),
-                            _ => ("🎙️ Voice", "accent"),
+                        // Category Symbolic Icon Prefix & Kind Title
+                        let (icon_name, kind_title) = match entry.entry_kind.as_str() {
+                            "meeting" => ("system-users-symbolic", "Meeting Minutes"),
+                            "post_process" => ("starred-symbolic", "AI Post-Processed"),
+                            "file" => ("document-open-symbolic", "Media File"),
+                            _ => ("audio-input-microphone-symbolic", "Voice Dictation"),
                         };
-                        let kind_badge = gtk4::Label::new(Some(kind_label));
-                        kind_badge.add_css_class("caption");
-                        kind_badge.add_css_class(badge_style);
-                        row.add_prefix(&kind_badge);
+                        let kind_icon = gtk4::Image::from_icon_name(icon_name);
+                        kind_icon.set_pixel_size(16);
+                        row.add_prefix(&kind_icon);
 
                         row.set_title(&glib::markup_escape_text(&entry.title));
                         let ts = chrono::DateTime::from_timestamp(entry.timestamp, 0)
@@ -256,7 +293,7 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                                 local.format("%Y-%m-%d %H:%M").to_string()
                             })
                             .unwrap_or_else(|| "unknown time".to_string());
-                        row.set_subtitle(&ts);
+                        row.set_subtitle(&format!("{} • {}", ts, kind_title));
                         row.set_expanded(false);
 
                         let primary_text = entry
@@ -271,11 +308,12 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                             .map(|pp| !pp.trim().is_empty() && pp != entry.transcription_text)
                             .unwrap_or(false);
 
+                        // Content rows inside the expanded body
                         if has_distinct_post_process {
                             let pp_text = entry.post_processed_text.as_deref().unwrap_or_default();
                             let processed_row = libadwaita::ActionRow::new();
                             let section_title = if entry.entry_kind == "meeting" {
-                                "Meeting Minutes & Summary"
+                                "Meeting Minutes &amp; Summary"
                             } else {
                                 "Processed Transcript"
                             };
@@ -316,26 +354,49 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                             row.add_row(&text_row);
                         }
 
-                        // Saved toggle
-                        let saved_row = libadwaita::SwitchRow::new();
-                        saved_row.set_title("Keep this entry");
-                        saved_row.set_active(entry.saved);
+                        // Child Management Row: Keep / Star toggle & Retry action
+                        let manage_row = libadwaita::ActionRow::new();
+                        manage_row.set_title("Keep this entry permanently");
+                        manage_row.set_subtitle(
+                            "Prevent automatic trimming when retention limit is reached",
+                        );
+
+                        let keep_switch = gtk4::Switch::new();
+                        keep_switch.set_active(entry.saved);
+                        keep_switch.set_valign(gtk4::Align::Center);
                         let save_ctx = ctx.clone();
                         let id = entry.id;
-                        saved_row.connect_active_notify(move |_r| {
+                        keep_switch.connect_active_notify(move |_r| {
                             let ctx = save_ctx.clone();
                             let id = id;
                             crate::runtime::spawn(async move {
                                 let _ = history_cmds::toggle_history_entry_saved(&ctx, id).await;
                             });
                         });
-                        row.add_row(&saved_row);
+                        manage_row.add_suffix(&keep_switch);
 
-                        // Copy button for the expander row header
+                        let retry_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
+                        retry_btn.set_tooltip_text(Some("Retry transcription"));
+                        retry_btn.set_valign(gtk4::Align::Center);
+                        retry_btn.add_css_class("flat");
+                        let retry_ctx = ctx.clone();
+                        let retry_id = entry.id;
+                        retry_btn.connect_clicked(move |_| {
+                            let ctx = retry_ctx.clone();
+                            let id = retry_id;
+                            crate::runtime::spawn(async move {
+                                let _ =
+                                    history_cmds::retry_history_entry_transcription(&ctx, id).await;
+                            });
+                        });
+                        manage_row.add_suffix(&retry_btn);
+                        row.add_row(&manage_row);
+
+                        // Primary Action 1: Copy button for the expander row header
                         let copy_button = create_copy_button(&ctx, primary_text);
                         row.add_suffix(&copy_button);
 
-                        // Audio Playback
+                        // Primary Action 2: Audio Playback (if audio file exists)
                         let is_playing = history_cmds::is_playing_history_audio(entry.id);
                         let play_button = if is_playing {
                             let btn = gtk4::Button::from_icon_name("media-playback-stop-symbolic");
@@ -347,6 +408,7 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                             btn
                         };
                         play_button.set_valign(gtk4::Align::Center);
+                        play_button.add_css_class("flat");
 
                         let audio_path = ctx.history.get_audio_file_path(&entry.file_name);
                         if !audio_path.exists() {
@@ -392,27 +454,9 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                                 });
                             });
                         }
-                        play_button.add_css_class("flat");
                         row.add_suffix(&play_button);
 
-                        // Retry
-                        let retry_button = gtk4::Button::from_icon_name("view-refresh-symbolic");
-                        retry_button.set_tooltip_text(Some("Retry transcription"));
-                        retry_button.set_valign(gtk4::Align::Center);
-                        retry_button.add_css_class("flat");
-                        let retry_ctx = ctx.clone();
-                        let retry_id = entry.id;
-                        retry_button.connect_clicked(move |_| {
-                            let ctx = retry_ctx.clone();
-                            let id = retry_id;
-                            crate::runtime::spawn(async move {
-                                let _ =
-                                    history_cmds::retry_history_entry_transcription(&ctx, id).await;
-                            });
-                        });
-                        row.add_suffix(&retry_button);
-
-                        // Delete
+                        // Primary Action 3: Delete button in header row
                         let delete_button = gtk4::Button::from_icon_name("user-trash-symbolic");
                         delete_button.set_tooltip_text(Some("Delete recording"));
                         delete_button.set_valign(gtk4::Align::Center);

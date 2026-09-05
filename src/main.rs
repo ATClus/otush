@@ -9,6 +9,7 @@ use clap::Parser;
 use otush::cli::CliArgs;
 
 fn main() {
+    otush::silence_alsa_logging();
     let cli_args = CliArgs::parse();
     otush::run(cli_args);
 }
