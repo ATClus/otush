@@ -1,7 +1,7 @@
 [package]
 name = "otush"
-version = "1.6.4"
-description = "Otush - a free, open source, offline speech-to-text application for GNOME"
+version = "1.7.1"
+description = "Otush - the native AI voice and productivity suite for GNOME"
 authors = ["Otush contributors"]
 edition = "2021"
 license = "MIT"
@@ -93,7 +93,7 @@ maintainer-scripts = "packaging/debian"
 copyright = "2026 Otush contributors"
 license-file = ["LICENSE", "4"]
 extended-description = """\
-Otush is a native GNOME (GTK4/libadwaita) speech-to-text application for Linux."""
+Otush is a native GNOME (GTK4/libadwaita) AI voice and productivity suite for Linux, featuring speech-to-text, meeting intelligence, notes, tasks, document OCR, and deep web research."""
 depends = "libgtk-4-1, libadwaita-1-0, libopenblas0, libasound2, libssl3, libvulkan1"
 section = "sound"
 priority = "optional"

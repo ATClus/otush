@@ -15,7 +15,7 @@ priority = "optional"
 maintainer = "Otush contributors <otush@clusterat.com>"
 maintainer-scripts = "."
 homepage = "https://github.com/ATClus/otush"
-description = "A free, open source, offline speech-to-text application for GNOME"
+description = "Native AI voice and productivity suite for GNOME"
 
 [source]
 root = ".."
