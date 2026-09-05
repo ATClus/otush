@@ -7,7 +7,7 @@
 //!
 //! The LLM and tool executor are injectable so the loop is unit-testable
 //! without network access; production wires
-//! [`crate::llm_client::send_chat_messages`] and [`crate::agents::tools`].
+//! [`crate::llm_client::send_chat_messages_streamed`] and [`crate::agents::tools`].
 
 use crate::agents::rag;
 use crate::agents::types::{AgentResolved, ResolvedTool};
@@ -27,6 +27,9 @@ pub struct ToolStep {
 /// multi-thread Tokio runtime.
 pub trait StepSink: Send + Sync {
     fn on_step(&self, step: ToolStep);
+    /// One streamed content token of the final answer (SSE delta). The
+    /// default ignores it so test sinks stay minimal.
+    fn on_token(&self, _delta: &str) {}
     fn is_cancelled(&self) -> bool {
         false
     }
@@ -43,12 +46,14 @@ pub struct RunOutcome {
 }
 
 /// LLM backend for the loop. Production uses
-/// [`crate::llm_client::send_chat_messages`].
+/// [`crate::llm_client::send_chat_messages_streamed`]; the optional
+/// `stream` sink receives SSE content deltas for live UI rendering.
 pub trait LlmBackend: Send + Sync {
     fn chat(
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
+        stream: Option<&dyn crate::llm_client::StreamSink>,
     ) -> impl std::future::Future<Output = Result<AssistantReply, String>> + Send;
 }
 
@@ -72,8 +77,9 @@ impl LlmBackend for LiveBackend {
         &self,
         messages: &[ChatMessage],
         tools: &[ToolDefinition],
+        stream: Option<&dyn crate::llm_client::StreamSink>,
     ) -> Result<AssistantReply, String> {
-        crate::llm_client::send_chat_messages(
+        crate::llm_client::send_chat_messages_streamed(
             &self.resolved.provider,
             self.resolved.api_key.clone(),
             &self.resolved.model,
@@ -84,6 +90,7 @@ impl LlmBackend for LiveBackend {
                 Some(tools.to_vec())
             },
             false,
+            stream,
         )
         .await
     }
@@ -138,13 +145,32 @@ where
 
     let tool_defs = crate::agents::tools::definitions(&agent.agent.effective_tools());
     let max_steps = agent.agent.effective_max_steps();
+    let tool_budget = agent.agent.effective_tool_budget();
     let mut steps_executed: u32 = 0;
+    // Per-tool call counts inside this turn: once a tool hits `tool_budget`,
+    // further calls are refused with a retry hint instead of executing.
+    let mut tool_counts: std::collections::HashMap<String, u32> = std::collections::HashMap::new();
+
+    /// Token forwarder: streams final-answer deltas to the step sink while
+    /// doubling as the `StreamSink` the LLM client needs for cancellation.
+    struct TokenForward<'a> {
+        sink: &'a dyn StepSink,
+    }
+    impl crate::llm_client::StreamSink for TokenForward<'_> {
+        fn on_token(&self, delta: &str) {
+            self.sink.on_token(delta);
+        }
+        fn is_cancelled(&self) -> bool {
+            self.sink.is_cancelled()
+        }
+    }
+    let forward = TokenForward { sink };
 
     loop {
         if sink.is_cancelled() {
             return Err("Chat stopped by user".to_string());
         }
-        let reply = llm.chat(&messages, &tool_defs).await?;
+        let reply = llm.chat(&messages, &tool_defs, Some(&forward)).await?;
         if reply.tool_calls.is_empty() {
             let text = reply.content.unwrap_or_default();
             return Ok(RunOutcome {
@@ -205,6 +231,21 @@ where
                 steps_executed += 1;
                 continue;
             }
+            let used = tool_counts.get(&tool.name).copied().unwrap_or(0);
+            if used >= tool_budget {
+                let msg = format!(
+                    "Tool '{}' already reached its per-turn budget ({tool_budget} calls). Summarize what you have or try a different tool instead of calling it again.",
+                    tool.name
+                );
+                messages.push(ChatMessage::tool_result(tool.id.clone(), msg.clone()));
+                sink.on_step(ToolStep {
+                    name: tool.name.clone(),
+                    summary: format!("budget reached ({tool_budget}) — refused"),
+                });
+                steps_executed += 1;
+                continue;
+            }
+            tool_counts.insert(tool.name.clone(), used + 1);
             match tools.execute(&tool.name, &tool.arguments).await {
                 Ok((content, summary)) => {
                     messages.push(ChatMessage::tool_result(tool.id.clone(), content));
@@ -312,6 +353,7 @@ mod tests {
             &self,
             _messages: &[ChatMessage],
             _tools: &[ToolDefinition],
+            _stream: Option<&dyn crate::llm_client::StreamSink>,
         ) -> Result<AssistantReply, String> {
             let mut replies = self.replies.lock().unwrap_or_else(|e| e.into_inner());
             Ok(replies.remove(0))
@@ -382,6 +424,7 @@ mod tests {
                 &self,
                 messages: &[ChatMessage],
                 _tools: &[ToolDefinition],
+                _stream: Option<&dyn crate::llm_client::StreamSink>,
             ) -> Result<AssistantReply, String> {
                 self.seen
                     .lock()
@@ -441,5 +484,84 @@ mod tests {
             .expect("turn");
         assert!(outcome.truncated_by_step_cap);
         assert_eq!(outcome.steps_executed, 1);
+    }
+
+    #[tokio::test]
+    async fn tool_budget_refuses_repeated_calls() {
+        let mut agent = test_agent();
+        agent.agent.max_tool_steps = 8;
+        agent.agent.tool_budget_per_tool = 1;
+        let llm = ScriptLlm {
+            replies: Mutex::new(vec![
+                tool_reply("c1", "tavily_search"),
+                tool_reply("c2", "tavily_search"),
+                AssistantReply {
+                    content: Some("summary".to_string()),
+                    tool_calls: vec![],
+                },
+            ]),
+        };
+        let tools = FakeTools {
+            calls: Mutex::new(Vec::new()),
+        };
+        let sink = RecordingSink {
+            steps: Mutex::new(Vec::new()),
+        };
+        let outcome = run_turn_with(&agent, vec![], "q", None, &llm, &tools, &sink)
+            .await
+            .expect("turn");
+        assert_eq!(outcome.text, "summary");
+        // Second call refused: only one real execution.
+        let calls = tools.calls.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(calls.len(), 1);
+        let steps = sink.steps.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(steps.len(), 2);
+        assert!(steps[1].summary.contains("budget reached"));
+    }
+
+    #[tokio::test]
+    async fn streamed_tokens_reach_the_sink() {
+        let agent = test_agent();
+        struct TokenLlm;
+        impl LlmBackend for TokenLlm {
+            async fn chat(
+                &self,
+                _messages: &[ChatMessage],
+                _tools: &[ToolDefinition],
+                stream: Option<&dyn crate::llm_client::StreamSink>,
+            ) -> Result<AssistantReply, String> {
+                let sink = stream.expect("stream sink");
+                sink.on_token("Hel");
+                sink.on_token("lo");
+                Ok(AssistantReply {
+                    content: Some("Hello".to_string()),
+                    tool_calls: vec![],
+                })
+            }
+        }
+        struct TokenSink {
+            tokens: Mutex<Vec<String>>,
+        }
+        impl StepSink for TokenSink {
+            fn on_step(&self, _step: ToolStep) {}
+            fn on_token(&self, delta: &str) {
+                self.tokens
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(delta.to_string());
+            }
+        }
+        let tools = FakeTools {
+            calls: Mutex::new(Vec::new()),
+        };
+        let sink = TokenSink {
+            tokens: Mutex::new(Vec::new()),
+        };
+        let outcome = run_turn_with(&agent, vec![], "q", None, &TokenLlm, &tools, &sink)
+            .await
+            .expect("turn");
+        assert_eq!(outcome.text, "Hello");
+        let tokens = sink.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(tokens.concat(), "Hello");
     }
 }

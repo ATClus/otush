@@ -147,6 +147,13 @@ pub enum AppEvent {
         tool: String,
         summary: String,
     },
+    /// One streamed content token (SSE delta) of the running turn. The UI
+    /// appends it to the live assistant bubble; deltas are never persisted
+    /// (only the final text is stored on `AgentDone`).
+    AgentToken {
+        chat_id: i64,
+        delta: String,
+    },
     /// A turn finished (`message_id` = placeholder row to replace).
     AgentDone {
         chat_id: i64,

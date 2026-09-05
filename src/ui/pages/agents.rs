@@ -184,6 +184,7 @@ fn refresh_agents_group(
             system_prompt: "You are a helpful assistant. Answer concisely in Markdown.".to_string(),
             enabled_tools: AGENT_TOOL_NAMES.iter().map(|s| s.to_string()).collect(),
             max_tool_steps: 6,
+            tool_budget_per_tool: 3,
             rag_enabled: true,
             rag_top_k: 4,
         };
@@ -407,6 +408,32 @@ fn build_agent_editor(
         }
     });
     row.add_row(&steps_row);
+
+    // Per-tool call budget spin.
+    let budget_adj = gtk4::Adjustment::new(
+        f64::from(agent.effective_tool_budget()),
+        1.0,
+        10.0,
+        1.0,
+        1.0,
+        0.0,
+    );
+    let budget_row = libadwaita::SpinRow::new(Some(&budget_adj), 1.0, 0);
+    budget_row.set_title("Calls per tool");
+    budget_row.set_subtitle("Max calls to the same tool inside one answer");
+    let ctx_budget = ctx.clone();
+    let edit_budget = edit.clone();
+    budget_row.connect_changed(move |row| {
+        let updated = {
+            let mut draft = edit_budget.borrow_mut();
+            draft.tool_budget_per_tool = row.value() as u32;
+            draft.clone()
+        };
+        if let Err(e) = crate::commands::agents::update_agent(&ctx_budget, updated) {
+            ctx_budget.report_error("update_agent", e);
+        }
+    });
+    row.add_row(&budget_row);
 
     // RAG toggles.
     let rag_row = libadwaita::SwitchRow::new();

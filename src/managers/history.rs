@@ -1178,6 +1178,21 @@ impl HistoryManager {
         }
     }
 
+    /// Rename a chat (title trimmed to 80 chars; empty keeps the old title).
+    pub fn rename_agent_chat(&self, chat_id: i64, title: &str) -> Result<()> {
+        let title = title.trim();
+        if title.is_empty() {
+            return Ok(());
+        }
+        let title: String = title.chars().take(80).collect();
+        let conn = self.get_connection()?;
+        conn.execute(
+            "UPDATE agent_chats SET title = ?1, updated_at = ?2 WHERE id = ?3",
+            params![title, Utc::now().timestamp(), chat_id],
+        )?;
+        Ok(())
+    }
+
     pub fn delete_agent_chat(&self, chat_id: i64) -> Result<()> {
         let conn = self.get_connection()?;
         conn.execute(
@@ -1588,5 +1603,29 @@ mod tests {
             .list_agent_messages(chat.id)
             .expect("list")
             .is_empty());
+    }
+
+    #[test]
+    fn agent_chat_rename_trims_and_ignores_empty() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = AppPaths {
+            data_dir: temp_dir.path().to_path_buf(),
+            resource_dir: temp_dir.path().to_path_buf(),
+            log_dir: temp_dir.path().to_path_buf(),
+        };
+        let manager = HistoryManager::new(&paths, EventBus::new()).expect("manager");
+        let chat = manager
+            .create_agent_chat("chat-assistant", "Old title")
+            .expect("create chat");
+        manager
+            .rename_agent_chat(chat.id, "  New title  ")
+            .expect("rename");
+        let chats = manager.list_agent_chats(None).expect("list");
+        assert_eq!(chats[0].title, "New title");
+        manager
+            .rename_agent_chat(chat.id, "   ")
+            .expect("empty rename");
+        let chats = manager.list_agent_chats(None).expect("list");
+        assert_eq!(chats[0].title, "New title");
     }
 }

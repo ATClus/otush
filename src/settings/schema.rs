@@ -133,6 +133,12 @@ pub const AGENT_TOOL_NAMES: &[&str] = &[
     "firecrawl_scrape",
 ];
 
+/// Default per-tool call budget inside one user turn (each tool may be
+/// called this many times before the runner refuses with a retry hint).
+pub(crate) fn default_agent_tool_budget() -> u32 {
+    3
+}
+
 /// An AI chat agent: a named persona bound to an LLM provider, with an
 /// optional model override, a tool allow-list, and RAG preferences.
 ///
@@ -157,6 +163,10 @@ pub struct AgentConfig {
     pub enabled_tools: Vec<String>,
     #[serde(default = "default_agent_max_steps")]
     pub max_tool_steps: u32,
+    /// Max calls per tool inside one turn (1..=10), guarding against loops
+    /// where the model repeats the same failing query.
+    #[serde(default = "default_agent_tool_budget")]
+    pub tool_budget_per_tool: u32,
     #[serde(default = "default_true")]
     pub rag_enabled: bool,
     #[serde(default = "default_agent_top_k")]
@@ -183,6 +193,11 @@ impl AgentConfig {
     /// Agentic loop cap, clamped to 1..=12.
     pub fn effective_max_steps(&self) -> u32 {
         self.max_tool_steps.clamp(1, 12)
+    }
+
+    /// Per-tool call budget per turn, clamped to 1..=10.
+    pub fn effective_tool_budget(&self) -> u32 {
+        self.tool_budget_per_tool.clamp(1, 10)
     }
 
     /// RAG retrieval depth, clamped to 1..=10.

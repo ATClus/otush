@@ -33,6 +33,15 @@ impl StepSink for LiveSink {
         });
     }
 
+    fn on_token(&self, delta: &str) {
+        // Coalescing happens in the UI (one GTK invoke per SSE chunk is
+        // fine at token rates; the label update is cheap).
+        self.bus.send(AppEvent::AgentToken {
+            chat_id: self.chat_id,
+            delta: delta.to_string(),
+        });
+    }
+
     fn is_cancelled(&self) -> bool {
         self.cancelled.load(Ordering::Relaxed)
     }
@@ -186,6 +195,34 @@ pub fn list_messages(ctx: &AppContext, chat_id: i64) -> CommandResult<Vec<AgentM
         .map_err(CommandError::Backend)
 }
 
+/// List recent chats, newest first (optionally filtered by agent).
+pub fn list_chats(
+    ctx: &AppContext,
+    agent_id: Option<&str>,
+) -> CommandResult<Vec<crate::managers::history::AgentChat>> {
+    ctx.history
+        .list_agent_chats(agent_id)
+        .map_err(CommandError::Backend)
+}
+
+/// Delete one chat and notify the overlay.
+pub fn delete_chat(ctx: &AppContext, chat_id: i64) -> CommandResult<()> {
+    ctx.history
+        .delete_agent_chat(chat_id)
+        .map_err(CommandError::Backend)?;
+    ctx.bus.send(AppEvent::AgentChatsChanged);
+    Ok(())
+}
+
+/// Rename one chat and notify the overlay.
+pub fn rename_chat(ctx: &AppContext, chat_id: i64, title: &str) -> CommandResult<()> {
+    ctx.history
+        .rename_agent_chat(chat_id, title)
+        .map_err(CommandError::Backend)?;
+    ctx.bus.send(AppEvent::AgentChatsChanged);
+    Ok(())
+}
+
 /// Cancel the in-flight turn of a chat, if any.
 pub fn stop_chat(ctx: &AppContext, chat_id: i64) -> CommandResult<()> {
     if let Some(sink) = take_sink(chat_id) {
@@ -262,6 +299,24 @@ pub fn send_message(ctx: &AppContext, chat_id: i64, text: &str) -> CommandResult
 
     let task_ctx = ctx.clone();
     let user_text = text.to_string();
+    // Auto-title empty chats from the first user message (cheap, local).
+    let is_first_turn = task_ctx
+        .history
+        .list_agent_messages(chat_id)
+        .map(|msgs| {
+            msgs.iter()
+                .filter(|m| m.role == "user" || (m.role == "assistant" && m.content != "…"))
+                .count()
+                <= 1
+        })
+        .unwrap_or(false);
+    if is_first_turn {
+        let title: String = text.chars().take(60).collect();
+        if !title.trim().is_empty() {
+            let _ = task_ctx.history.rename_agent_chat(chat_id, &title);
+            task_ctx.bus.send(AppEvent::AgentChatsChanged);
+        }
+    }
     crate::runtime::spawn(async move {
         let outcome =
             run_agent_turn(&task_ctx, &resolved, chat_id, &user_text, sink.as_ref()).await;

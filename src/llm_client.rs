@@ -333,6 +333,60 @@ struct ChatMessageResponse {
     tool_calls: Option<Vec<ToolCallOut>>,
 }
 
+/// One SSE `data:` payload of a streamed chat completion chunk
+/// (OpenAI-compat `chat.completion.chunk` with `delta`).
+#[derive(Debug, Deserialize)]
+struct ChatChunk {
+    choices: Vec<ChatChunkChoice>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChunkChoice {
+    delta: ChatChunkDelta,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChatChunkDelta {
+    #[serde(default)]
+    content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ChunkToolCall>>,
+}
+
+/// A streamed tool-call fragment: the model sends the call id + name first,
+/// then appends argument JSON across later chunks (`index` groups fragments).
+#[derive(Debug, Deserialize)]
+struct ChunkToolCall {
+    #[serde(default)]
+    index: Option<u32>,
+    #[serde(default)]
+    id: Option<String>,
+    #[serde(rename = "type", default)]
+    call_type: Option<String>,
+    #[serde(default)]
+    function: Option<ChunkFunction>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ChunkFunction {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    arguments: Option<String>,
+}
+
+/// One streamed tool call under assembly: (id, type, name, arguments).
+type PendingCall = (Option<String>, Option<String>, Option<String>, String);
+
+/// Token callback for streamed completions. Invoked on the Tokio worker with
+/// each `content` delta; must be cheap and non-blocking.
+pub trait StreamSink: Send + Sync {
+    fn on_token(&self, delta: &str);
+    fn is_cancelled(&self) -> bool {
+        false
+    }
+}
+
 /// Build headers for API requests based on provider type and custom headers
 fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<HeaderMap, String> {
     let mut headers = HeaderMap::new();
@@ -768,13 +822,19 @@ pub async fn send_chat_completion_with_schema(
 /// The reasoning-disable/retry semantics match
 /// [`send_chat_completion_with_schema`]: a 400/422 on a request carrying
 /// reasoning fields retries once without them.
-pub async fn send_chat_messages(
+///
+/// The request uses SSE (`stream: true`); when `stream` is set, each content
+/// delta is forwarded as it arrives so the UI can render tokens live. The
+/// returned [`AssistantReply`] always carries the complete text plus any
+/// streamed tool calls. Pass `None` for a plain buffered call.
+pub async fn send_chat_messages_streamed(
     provider: &PostProcessProvider,
     api_key: String,
     model: &str,
     messages: Vec<ChatMessage>,
     tools: Option<Vec<ToolDefinition>>,
     disable_reasoning: bool,
+    stream: Option<&dyn StreamSink>,
 ) -> Result<AssistantReply, String> {
     let base_url = provider.base_url.trim_end_matches('/');
     let url = format!("{}/chat/completions", base_url);
@@ -809,12 +869,46 @@ pub async fn send_chat_messages(
     let mut request_body = ChatCompletionRequest {
         model: model.to_string(),
         messages,
-        stream: false,
+        stream: stream.is_some(),
         response_format: None,
         tools: tool_items,
         tool_choice,
         reasoning,
     };
+
+    // Local helper so the reasoning-retry path shares the SSE consumer.
+    async fn read_reply(
+        response: reqwest::Response,
+        stream: Option<&dyn StreamSink>,
+    ) -> Result<AssistantReply, String> {
+        let status = response.status();
+        if !status.is_success() {
+            let error_text = response
+                .text()
+                .await
+                .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
+            return Err(format!(
+                "API request failed with status {}: {}",
+                status, error_text
+            ));
+        }
+        if stream.is_none() {
+            let raw_response = response
+                .text()
+                .await
+                .map_err(|e| report_reqwest_error("Failed to read API response body", &e))?;
+            let completion: ChatCompletionResponse = serde_json::from_str(&raw_response)
+                .map_err(|e| format!("Failed to parse API response JSON: {e}"))?;
+            let Some(first) = completion.choices.first() else {
+                return Err("API response contained no choices".to_string());
+            };
+            return Ok(AssistantReply {
+                content: first.message.content.clone(),
+                tool_calls: first.message.tool_calls.clone().unwrap_or_default(),
+            });
+        }
+        consume_sse_reply(response, stream).await
+    }
 
     let mut response = client
         .post(&url)
@@ -850,32 +944,127 @@ pub async fn send_chat_messages(
         }
     }
 
-    if !status.is_success() {
-        let error_text = response
-            .text()
-            .await
-            .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
-        return Err(format!(
-            "API request failed with status {}: {}",
-            status, error_text
-        ));
+    read_reply(response, stream).await
+}
+
+/// Consume an OpenAI-compat SSE stream (`data: {...}` lines ending with
+/// `data: [DONE]`), forwarding content deltas to `stream` and accumulating
+/// the full reply (content + tool calls assembled from `index` fragments).
+async fn consume_sse_reply(
+    response: reqwest::Response,
+    stream: Option<&dyn StreamSink>,
+) -> Result<AssistantReply, String> {
+    use futures_util::StreamExt;
+
+    let mut content = String::new();
+    // Tool-call fragments grouped by `index`.
+    let mut pending: Vec<PendingCall> = Vec::new();
+    let mut buffer = String::new();
+    let mut byte_stream = response.bytes_stream();
+
+    while let Some(chunk) = byte_stream.next().await {
+        let bytes = chunk.map_err(|e| report_reqwest_error("Failed to read SSE chunk", &e))?;
+        buffer.push_str(&String::from_utf8_lossy(&bytes));
+        // Drain complete lines, keeping a partial tail for the next chunk.
+        while let Some(nl) = buffer.find('\n') {
+            let line: String = buffer.drain(..=nl).collect();
+            handle_sse_line(&line, &mut content, &mut pending, stream)?;
+        }
+        if let Some(sink) = stream {
+            if sink.is_cancelled() {
+                return Err("Chat stopped by user".to_string());
+            }
+        }
     }
 
-    let raw_response = response
-        .text()
-        .await
-        .map_err(|e| report_reqwest_error("Failed to read API response body", &e))?;
+    let tool_calls: Vec<ToolCallOut> = pending
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, (id, kind, name, args))| {
+            let name = name?;
+            Some(ToolCallOut {
+                id: id.unwrap_or_else(|| format!("call_{idx}")),
+                call_type: kind.unwrap_or_else(|| "function".to_string()),
+                function: ToolFunctionCall {
+                    name,
+                    arguments: args,
+                },
+            })
+        })
+        .collect();
 
-    let completion: ChatCompletionResponse = serde_json::from_str(&raw_response)
-        .map_err(|e| format!("Failed to parse API response JSON: {e}"))?;
-
-    let Some(first) = completion.choices.first() else {
-        return Err("API response contained no choices".to_string());
-    };
     Ok(AssistantReply {
-        content: first.message.content.clone(),
-        tool_calls: first.message.tool_calls.clone().unwrap_or_default(),
+        content: if content.is_empty() {
+            None
+        } else {
+            Some(content)
+        },
+        tool_calls,
     })
+}
+
+/// Parse one drained SSE line: accumulate content, forward deltas, and merge
+/// tool-call fragments. Non-`data:` lines (comments, keep-alives) and
+/// unparsable payloads are skipped.
+fn handle_sse_line(
+    line: &str,
+    content: &mut String,
+    pending: &mut Vec<PendingCall>,
+    stream: Option<&dyn StreamSink>,
+) -> Result<(), String> {
+    let line = line.trim();
+    let Some(payload) = line.strip_prefix("data:") else {
+        return Ok(());
+    };
+    let payload = payload.trim();
+    if payload == "[DONE]" || payload.is_empty() {
+        return Ok(());
+    }
+    let event: ChatChunk = match serde_json::from_str(payload) {
+        Ok(event) => event,
+        Err(_) => return Ok(()),
+    };
+    for choice in event.choices {
+        if let Some(text) = choice.delta.content {
+            if !text.is_empty() {
+                content.push_str(&text);
+                if let Some(sink) = stream {
+                    if sink.is_cancelled() {
+                        return Err("Chat stopped by user".to_string());
+                    }
+                    sink.on_token(&text);
+                }
+            }
+        }
+        for call in choice.delta.tool_calls.unwrap_or_default() {
+            let idx = call.index.unwrap_or(0) as usize;
+            if pending.len() <= idx {
+                pending.resize_with(idx + 1, || (None, None, None, String::new()));
+            }
+            let slot = &mut pending[idx];
+            if let Some(id) = call.id {
+                if !id.is_empty() {
+                    slot.0 = Some(id);
+                }
+            }
+            if let Some(kind) = call.call_type {
+                if !kind.is_empty() {
+                    slot.1 = Some(kind);
+                }
+            }
+            if let Some(function) = call.function {
+                if let Some(name) = function.name {
+                    if !name.is_empty() {
+                        slot.2 = Some(name);
+                    }
+                }
+                if let Some(args) = function.arguments {
+                    slot.3.push_str(&args);
+                }
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Fetch available models dynamically from an LLM provider API.
@@ -1206,6 +1395,80 @@ mod tests {
     fn requests_explicitly_disable_streaming() {
         let json = request_json(ReasoningParams::default());
         assert_eq!(json["stream"], false);
+    }
+
+    struct CollectSink {
+        tokens: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl StreamSink for CollectSink {
+        fn on_token(&self, delta: &str) {
+            self.tokens
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(delta.to_string());
+        }
+    }
+
+    #[tokio::test]
+    async fn sse_stream_assembles_content_and_tool_calls() {
+        let arg_open = "{\"query\":\"".to_string();
+        let arg_close = "x\"}".to_string();
+        let body = format!(
+            concat!(
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"Hel\"}}}}]}}\n\n",
+                "data: {{\"choices\":[{{\"delta\":{{\"content\":\"lo\"}}}}]}}\n\n",
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"id\":\"c1\",\"type\":\"function\",\"function\":{{\"name\":\"tavily_search\",\"arguments\":\"{arg}\"}}}}]}}}}]}}\n\n",
+                "data: {{\"choices\":[{{\"delta\":{{\"tool_calls\":[{{\"index\":0,\"function\":{{\"arguments\":\"{more}\"}}}}]}}}}]}}\n\n",
+                "data: [DONE]\n\n",
+            ),
+            arg = arg_open.replace('\"', "\\\""),
+            more = arg_close.replace('\"', "\\\""),
+        );
+        let base_url = serve_one_response("200 OK", &body).await;
+        let sink = CollectSink {
+            tokens: std::sync::Mutex::new(Vec::new()),
+        };
+        let reply = send_chat_messages_streamed(
+            &provider("openai", &base_url),
+            String::new(),
+            "test-model",
+            vec![ChatMessage::user("hi")],
+            None,
+            true,
+            Some(&sink),
+        )
+        .await
+        .expect("streamed reply");
+        assert_eq!(reply.content.as_deref(), Some("Hello"));
+        let tokens = sink.tokens.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(tokens.concat(), "Hello");
+        assert_eq!(reply.tool_calls.len(), 1);
+        assert_eq!(reply.tool_calls[0].id, "c1");
+        assert_eq!(reply.tool_calls[0].function.name, "tavily_search");
+        assert_eq!(
+            reply.tool_calls[0].function.arguments,
+            "{\"query\":\"x\"}".to_string()
+        );
+    }
+
+    #[tokio::test]
+    async fn non_streaming_path_still_returns_full_reply() {
+        let body = r#"{"choices":[{"message":{"content":"full answer"}}]}"#;
+        let base_url = serve_one_response("200 OK", body).await;
+        let reply = send_chat_messages_streamed(
+            &provider("openai", &base_url),
+            String::new(),
+            "test-model",
+            vec![ChatMessage::user("hi")],
+            None,
+            true,
+            None,
+        )
+        .await
+        .expect("reply");
+        assert_eq!(reply.content.as_deref(), Some("full answer"));
+        assert!(reply.tool_calls.is_empty());
     }
 
     #[test]

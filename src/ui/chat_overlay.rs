@@ -242,6 +242,11 @@ struct ChatUi {
     chat_id: Option<i64>,
     generating: bool,
     pending_steps: Vec<(String, String)>,
+    /// Live assistant bubble receiving `AgentToken` deltas (`None` until the
+    /// first token of the turn creates it). Stored as a weak ref: GTK
+    /// widgets are `!Send` and must never be held across threads (the bus
+    /// closure requires `Send`).
+    live_label: Option<glib::SendWeakRef<gtk4::Label>>,
 }
 
 fn build_chat_page(
@@ -273,6 +278,11 @@ fn build_chat_page(
     new_chat_btn.set_tooltip_text(Some("New chat"));
     new_chat_btn.add_css_class("flat");
     agent_row.append(&new_chat_btn);
+
+    let history_btn = gtk4::Button::from_icon_name("document-open-recent-symbolic");
+    history_btn.set_tooltip_text(Some("Chat history"));
+    history_btn.add_css_class("flat");
+    agent_row.append(&history_btn);
 
     let export_btn = gtk4::Button::from_icon_name("document-save-symbolic");
     export_btn.set_tooltip_text(Some("Copy chat as Markdown"));
@@ -333,6 +343,7 @@ fn build_chat_page(
         chat_id: None,
         generating: false,
         pending_steps: Vec::new(),
+        live_label: None,
     }));
 
     // Refresh the agent dropdown from settings.
@@ -422,14 +433,30 @@ fn build_chat_page(
         let transcript = transcript.clone();
         let steps_box = steps_box.clone();
         new_chat_btn.connect_clicked(move |_| {
-            if let Ok(mut st) = state.lock() {
-                st.chat_id = None;
-                st.generating = false;
-                st.pending_steps.clear();
-            }
-            clear_transcript(&transcript);
-            steps_box.set_visible(false);
-            ensure_chat(&ctx, &state, &transcript, &steps_box);
+            switch_chat(&ctx, &state, &transcript, &steps_box, None);
+        });
+    }
+
+    // History menu: recent chats for the selected agent, with delete.
+    {
+        let ctx = ctx.clone();
+        let state = state.clone();
+        let transcript = transcript.clone();
+        let steps_box = steps_box.clone();
+        let toast = toast_overlay.clone();
+        let history_menu = gtk4::Popover::new();
+        history_menu.set_has_arrow(true);
+        history_menu.set_autohide(true);
+        let menu_box = gtk4::Box::new(gtk4::Orientation::Vertical, 2);
+        menu_box.set_margin_start(8);
+        menu_box.set_margin_end(8);
+        menu_box.set_margin_top(8);
+        menu_box.set_margin_bottom(8);
+        history_menu.set_child(Some(&menu_box));
+        history_menu.set_parent(&history_btn);
+        history_btn.connect_clicked(move |_| {
+            refresh_history_menu(&ctx, &menu_box, &state, &transcript, &steps_box, &toast);
+            history_menu.popup();
         });
     }
 
@@ -531,7 +558,12 @@ fn build_chat_page(
             if let Ok(mut st) = state.lock() {
                 st.generating = true;
                 st.pending_steps.clear();
+                st.live_label = None;
             }
+            // The live bubble is created on the first AgentToken; pre-create
+            // it here so empty-token turns (tool-only replies) still show
+            // progress instead of a frozen transcript.
+            st_live_bubble(&state, &transcript);
             send_btn.set_sensitive(false);
             stop_btn.set_visible(true);
             steps_box.set_visible(false);
@@ -594,11 +626,54 @@ fn build_chat_page(
                             steps.append(&row);
                         }
                     }
+                    AppEvent::AgentToken { chat_id, delta } => {
+                        if Some(chat_id) != my_chat {
+                            return;
+                        }
+                        // Existing live bubble wins; otherwise create one
+                        // (transcript gone = overlay closed: skip token).
+                        let mut live: Option<glib::SendWeakRef<gtk4::Label>> = None;
+                        if let Ok(guard) = state.lock() {
+                            live = guard.live_label.clone();
+                        }
+                        let label = match live.and_then(|w| w.into_weak_ref().upgrade()) {
+                            Some(label) => Some(label),
+                            None => {
+                                let transcript = transcript_weak.into_weak_ref().upgrade();
+                                transcript.map(|t| {
+                                    let label = append_live_bubble(&t);
+                                    if let Ok(mut guard) = state.lock() {
+                                        guard.live_label =
+                                            Some(glib::SendWeakRef::from(label.downgrade()));
+                                    }
+                                    label
+                                })
+                            }
+                        };
+                        if let Some(label) = label {
+                            // Append-only: deltas arrive in order on one turn.
+                            let mut text = label.text().to_string();
+                            text.push_str(&delta);
+                            label.set_text(&text);
+                        }
+                    }
                     AppEvent::AgentMessageAdded { chat_id, message } => {
                         if Some(chat_id) != my_chat {
                             return;
                         }
+                        // Final text replaces the live bubble (or the "…").
                         if message.role == "assistant" && message.content != "…" {
+                            let mut live: Option<gtk4::Label> = None;
+                            if let Ok(mut guard) = state.lock() {
+                                live = guard
+                                    .live_label
+                                    .take()
+                                    .and_then(|w| w.into_weak_ref().upgrade());
+                            }
+                            if let Some(label) = live {
+                                label.set_text(&message.content);
+                                return;
+                            }
                             if let Some(transcript) = transcript_weak.into_weak_ref().upgrade() {
                                 replace_last_assistant(&transcript, &message.content);
                             }
@@ -612,6 +687,7 @@ fn build_chat_page(
                         }
                         if let Ok(mut st) = state.lock() {
                             st.generating = false;
+                            st.live_label = None;
                         }
                         if let Some(btn) = send_weak.into_weak_ref().upgrade() {
                             btn.set_sensitive(true);
@@ -659,21 +735,275 @@ fn ensure_chat(
     let settings = settings::get_settings(ctx);
     let agent = settings.selected_agent()?;
     let chat = crate::commands::agents::start_chat(ctx, Some(&agent.id), None).ok()?;
+    load_chat(ctx, state, transcript, chat.id);
+    Some(chat.id)
+}
+
+/// Load an existing chat into the transcript (or a fresh one when `None`).
+fn switch_chat(
+    ctx: &AppContext,
+    state: &Arc<Mutex<ChatUi>>,
+    transcript: &gtk4::ListBox,
+    steps_box: &gtk4::Box,
+    chat_id: Option<i64>,
+) {
     if let Ok(mut st) = state.lock() {
-        st.chat_id = Some(chat.id);
+        st.chat_id = None;
+        st.generating = false;
+        st.pending_steps.clear();
+        st.live_label = None;
     }
-    if let Ok(messages) = crate::commands::agents::list_messages(ctx, chat.id) {
+    clear_transcript(transcript);
+    steps_box.set_visible(false);
+    while let Some(child) = steps_box.first_child() {
+        steps_box.remove(&child);
+    }
+    match chat_id {
+        Some(id) => load_chat(ctx, state, transcript, id),
+        None => {
+            ensure_chat(ctx, state, transcript, steps_box);
+        }
+    }
+}
+
+/// Point `state` at `chat_id` and render its persisted transcript.
+fn load_chat(
+    ctx: &AppContext,
+    state: &Arc<Mutex<ChatUi>>,
+    transcript: &gtk4::ListBox,
+    chat_id: i64,
+) {
+    if let Ok(mut st) = state.lock() {
+        st.chat_id = Some(chat_id);
+        st.live_label = None;
+    }
+    let settings = settings::get_settings(ctx);
+    let agent_name = settings
+        .agents
+        .iter()
+        .find(|a| {
+            ctx.history
+                .list_agent_chats(None)
+                .map(|chats| {
+                    chats
+                        .iter()
+                        .find(|c| c.id == chat_id)
+                        .map(|c| c.agent_id == a.id)
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
+        })
+        .map(|a| a.name.clone())
+        .or_else(|| settings.selected_agent().map(|a| a.name.clone()))
+        .unwrap_or_else(|| "Assistant".to_string());
+    if let Ok(messages) = crate::commands::agents::list_messages(ctx, chat_id) {
         for msg in messages {
             match msg.role.as_str() {
                 "user" => append_bubble(transcript, "You", &msg.content, false),
                 "assistant" if msg.content != "…" => {
-                    append_bubble(transcript, &agent.name, &msg.content, true)
+                    append_bubble(transcript, &agent_name, &msg.content, true)
                 }
                 _ => {}
             }
         }
     }
-    Some(chat.id)
+}
+
+/// Rebuild the history popover: recent chats for the selected agent, each
+/// with a delete button. Opening a chat loads it; deleting the open chat
+/// starts a fresh one.
+fn refresh_history_menu(
+    ctx: &AppContext,
+    menu_box: &gtk4::Box,
+    state: &Arc<Mutex<ChatUi>>,
+    transcript: &gtk4::ListBox,
+    steps_box: &gtk4::Box,
+    toast: &libadwaita::ToastOverlay,
+) {
+    while let Some(child) = menu_box.first_child() {
+        menu_box.remove(&child);
+    }
+    let settings = settings::get_settings(ctx);
+    let agent = settings.selected_agent();
+    let chats = agent
+        .as_ref()
+        .and_then(|a| crate::commands::agents::list_chats(ctx, Some(&a.id)).ok())
+        .unwrap_or_default();
+    let current = state.lock().map(|s| s.chat_id).unwrap_or(None);
+    if chats.is_empty() {
+        let empty = gtk4::Label::new(Some("No saved chats yet"));
+        empty.add_css_class("dim-label");
+        empty.add_css_class("caption");
+        menu_box.append(&empty);
+        return;
+    }
+    for chat in chats.into_iter().take(20) {
+        let row = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
+        row.set_hexpand(true);
+        let open_btn = gtk4::Button::with_label(&chat.title);
+        open_btn.set_hexpand(true);
+        open_btn.add_css_class("flat");
+        if Some(chat.id) == current {
+            open_btn.set_sensitive(false);
+        }
+        let ctx_open = ctx.clone();
+        let state_open = state.clone();
+        let transcript_open = transcript.clone();
+        let steps_open = steps_box.clone();
+        let chat_id = chat.id;
+        open_btn.connect_clicked(move |_| {
+            if state_open.lock().map(|s| s.generating).unwrap_or(false) {
+                return;
+            }
+            switch_chat(
+                &ctx_open,
+                &state_open,
+                &transcript_open,
+                &steps_open,
+                Some(chat_id),
+            );
+        });
+        row.append(&open_btn);
+        // Rename: small inline dialog (entry + save).
+        let rename_btn = gtk4::Button::from_icon_name("document-edit-symbolic");
+        rename_btn.add_css_class("flat");
+        rename_btn.set_tooltip_text(Some("Rename chat"));
+        let ctx_rename = ctx.clone();
+        let menu_rename = menu_box.clone();
+        let state_rename = state.clone();
+        let transcript_rename = transcript.clone();
+        let steps_rename = steps_box.clone();
+        let toast_rename = toast.clone();
+        let old_title = chat.title.clone();
+        rename_btn.connect_clicked(move |_| {
+            show_rename_dialog(
+                &ctx_rename,
+                chat_id,
+                &old_title,
+                &menu_rename,
+                &state_rename,
+                &transcript_rename,
+                &steps_rename,
+                &toast_rename,
+            );
+        });
+        row.append(&rename_btn);
+        let delete_btn = gtk4::Button::from_icon_name("user-trash-symbolic");
+        delete_btn.add_css_class("flat");
+        delete_btn.set_tooltip_text(Some("Delete chat"));
+        let ctx_delete = ctx.clone();
+        let state_delete = state.clone();
+        let transcript_delete = transcript.clone();
+        let steps_delete = steps_box.clone();
+        let menu_delete = menu_box.clone();
+        let toast_delete = toast.clone();
+        let is_current = Some(chat.id) == current;
+        delete_btn.connect_clicked(move |_| {
+            if let Err(e) = crate::commands::agents::delete_chat(&ctx_delete, chat_id) {
+                ctx_delete.report_error("delete_chat", e);
+                toast_delete.add_toast(libadwaita::Toast::new("Could not delete chat"));
+                return;
+            }
+            if is_current {
+                switch_chat(
+                    &ctx_delete,
+                    &state_delete,
+                    &transcript_delete,
+                    &steps_delete,
+                    None,
+                );
+            }
+            refresh_history_menu(
+                &ctx_delete,
+                &menu_delete,
+                &state_delete,
+                &transcript_delete,
+                &steps_delete,
+                &toast_delete,
+            );
+        });
+        row.append(&delete_btn);
+        menu_box.append(&row);
+    }
+}
+
+/// Rename dialog for one chat: modal entry pre-filled with the old title.
+#[allow(clippy::too_many_arguments)]
+fn show_rename_dialog(
+    ctx: &AppContext,
+    chat_id: i64,
+    old_title: &str,
+    menu_box: &gtk4::Box,
+    state: &Arc<Mutex<ChatUi>>,
+    transcript: &gtk4::ListBox,
+    steps_box: &gtk4::Box,
+    toast: &libadwaita::ToastOverlay,
+) {
+    let dialog = libadwaita::Window::new();
+    dialog.set_title(Some("Rename chat"));
+    dialog.set_modal(true);
+    dialog.set_default_size(360, 180);
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    content.set_margin_start(20);
+    content.set_margin_end(20);
+    content.set_margin_top(20);
+    content.set_margin_bottom(20);
+    let entry = libadwaita::EntryRow::new();
+    entry.set_title("Title");
+    entry.set_text(old_title);
+    content.append(&entry);
+    let buttons = gtk4::Box::new(gtk4::Orientation::Horizontal, 8);
+    buttons.set_halign(gtk4::Align::End);
+    let cancel_btn = gtk4::Button::with_label("Cancel");
+    cancel_btn.add_css_class("flat");
+    let save_btn = gtk4::Button::with_label("Save");
+    save_btn.add_css_class("suggested-action");
+    buttons.append(&cancel_btn);
+    buttons.append(&save_btn);
+    content.append(&buttons);
+    dialog.set_content(Some(&content));
+
+    let dialog_weak = glib::SendWeakRef::from(dialog.downgrade());
+    cancel_btn.connect_clicked(move |_| {
+        if let Some(d) = dialog_weak.clone().into_weak_ref().upgrade() {
+            d.close();
+        }
+    });
+    let ctx_save = ctx.clone();
+    let menu_save = menu_box.clone();
+    let state_save = state.clone();
+    let transcript_save = transcript.clone();
+    let steps_save = steps_box.clone();
+    let toast_save = toast.clone();
+    let dialog_save = glib::SendWeakRef::from(dialog.downgrade());
+    let entry_save = entry.clone();
+    save_btn.connect_clicked(move |_| {
+        let title = entry_save.text().to_string();
+        if title.trim().is_empty() {
+            return;
+        }
+        if let Err(e) = crate::commands::agents::rename_chat(&ctx_save, chat_id, &title) {
+            ctx_save.report_error("rename_chat", e);
+            toast_save.add_toast(libadwaita::Toast::new("Could not rename chat"));
+            return;
+        }
+        refresh_history_menu(
+            &ctx_save,
+            &menu_save,
+            &state_save,
+            &transcript_save,
+            &steps_save,
+            &toast_save,
+        );
+        if let Some(d) = dialog_save.clone().into_weak_ref().upgrade() {
+            d.close();
+        }
+    });
+    let save_activate = save_btn.clone();
+    entry.connect_activate(move |_| {
+        save_activate.emit_clicked();
+    });
+    dialog.present();
 }
 
 fn clear_transcript(transcript: &gtk4::ListBox) {
@@ -725,6 +1055,50 @@ fn append_bubble(transcript: &gtk4::ListBox, who: &str, text: &str, is_agent: bo
 
     row.append(&card);
     transcript.append(&row);
+}
+
+/// Append an empty agent bubble and return its body label for token fills.
+fn append_live_bubble(transcript: &gtk4::ListBox) -> gtk4::Label {
+    let row = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    row.set_margin_top(6);
+    row.set_margin_bottom(6);
+
+    let name = gtk4::Label::new(Some("Assistant"));
+    name.set_xalign(0.0);
+    name.add_css_class("caption");
+    name.add_css_class("dim-label");
+    row.append(&name);
+
+    let card = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
+    card.add_css_class("card");
+    card.set_margin_bottom(2);
+    let body = gtk4::Label::new(Some(""));
+    body.set_wrap(true);
+    body.set_wrap_mode(gtk4::pango::WrapMode::Word);
+    body.set_selectable(true);
+    body.set_xalign(0.0);
+    body.set_margin_start(12);
+    body.set_margin_end(12);
+    body.set_margin_top(10);
+    body.set_margin_bottom(10);
+    card.append(&body);
+    row.append(&card);
+    transcript.append(&row);
+    body
+}
+
+/// Ensure the live bubble exists (called right after send, before tokens).
+fn st_live_bubble(state: &Arc<Mutex<ChatUi>>, transcript: &gtk4::ListBox) {
+    let exists = state
+        .lock()
+        .map(|st| st.live_label.is_some())
+        .unwrap_or(false);
+    if !exists {
+        let label = append_live_bubble(transcript);
+        if let Ok(mut st) = state.lock() {
+            st.live_label = Some(glib::SendWeakRef::from(label.downgrade()));
+        }
+    }
 }
 
 /// Replace the last assistant bubble text (placeholder "…" → final answer).
