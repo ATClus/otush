@@ -216,7 +216,7 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
                                 .unwrap_or("media file");
                             row.set_subtitle(name);
                         }
-                        *file_path_clone.lock().unwrap() = Some(path);
+                        *file_path_clone.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
                     }
                 }
             }
@@ -251,7 +251,7 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
                     if let Some(row) = file_row_drop.clone().into_weak_ref().upgrade() {
                         row.set_subtitle(&name);
                     }
-                    *file_path_drop.lock().unwrap() = Some(path);
+                    *file_path_drop.lock().unwrap_or_else(|e| e.into_inner()) = Some(path);
                     return true;
                 }
             }
@@ -274,7 +274,10 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
     let toast_weak = glib::SendWeakRef::from(toast_overlay.downgrade());
 
     start_button.connect_clicked(move |_| {
-        let path_opt = file_path_start.lock().unwrap().clone();
+        let path_opt = file_path_start
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
         let Some(path) = path_opt else {
             if let Some(toast_ov) = toast_weak.clone().into_weak_ref().upgrade() {
                 toast_ov.add_toast(libadwaita::Toast::new("Please choose a file to transcribe"));
@@ -377,7 +380,7 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
                         if let Some(res) = results_weak_fin.into_weak_ref().upgrade() {
                             res.set_visible(true);
                         }
-                        *doc_store_fin.lock().unwrap() = Some(doc);
+                        *doc_store_fin.lock().unwrap_or_else(|e| e.into_inner()) = Some(doc);
 
                         if let Some(toast_ov) = toast_weak_fin.into_weak_ref().upgrade() {
                             toast_ov.add_toast(libadwaita::Toast::new(
@@ -404,7 +407,7 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
     let ctx_copy = ctx.clone();
     let toast_copy = toast_overlay.clone();
     copy_btn.connect_clicked(move |_| {
-        if let Some(doc) = doc_copy.lock().unwrap().as_ref() {
+        if let Some(doc) = doc_copy.lock().unwrap_or_else(|e| e.into_inner()).as_ref() {
             let text = if let Some(ref post) = doc.summary_or_post_processed {
                 post.clone()
             } else {
@@ -426,7 +429,7 @@ fn build_and_present_dialog(ctx: &AppContext, initial_file: Option<PathBuf>) {
          parent_win: glib::SendWeakRef<libadwaita::Window>,
          toast: libadwaita::ToastOverlay| {
             btn.connect_clicked(move |_| {
-                let doc_opt = doc_store.lock().unwrap().clone();
+                let doc_opt = doc_store.lock().unwrap_or_else(|e| e.into_inner()).clone();
                 let Some(doc) = doc_opt else { return };
 
                 let content = match ext {

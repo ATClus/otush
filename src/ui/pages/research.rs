@@ -71,11 +71,11 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
     let ctx_overlay = ctx.clone();
     overlay_row.connect_activated(move |_| {
-        crate::ui::search_overlay::show_search_overlay(&ctx_overlay);
+        crate::ui::chat_overlay::show_search_mode(&ctx_overlay);
     });
     let ctx_overlay_btn = ctx.clone();
     overlay_btn.connect_clicked(move |_| {
-        crate::ui::search_overlay::show_search_overlay(&ctx_overlay_btn);
+        crate::ui::chat_overlay::show_search_mode(&ctx_overlay_btn);
     });
 
     query_group.add(&overlay_row);

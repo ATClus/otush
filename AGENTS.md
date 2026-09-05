@@ -68,7 +68,7 @@ Otush is a **native GNOME application** (GTK4 + libadwaita on Wayland) with a Ru
 - `commands/` — the command layer (plain functions on `&AppContext`) that the UI calls.
 - `shortcut/` — shortcut engines behind one interface: `portal.rs` (XDG GlobalShortcuts portal via `ashpd`, Wayland-native) and `evdev.rs` (evdev via the handy-keys crate); `handler.rs` dispatches events.
 - `settings.rs` — settings model + JSON store (`settings_store.json`).
-- `clipboard.rs`, `paste_tx/` — clipboard + paste (wtype/ydotool/xdotool/enigo, GNOME-Wayland aware).
+- `clipboard.rs` — clipboard + paste (wtype/ydotool/xdotool/enigo, GNOME-Wayland aware).
 - `logging.rs` — console + file logging with UI streaming in debug mode.
 - `autostart.rs` — XDG autostart entry; `updater.rs` — GitHub releases check.
 

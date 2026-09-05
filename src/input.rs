@@ -3,7 +3,7 @@
 //! Provides wrappers for simulating paste keystrokes (`Ctrl+V`, `Ctrl+Shift+V`,
 //! `Shift+Insert`), direct typing, and cursor tracking.
 
-use enigo::{Enigo, Key, Keyboard, Mouse, Settings};
+use enigo::{Enigo, Key, Keyboard, Settings};
 use std::sync::{Mutex, OnceLock};
 
 /// Thread-safe wrapper around [`Enigo`].
@@ -38,17 +38,6 @@ pub fn initialize_enigo() -> Result<(), String> {
 /// Access the initialized global Enigo state, if available.
 pub fn get_enigo() -> Option<&'static EnigoState> {
     ENIGO_STATE.get()
-}
-
-/// Get the current mouse cursor coordinates (x, y) on screen.
-///
-/// Returns `None` if Enigo is not initialized or the underlying windowing system
-/// fails to query cursor position.
-#[allow(dead_code)]
-pub fn get_cursor_position() -> Option<(i32, i32)> {
-    let enigo_state = ENIGO_STATE.get()?;
-    let enigo = enigo_state.0.lock().ok()?;
-    enigo.location().ok()
 }
 
 /// Sends a `Ctrl+V` paste keystroke chord.

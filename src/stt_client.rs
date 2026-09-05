@@ -252,8 +252,12 @@ pub(crate) async fn run_deepgram_websocket_stream(
                                 .unwrap_or("")
                                 .trim();
 
-                            let mut comm = committed_for_reader.lock().unwrap();
-                            let mut tent = tentative_for_reader.lock().unwrap();
+                            let mut comm = committed_for_reader
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
+                            let mut tent = tentative_for_reader
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner());
 
                             if is_final {
                                 if !transcript.is_empty() {
@@ -315,8 +319,14 @@ pub(crate) async fn run_deepgram_websocket_stream(
                 // Wait up to 600ms for reader to drain any remaining final message
                 let _ = tokio::time::timeout(Duration::from_millis(600), reader_task).await;
 
-                let comm = committed_text.lock().unwrap().clone();
-                let tent = tentative_text.lock().unwrap().clone();
+                let comm = committed_text
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
+                let tent = tentative_text
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone();
                 let mut full_text = comm;
                 if !tent.is_empty() {
                     if !full_text.is_empty() && !full_text.ends_with(' ') {
@@ -1022,7 +1032,7 @@ mod tests {
 
     #[test]
     fn test_default_transcription_providers_structure() {
-        let providers = crate::settings::default_transcription_providers();
+        let providers = crate::settings::defaults::default_transcription_providers();
         assert_eq!(providers.len(), 7);
         assert_eq!(providers[0].id, "deepgram");
         assert_eq!(providers[1].id, "groq");

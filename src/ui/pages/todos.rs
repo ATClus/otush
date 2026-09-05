@@ -6,6 +6,7 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum TodoFilter {
@@ -150,13 +151,15 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     page.add(&list_group);
 
     // Refresh function directly rendering into list_group (identical to history and notes)
+    let rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
     let refresh_tasks = {
         let ctx = ctx.clone();
         let group = list_group.clone();
         let filter = active_filter.clone();
+        let rows = rows.clone();
 
         move || {
-            crate::ui::pages::clear_group_rows(&group);
+            rows.lock().unwrap_or_else(|e| e.into_inner()).clear(&group);
 
             let current_filter = *filter.borrow();
 
@@ -191,8 +194,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     let empty_icon = gtk4::Image::from_icon_name("checkbox-checked-symbolic");
                     empty_row.add_prefix(&empty_icon);
                     empty_row.set_activatable(false);
-                    group.add(&empty_row);
-                    crate::ui::pages::track_row(&group, &empty_row);
+                    rows.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .add(&group, &empty_row);
                     return;
                 }
 
@@ -274,8 +278,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     });
                     row.add_suffix(&del_btn);
 
-                    group.add(&row);
-                    crate::ui::pages::track_row(&group, &row);
+                    rows.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .add(&group, &row);
                 }
             }
         }

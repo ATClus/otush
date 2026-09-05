@@ -1,3 +1,10 @@
+//! Silero v4 ONNX voice-activity detector.
+//!
+//! Accurate neural VAD over 30 ms frames at 16 kHz; needs the
+//! `silero_vad_v4.onnx` model file (see `BUILD.md`). Prefer this backend when
+//! the model is present; otherwise the manager falls back to the Earshot
+//! energy detector.
+
 use anyhow::Result;
 use std::path::Path;
 

@@ -1,3 +1,11 @@
+//! Smoothing wrapper adding onset pre-roll and hangover tail.
+//!
+//! Wraps any voice-activity detector so word edges are never clipped: the
+//! first speech frames are preceded by buffered pre-roll, and speech stays
+//! open through short pauses (hangover) before closing. Frame counts come
+//! from the shared `frames_for_duration_ms` helper so both backends share
+//! identical boundary behavior.
+
 use super::{VadFrame, VadTailReport, VoiceActivityDetector};
 use anyhow::Result;
 use std::collections::VecDeque;

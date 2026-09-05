@@ -447,6 +447,10 @@ fn try_direct_typing_linux(text: &str, preferred_tool: TypingTool) -> Result<boo
 
 /// Returns the list of available typing tools on this system.
 /// Always includes "auto" as the first entry.
+///
+/// Detection backend for the General page's Direct Typing Backend selector:
+/// probes the real binaries on `PATH` so missing tools are hidden rather
+/// than failing at paste time.
 pub fn get_available_typing_tools() -> Vec<String> {
     let mut tools = vec!["auto".to_string()];
     if is_wtype_available() {

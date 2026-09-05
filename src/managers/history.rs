@@ -1,3 +1,11 @@
+//! Transcription history, notes, todos, and documents storage (SQLite).
+//!
+//! [`HistoryManager`] owns a dedicated rusqlite connection over the history
+//! database (migrations via `rusqlite_migration`, WAL mode with busy timeout).
+//! All writes run off the GTK main thread; UI updates flow back through the
+//! [`EventBus`](crate::context::EventBus) as `AppEvent::HistoryUpdated`.
+//! Audio files referenced by entries live under `recordings/`.
+
 use crate::context::{AppEvent, AppPaths, EventBus};
 use anyhow::{anyhow, Result};
 use chrono::{DateTime, Local, Utc};
@@ -63,6 +71,61 @@ static MIGRATIONS: &[M] = &[
             doc_type TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );",
+    ),
+    // --- agent chats (AI chat overlay) ---
+    M::up(
+        "CREATE TABLE IF NOT EXISTS agent_chats (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            agent_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            created_at INTEGER NOT NULL,
+            updated_at INTEGER NOT NULL
+        );",
+    ),
+    M::up("CREATE INDEX IF NOT EXISTS idx_agent_chats_agent ON agent_chats (agent_id, updated_at DESC);"),
+    M::up(
+        "CREATE TABLE IF NOT EXISTS agent_messages (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            chat_id INTEGER NOT NULL REFERENCES agent_chats(id) ON DELETE CASCADE,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            tool_name TEXT,
+            created_at INTEGER NOT NULL
+        );",
+    ),
+    M::up("CREATE INDEX IF NOT EXISTS idx_agent_messages_chat ON agent_messages (chat_id, id);"),
+    // --- basic RAG: chunk store + FTS5 index ---
+    M::up(
+        "CREATE TABLE IF NOT EXISTS rag_docs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            source_kind TEXT NOT NULL,
+            source_id TEXT NOT NULL,
+            title TEXT NOT NULL,
+            uri TEXT NOT NULL DEFAULT ''
+        );",
+    ),
+    M::up(
+        "CREATE TABLE IF NOT EXISTS rag_chunks (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            doc_id INTEGER NOT NULL REFERENCES rag_docs(id) ON DELETE CASCADE,
+            ord INTEGER NOT NULL,
+            title TEXT NOT NULL DEFAULT '',
+            content TEXT NOT NULL
+        );",
+    ),
+    M::up(
+        "CREATE VIRTUAL TABLE IF NOT EXISTS rag_chunks_fts USING fts5(title, content, content='rag_chunks', content_rowid='id', tokenize='unicode61');",
+    ),
+    M::up("INSERT INTO rag_chunks_fts(rag_chunks_fts) VALUES('rebuild');"),
+    M::up(
+        "CREATE TRIGGER IF NOT EXISTS rag_chunks_ai AFTER INSERT ON rag_chunks BEGIN
+            INSERT INTO rag_chunks_fts(rowid, title, content) VALUES(new.id, new.title, new.content);
+        END;",
+    ),
+    M::up(
+        "CREATE TRIGGER IF NOT EXISTS rag_chunks_ad AFTER DELETE ON rag_chunks BEGIN
+            INSERT INTO rag_chunks_fts(rag_chunks_fts, rowid, title, content) VALUES('delete', old.id, old.title, old.content);
+        END;",
     ),
 ];
 
@@ -265,7 +328,9 @@ impl HistoryManager {
     }
 
     fn get_connection(&self) -> Result<Connection> {
-        Ok(Connection::open(&self.db_path)?)
+        let conn = Connection::open(&self.db_path)?;
+        conn.execute_batch("PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;")?;
+        Ok(conn)
     }
 
     fn map_history_entry(row: &rusqlite::Row<'_>) -> rusqlite::Result<HistoryEntry> {
@@ -1025,6 +1090,286 @@ impl HistoryManager {
     }
 }
 
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentChat {
+    pub id: i64,
+    pub agent_id: String,
+    pub title: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AgentMessage {
+    pub id: i64,
+    pub chat_id: i64,
+    pub role: String,
+    pub content: String,
+    pub tool_name: Option<String>,
+    pub created_at: i64,
+}
+
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
+pub struct RagHit {
+    pub chunk_id: i64,
+    pub doc_id: i64,
+    pub title: String,
+    pub uri: String,
+    pub snippet: String,
+    pub rank: f64,
+}
+
+impl HistoryManager {
+    /// Create a chat for `agent_id` and return it.
+    pub fn create_agent_chat(&self, agent_id: &str, title: &str) -> Result<AgentChat> {
+        let conn = self.get_connection()?;
+        let now = Utc::now().timestamp();
+        let title_clean = if title.trim().is_empty() {
+            "New chat".to_string()
+        } else {
+            title.trim().chars().take(80).collect()
+        };
+        conn.execute(
+            "INSERT INTO agent_chats (agent_id, title, created_at, updated_at)
+             VALUES (?1, ?2, ?3, ?4)",
+            params![agent_id, title_clean, now, now],
+        )?;
+        let id = conn.last_insert_rowid();
+        Ok(AgentChat {
+            id,
+            agent_id: agent_id.to_string(),
+            title: title_clean,
+            created_at: now,
+            updated_at: now,
+        })
+    }
+
+    pub fn list_agent_chats(&self, agent_id: Option<&str>) -> Result<Vec<AgentChat>> {
+        let conn = self.get_connection()?;
+        let sql = match agent_id {
+            Some(_) => {
+                "SELECT id, agent_id, title, created_at, updated_at FROM agent_chats
+                 WHERE agent_id = ?1 ORDER BY updated_at DESC LIMIT 100"
+            }
+            None => {
+                "SELECT id, agent_id, title, created_at, updated_at FROM agent_chats
+                 ORDER BY updated_at DESC LIMIT 100"
+            }
+        };
+        let mut stmt = conn.prepare(sql)?;
+        let rows: Vec<AgentChat> = match agent_id {
+            Some(id) => stmt
+                .query_map(params![id], row_agent_chat)?
+                .collect::<Result<Vec<_>, _>>()?,
+            None => stmt
+                .query_map([], row_agent_chat)?
+                .collect::<Result<Vec<_>, _>>()?,
+        };
+        return Ok(rows);
+
+        fn row_agent_chat(row: &rusqlite::Row) -> rusqlite::Result<AgentChat> {
+            Ok(AgentChat {
+                id: row.get(0)?,
+                agent_id: row.get(1)?,
+                title: row.get(2)?,
+                created_at: row.get(3)?,
+                updated_at: row.get(4)?,
+            })
+        }
+    }
+
+    pub fn delete_agent_chat(&self, chat_id: i64) -> Result<()> {
+        let conn = self.get_connection()?;
+        conn.execute(
+            "DELETE FROM agent_messages WHERE chat_id = ?1",
+            params![chat_id],
+        )?;
+        conn.execute("DELETE FROM agent_chats WHERE id = ?1", params![chat_id])?;
+        Ok(())
+    }
+
+    /// Delete chats older than `retention_days` (0 disables cleanup).
+    pub fn cleanup_agent_chats(&self, retention_days: u32) -> Result<usize> {
+        if retention_days == 0 {
+            return Ok(0);
+        }
+        let cutoff = Utc::now().timestamp() - i64::from(retention_days) * 86_400;
+        let conn = self.get_connection()?;
+        let stale: Vec<i64> = conn
+            .prepare("SELECT id FROM agent_chats WHERE updated_at < ?1")?
+            .query_map(params![cutoff], |row| row.get(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        for id in &stale {
+            conn.execute("DELETE FROM agent_messages WHERE chat_id = ?1", params![id])?;
+            conn.execute("DELETE FROM agent_chats WHERE id = ?1", params![id])?;
+        }
+        Ok(stale.len())
+    }
+
+    /// Append a message and bump the chat's `updated_at`. Returns the row.
+    pub fn append_agent_message(
+        &self,
+        chat_id: i64,
+        role: &str,
+        content: &str,
+        tool_name: Option<&str>,
+    ) -> Result<AgentMessage> {
+        let conn = self.get_connection()?;
+        let now = Utc::now().timestamp();
+        conn.execute(
+            "INSERT INTO agent_messages (chat_id, role, content, tool_name, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![chat_id, role, content, tool_name, now],
+        )?;
+        let id = conn.last_insert_rowid();
+        conn.execute(
+            "UPDATE agent_chats SET updated_at = ?1 WHERE id = ?2",
+            params![now, chat_id],
+        )?;
+        Ok(AgentMessage {
+            id,
+            chat_id,
+            role: role.to_string(),
+            content: content.to_string(),
+            tool_name: tool_name.map(str::to_string),
+            created_at: now,
+        })
+    }
+
+    pub fn list_agent_messages(&self, chat_id: i64) -> Result<Vec<AgentMessage>> {
+        let conn = self.get_connection()?;
+        let mut stmt = conn.prepare(
+            "SELECT id, chat_id, role, content, tool_name, created_at
+             FROM agent_messages WHERE chat_id = ?1 ORDER BY id ASC LIMIT 500",
+        )?;
+        let rows = stmt.query_map(params![chat_id], |row| {
+            Ok(AgentMessage {
+                id: row.get(0)?,
+                chat_id: row.get(1)?,
+                role: row.get(2)?,
+                content: row.get(3)?,
+                tool_name: row.get(4)?,
+                created_at: row.get(5)?,
+            })
+        })?;
+        let mut out = Vec::new();
+        for r in rows {
+            out.push(r?);
+        }
+        Ok(out)
+    }
+
+    /// Replace every chunk of one indexed document (delete + reinsert keeps
+    /// the FTS index in sync through the `rag_chunks_*` triggers).
+    pub fn index_rag_document(
+        &self,
+        source_kind: &str,
+        source_id: &str,
+        title: &str,
+        uri: &str,
+        chunks: &[String],
+    ) -> Result<i64> {
+        let conn = self.get_connection()?;
+        let existing: Option<i64> = conn
+            .query_row(
+                "SELECT id FROM rag_docs WHERE source_kind = ?1 AND source_id = ?2",
+                params![source_kind, source_id],
+                |row| row.get(0),
+            )
+            .optional()?;
+        if let Some(doc_id) = existing {
+            conn.execute("DELETE FROM rag_chunks WHERE doc_id = ?1", params![doc_id])?;
+            conn.execute(
+                "UPDATE rag_docs SET title = ?1, uri = ?2 WHERE id = ?3",
+                params![title, uri, doc_id],
+            )?;
+            insert_chunks(&conn, doc_id, title, chunks)?;
+            return Ok(doc_id);
+        }
+        conn.execute(
+            "INSERT INTO rag_docs (source_kind, source_id, title, uri) VALUES (?1, ?2, ?3, ?4)",
+            params![source_kind, source_id, title, uri],
+        )?;
+        let doc_id = conn.last_insert_rowid();
+        insert_chunks(&conn, doc_id, title, chunks)?;
+        return Ok(doc_id);
+
+        fn insert_chunks(
+            conn: &Connection,
+            doc_id: i64,
+            title: &str,
+            chunks: &[String],
+        ) -> Result<()> {
+            for (ord, chunk) in chunks.iter().enumerate() {
+                conn.execute(
+                    "INSERT INTO rag_chunks (doc_id, ord, title, content) VALUES (?1, ?2, ?3, ?4)",
+                    params![doc_id, ord as i64, title, chunk],
+                )?;
+            }
+            Ok(())
+        }
+    }
+
+    /// Drop the whole RAG index (documents + chunks; FTS follows via trigger).
+    pub fn clear_rag_index(&self) -> Result<()> {
+        let conn = self.get_connection()?;
+        conn.execute("DELETE FROM rag_chunks", [])?;
+        conn.execute("DELETE FROM rag_docs", [])?;
+        Ok(())
+    }
+
+    /// BM25 full-text search over indexed chunks. Never fails the chat when
+    /// the index is missing/empty: returns an empty vec instead.
+    pub fn rag_search(&self, query: &str, top_k: u32) -> Vec<RagHit> {
+        let query = query.trim();
+        if query.is_empty() {
+            return Vec::new();
+        }
+        let conn = match self.get_connection() {
+            Ok(conn) => conn,
+            Err(_) => return Vec::new(),
+        };
+        // Quote each term so user input cannot break the MATCH syntax.
+        let terms: Vec<String> = query
+            .split_whitespace()
+            .take(10)
+            .map(|t| format!("\"{}\"", t.replace('"', "\"\"")))
+            .collect();
+        if terms.is_empty() {
+            return Vec::new();
+        }
+        let match_expr = terms.join(" OR ");
+        let limit = top_k.clamp(1, 10) as i64;
+        let mut stmt = match conn.prepare(
+            "SELECT c.id, c.doc_id, d.title, d.uri,
+                    snippet(rag_chunks_fts, 1, '[', ']', '…', 24),
+                    bm25(rag_chunks_fts)
+             FROM rag_chunks_fts
+             JOIN rag_chunks c ON c.id = rag_chunks_fts.rowid
+             JOIN rag_docs d ON d.id = c.doc_id
+             WHERE rag_chunks_fts MATCH ?1
+             ORDER BY bm25(rag_chunks_fts) LIMIT ?2",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return Vec::new(),
+        };
+        let rows = match stmt.query_map(params![match_expr, limit], |row| {
+            Ok(RagHit {
+                chunk_id: row.get(0)?,
+                doc_id: row.get(1)?,
+                title: row.get(2)?,
+                uri: row.get(3)?,
+                snippet: row.get(4)?,
+                rank: row.get(5)?,
+            })
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return Vec::new(),
+        };
+        rows.filter_map(|r| r.ok()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1185,5 +1530,63 @@ mod tests {
             .query_row("SELECT count(*) FROM suite_docs", [], |r| r.get(0))
             .unwrap();
         assert_eq!(doc_count, 1);
+    }
+
+    #[test]
+    fn agent_chats_crud_and_rag_round_trip() {
+        let temp_dir = tempfile::tempdir().expect("temp dir");
+        let paths = AppPaths {
+            data_dir: temp_dir.path().to_path_buf(),
+            resource_dir: temp_dir.path().to_path_buf(),
+            log_dir: temp_dir.path().to_path_buf(),
+        };
+        let manager = HistoryManager::new(&paths, EventBus::new()).expect("manager");
+
+        let chat = manager
+            .create_agent_chat("chat-assistant", "Test chat")
+            .expect("create chat");
+        manager
+            .append_agent_message(chat.id, "user", "What is Vulkan?", None)
+            .expect("append user");
+        manager
+            .append_agent_message(chat.id, "assistant", "A graphics API.", None)
+            .expect("append assistant");
+        let messages = manager.list_agent_messages(chat.id).expect("list");
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[0].role, "user");
+
+        // FTS5 must be live: index → search → hit with snippet.
+        manager
+            .index_rag_document(
+                "suite_doc",
+                "1",
+                "GPU Guide",
+                "otush://suite_doc/1",
+                &["Vulkan is a low-overhead graphics API for GPUs.".to_string()],
+            )
+            .expect("index doc");
+        let hits = manager.rag_search("Vulkan graphics", 4);
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].title, "GPU Guide");
+        assert!(hits[0].snippet.contains("Vulkan"));
+
+        // Re-index replaces chunks; empty query returns nothing.
+        manager
+            .index_rag_document(
+                "suite_doc",
+                "1",
+                "GPU Guide",
+                "otush://suite_doc/1",
+                &["Unrelated pottery content.".to_string()],
+            )
+            .expect("re-index");
+        assert!(manager.rag_search("Vulkan graphics", 4).is_empty());
+        assert!(manager.rag_search("   ", 4).is_empty());
+
+        manager.delete_agent_chat(chat.id).expect("delete chat");
+        assert!(manager
+            .list_agent_messages(chat.id)
+            .expect("list")
+            .is_empty());
     }
 }

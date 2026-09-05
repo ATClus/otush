@@ -6,6 +6,7 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 /// Build the Documents & OCR Library preferences page.
 pub fn build(ctx: &AppContext) -> gtk4::Widget {
@@ -76,13 +77,15 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     list_group.set_hexpand(true);
     page.add(&list_group);
 
+    let rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
     let refresh_docs = {
         let ctx = ctx.clone();
         let group = list_group.clone();
         let query_state = search_query.clone();
+        let rows = rows.clone();
 
         move || {
-            crate::ui::pages::clear_group_rows(&group);
+            rows.lock().unwrap_or_else(|e| e.into_inner()).clear(&group);
 
             let query = query_state.borrow().trim().to_lowercase();
 
@@ -118,8 +121,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     let empty_icon = gtk4::Image::from_icon_name("x-office-document-symbolic");
                     empty_row.add_prefix(&empty_icon);
                     empty_row.set_activatable(false);
-                    group.add(&empty_row);
-                    crate::ui::pages::track_row(&group, &empty_row);
+                    rows.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .add(&group, &empty_row);
                     return;
                 }
 
@@ -192,8 +196,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
                     row.add_row(&content_row);
 
-                    group.add(&row);
-                    crate::ui::pages::track_row(&group, &row);
+                    rows.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .add(&group, &row);
                 }
             }
         }

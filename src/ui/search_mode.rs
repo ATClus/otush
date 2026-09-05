@@ -1,8 +1,9 @@
-//! Search & Deep Research floating overlay (`Ctrl+Alt+S`).
+//! Search mode page of the combined Chat & Research overlay.
 //!
-//! Native GTK4 + libadwaita web intelligence and multi-source research palette.
-//! Powered by Tavily and Firecrawl APIs with AI synthesis, interactive source cards,
-//! direct browser links, markdown export, and seamless integration with Quick Notes.
+//! The Tavily/Firecrawl web & deep research UI, moved from the former
+//! standalone `search_overlay.rs` with behavior unchanged. Only the mounting
+//! changed: widgets build into the shared overlay window (toast + main box +
+//! title owned by `chat_overlay`), and `Escape` is forwarded to the parent.
 
 use crate::context::AppContext;
 use crate::settings;
@@ -11,59 +12,13 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use log::warn;
 use std::rc::Rc;
-use std::sync::{Arc, LazyLock, Mutex};
-use std::time::Duration;
+use std::sync::{Arc, Mutex};
 
-static SEARCH_WINDOW: LazyLock<Mutex<Option<glib::SendWeakRef<libadwaita::Window>>>> =
-    LazyLock::new(|| Mutex::new(None));
-static LAST_SEARCH_TOGGLE: LazyLock<Mutex<Option<std::time::Instant>>> =
-    LazyLock::new(|| Mutex::new(None));
-
-/// Toggle or show the search and deep research overlay window.
-pub fn show_search_overlay(ctx: &AppContext) {
-    toggle_search_overlay(ctx);
-}
-
-/// Toggle display of the search and deep research overlay window.
-pub fn toggle_search_overlay(ctx: &AppContext) {
-    let now = std::time::Instant::now();
-    if let Ok(mut last) = LAST_SEARCH_TOGGLE.lock() {
-        if let Some(prev) = *last {
-            if now.duration_since(prev) < Duration::from_millis(300) {
-                return;
-            }
-        }
-        *last = Some(now);
-    }
-
-    let ctx = ctx.clone();
-    glib::MainContext::default().invoke(move || {
-        let existing_win = {
-            let mut guard = match SEARCH_WINDOW.lock() {
-                Ok(g) => g,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            guard.take().and_then(|w| w.into_weak_ref().upgrade())
-        };
-
-        if let Some(win) = existing_win {
-            if !win.in_destruction() {
-                if win.is_visible() {
-                    win.close();
-                } else {
-                    win.present();
-                    if let Ok(mut guard) = SEARCH_WINDOW.lock() {
-                        *guard = Some(glib::SendWeakRef::from(win.downgrade()));
-                    }
-                }
-                return;
-            }
-        }
-
-        build_and_present_search_overlay(&ctx);
-    });
-}
-
+/// Build the Search-mode page into the shared overlay widgets.
+///
+/// Behavior-identical to the former standalone search overlay; `window_title`
+/// is the shared header title (subtitle updates as before). `on_escape`
+/// closes the parent window (attached controller lives on `main_box`).
 #[derive(Clone, Default)]
 struct ResearchSource {
     title: String,
@@ -80,28 +35,13 @@ struct ResearchState {
     full_markdown: String,
 }
 
-fn build_and_present_search_overlay(ctx: &AppContext) {
-    let window = libadwaita::Window::new();
-    window.set_title(Some("Web & Deep Research"));
-    window.set_default_size(780, 580);
-    window.set_modal(true);
-    window.set_resizable(true);
-    window.set_deletable(true);
-    window.add_css_class("dialog");
-
-    {
-        let mut guard = match SEARCH_WINDOW.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = Some(glib::SendWeakRef::from(window.downgrade()));
-    }
-
-    let toast_overlay = libadwaita::ToastOverlay::new();
-    let main_box = gtk4::Box::new(gtk4::Orientation::Vertical, 0);
-    toast_overlay.set_child(Some(&main_box));
-    window.set_content(Some(&toast_overlay));
-
+pub fn build_search_mode(
+    ctx: &AppContext,
+    toast_overlay: &libadwaita::ToastOverlay,
+    main_box: &gtk4::Box,
+    window_title: &libadwaita::WindowTitle,
+    on_escape: impl Fn() + 'static,
+) {
     let research_state = Arc::new(Mutex::new(ResearchState::default()));
 
     // ========================================================================
@@ -110,9 +50,7 @@ fn build_and_present_search_overlay(ctx: &AppContext) {
     let header_bar = libadwaita::HeaderBar::new();
     header_bar.set_show_end_title_buttons(true);
 
-    let window_title =
-        libadwaita::WindowTitle::new("Web & Deep Research", "Tavily & Firecrawl Intelligence");
-    header_bar.set_title_widget(Some(&window_title));
+    header_bar.set_title_widget(Some(window_title));
 
     // Clear Button (Left)
     let clear_btn = gtk4::Button::from_icon_name("view-refresh-symbolic");
@@ -753,7 +691,6 @@ fn build_and_present_search_overlay(ctx: &AppContext) {
     // Ctrl+S = Save to Notes
     // Ctrl+L = Focus search entry
     let key_controller = gtk4::EventControllerKey::new();
-    let win_weak = glib::SendWeakRef::from(window.downgrade());
     let deep_key = deep_toggle.clone();
     let copy_key = copy_btn.clone();
     let save_key = save_note_btn.clone();
@@ -761,10 +698,8 @@ fn build_and_present_search_overlay(ctx: &AppContext) {
 
     key_controller.connect_key_pressed(move |_, key, _, state_mod| {
         if key == gdk4::Key::Escape {
-            if let Some(w) = win_weak.clone().into_weak_ref().upgrade() {
-                w.close();
-                return glib::Propagation::Stop;
-            }
+            on_escape();
+            return glib::Propagation::Stop;
         } else if state_mod.contains(gdk4::ModifierType::CONTROL_MASK) {
             match key {
                 gdk4::Key::d | gdk4::Key::D => {
@@ -793,16 +728,7 @@ fn build_and_present_search_overlay(ctx: &AppContext) {
         }
         glib::Propagation::Proceed
     });
-    window.add_controller(key_controller);
-
-    window.connect_destroy(|_| {
-        let mut guard = match SEARCH_WINDOW.lock() {
-            Ok(g) => g,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *guard = None;
-    });
+    main_box.add_controller(key_controller);
 
     search_entry.grab_focus();
-    window.present();
 }

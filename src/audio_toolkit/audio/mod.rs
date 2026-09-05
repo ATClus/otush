@@ -1,3 +1,9 @@
+//! Audio capture and file decoding.
+//!
+//! The cpal input stream owner plus media probing via symphonia (resampled to
+//! 16 kHz mono), the voice-enhancement DSP chain (high-pass, noise gate),
+//! and the overlay level-meter visualizer.
+
 pub mod decoder;
 mod device;
 pub mod dsp;

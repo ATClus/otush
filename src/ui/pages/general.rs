@@ -1,7 +1,7 @@
 //! General settings page: Language, Overlay HUD, Pasting, and System Behavior.
 
 use crate::context::AppContext;
-use crate::settings::{AutoSubmitKey, PasteMethod, Theme, TypingTool};
+use crate::settings::{AutoSubmitKey, PasteMethod, Theme, TrayTheme, TypingTool};
 use crate::shortcut;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
@@ -93,7 +93,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     custom_lang_row.connect_changed(move |row| {
         let text = row.text().trim().to_string();
         if !text.is_empty() {
-            let _ = shortcut::change_selected_language_setting(&entry_ctx, text);
+            if let Err(err) = shortcut::change_selected_language_setting(&entry_ctx, text) {
+                entry_ctx.report_error("change_selected_language_setting", err);
+            }
         }
     });
 
@@ -176,7 +178,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let pos_row_weak = glib::SendWeakRef::from(overlay_position_row.downgrade());
     overlay_style_row.connect_selected_notify(move |row| {
         if let Some((id, _)) = style_labels.get(row.selected() as usize) {
-            let _ = shortcut::change_overlay_style_setting(&ctx1, id.to_string());
+            if let Err(err) = shortcut::change_overlay_style_setting(&ctx1, id.to_string()) {
+                ctx1.report_error("change_overlay_style_setting", err);
+            }
             if let Some(pos_row) = pos_row_weak.clone().into_weak_ref().upgrade() {
                 pos_row.set_visible(*id != "none");
             }
@@ -187,7 +191,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let ctx2 = ctx.clone();
     overlay_position_row.connect_selected_notify(move |row| {
         if let Some((id, _)) = position_labels.get(row.selected() as usize) {
-            let _ = shortcut::change_overlay_position_setting(&ctx2, id.to_string());
+            if let Err(err) = shortcut::change_overlay_position_setting(&ctx2, id.to_string()) {
+                ctx2.report_error("change_overlay_position_setting", err);
+            }
         }
     });
     overlay_group.add(&overlay_position_row);
@@ -235,40 +241,69 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
     let typing_tool_row = libadwaita::ComboRow::new();
     typing_tool_row.set_title("Direct Typing Backend");
-    typing_tool_row.set_subtitle("Virtual keystroke injector tool for Wayland/X11");
     let typing_icon = gtk4::Image::from_icon_name("input-keyboard-symbolic");
     typing_tool_row.add_prefix(&typing_icon);
 
-    let tool_labels = [
-        ("auto", "Auto (Detect Environment)"),
-        ("wtype", "wtype (Wayland standard)"),
-        ("ydotool", "ydotool (uinput daemon)"),
-        ("xdotool", "xdotool (X11)"),
-        ("dotool", "dotool"),
-        ("kwtype", "kwtype (KDE)"),
-    ];
-    let model = gtk4::StringList::new(
-        &tool_labels
-            .iter()
-            .map(|(_, label)| *label)
-            .collect::<Vec<_>>(),
-    );
+    // List only the tools actually installed on this system (probed on PATH),
+    // so a missing tool cannot be selected and then fail at paste time.
+    // "auto" is always present; the saved setting may name a tool that was
+    // since uninstalled — keep it selectable with a warning label.
+    fn tool_label(id: &str) -> &str {
+        match id {
+            "auto" => "Auto (Detect Environment)",
+            "wtype" => "wtype (Wayland standard)",
+            "ydotool" => "ydotool (uinput daemon)",
+            "xdotool" => "xdotool (X11)",
+            "dotool" => "dotool",
+            "kwtype" => "kwtype (KDE)",
+            _ => "Unknown tool",
+        }
+    }
+    let mut tool_ids = crate::clipboard::get_available_typing_tools();
+    let saved_tool_id = match settings.typing_tool {
+        TypingTool::Auto => "auto",
+        TypingTool::Wtype => "wtype",
+        TypingTool::Ydotool => "ydotool",
+        TypingTool::Xdotool => "xdotool",
+        TypingTool::Dotool => "dotool",
+        TypingTool::Kwtype => "kwtype",
+    };
+    let saved_missing = !tool_ids.iter().any(|id| id == saved_tool_id);
+    if saved_missing {
+        tool_ids.push(saved_tool_id.to_string());
+        typing_tool_row
+            .set_subtitle("Saved tool is not installed; pick an available backend or reinstall it");
+    } else {
+        typing_tool_row.set_subtitle("Virtual keystroke injector tool for Wayland/X11");
+    }
+    let tool_label_strings: Vec<String> = tool_ids
+        .iter()
+        .map(|id| {
+            if saved_missing && id == saved_tool_id {
+                format!("{} (not installed)", tool_label(id))
+            } else {
+                tool_label(id).to_string()
+            }
+        })
+        .collect();
+    let tool_label_refs: Vec<&str> = tool_label_strings.iter().map(String::as_str).collect();
+    let model = gtk4::StringList::new(&tool_label_refs);
     typing_tool_row.set_model(Some(&model));
-    typing_tool_row.set_selected(match settings.typing_tool {
-        TypingTool::Auto => 0,
-        TypingTool::Wtype => 1,
-        TypingTool::Ydotool => 2,
-        TypingTool::Xdotool => 3,
-        TypingTool::Dotool => 4,
-        TypingTool::Kwtype => 5,
-    });
+    typing_tool_row.set_selected(
+        tool_ids
+            .iter()
+            .position(|id| id == saved_tool_id)
+            .unwrap_or(0) as u32,
+    );
     typing_tool_row.set_visible(settings.paste_method == PasteMethod::Direct);
 
     let ctx3 = ctx.clone();
     let typing_weak = glib::SendWeakRef::from(typing_tool_row.downgrade());
     paste_method_row.connect_selected_notify(move |row| {
         if let Some((id, _)) = method_labels.get(row.selected() as usize) {
-            let _ = shortcut::change_paste_method_setting(&ctx3, id.to_string());
+            if let Err(err) = shortcut::change_paste_method_setting(&ctx3, id.to_string()) {
+                ctx3.report_error("change_paste_method_setting", err);
+            }
             if let Some(typing_row) = typing_weak.clone().into_weak_ref().upgrade() {
                 typing_row.set_visible(*id == "direct");
             }
@@ -278,8 +313,10 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
     let ctx4 = ctx.clone();
     typing_tool_row.connect_selected_notify(move |row| {
-        if let Some((id, _)) = tool_labels.get(row.selected() as usize) {
-            let _ = shortcut::change_typing_tool_setting(&ctx4, id.to_string());
+        if let Some(id) = tool_ids.get(row.selected() as usize) {
+            if let Err(err) = shortcut::change_typing_tool_setting(&ctx4, id.clone()) {
+                ctx4.report_error("change_typing_tool_setting", err);
+            }
         }
     });
     paste_group.add(&typing_tool_row);
@@ -318,7 +355,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let submit_key_weak = glib::SendWeakRef::from(submit_key_row.downgrade());
     auto_submit_row.connect_active_notify(move |row| {
         let is_active = row.is_active();
-        let _ = shortcut::change_auto_submit_setting(&submit_ctx, is_active);
+        if let Err(err) = shortcut::change_auto_submit_setting(&submit_ctx, is_active) {
+            submit_ctx.report_error("change_auto_submit_setting", err);
+        }
         if let Some(key_row) = submit_key_weak.clone().into_weak_ref().upgrade() {
             key_row.set_visible(is_active);
         }
@@ -328,7 +367,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let key_ctx = ctx.clone();
     submit_key_row.connect_selected_notify(move |row| {
         if let Some((id, _)) = key_labels.get(row.selected() as usize) {
-            let _ = shortcut::change_auto_submit_key_setting(&key_ctx, id.to_string());
+            if let Err(err) = shortcut::change_auto_submit_key_setting(&key_ctx, id.to_string()) {
+                key_ctx.report_error("change_auto_submit_key_setting", err);
+            }
         }
     });
     paste_group.add(&submit_key_row);
@@ -341,7 +382,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     trailing_space_row.set_active(settings.append_trailing_space);
     let ts_ctx = ctx.clone();
     trailing_space_row.connect_active_notify(move |row| {
-        let _ = shortcut::change_append_trailing_space_setting(&ts_ctx, row.is_active());
+        if let Err(err) = shortcut::change_append_trailing_space_setting(&ts_ctx, row.is_active()) {
+            ts_ctx.report_error("change_append_trailing_space_setting", err);
+        }
     });
     paste_group.add(&trailing_space_row);
 
@@ -383,7 +426,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
             2 => "dark",
             _ => "system",
         };
-        let _ = shortcut::change_theme_setting(&theme_ctx, theme_str.to_string());
+        if let Err(err) = shortcut::change_theme_setting(&theme_ctx, theme_str.to_string()) {
+            theme_ctx.report_error("change_theme_setting", err);
+        }
     });
     system_group.add(&theme_row);
 
@@ -395,9 +440,51 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     tray_row.set_active(settings.show_tray_icon);
     let tray_ctx = ctx.clone();
     tray_row.connect_active_notify(move |row| {
-        let _ = shortcut::change_show_tray_icon_setting(&tray_ctx, row.is_active());
+        if let Err(err) = shortcut::change_show_tray_icon_setting(&tray_ctx, row.is_active()) {
+            tray_ctx.report_error("change_show_tray_icon_setting", err);
+        }
     });
     system_group.add(&tray_row);
+
+    let tray_theme_row = libadwaita::ComboRow::new();
+    tray_theme_row.set_title("Tray Icon Style");
+    tray_theme_row.set_subtitle("Icon set for the top-bar status icon");
+    let tray_theme_icon = gtk4::Image::from_icon_name("preferences-desktop-theme-symbolic");
+    tray_theme_row.add_prefix(&tray_theme_icon);
+    let tray_theme_labels = [
+        ("dark", "Dark Bar (Light Icons)"),
+        ("light", "Light Bar (Dark Icons)"),
+        ("colored", "Colored"),
+    ];
+    let tray_theme_model = gtk4::StringList::new(
+        &tray_theme_labels
+            .iter()
+            .map(|(_, label)| *label)
+            .collect::<Vec<_>>(),
+    );
+    tray_theme_row.set_model(Some(&tray_theme_model));
+    tray_theme_row.set_selected(match settings.tray_theme {
+        TrayTheme::Dark => 0,
+        TrayTheme::Light => 1,
+        TrayTheme::Colored => 2,
+    });
+    tray_theme_row.set_visible(settings.show_tray_icon);
+    let tray_theme_ctx = ctx.clone();
+    tray_theme_row.connect_selected_notify(move |row| {
+        if let Some((id, _)) = tray_theme_labels.get(row.selected() as usize) {
+            if let Err(err) = shortcut::change_tray_theme_setting(&tray_theme_ctx, id.to_string()) {
+                tray_theme_ctx.report_error("change_tray_theme_setting", err);
+            }
+        }
+    });
+    // Show the style row only while the tray icon itself is enabled.
+    let tray_theme_weak = glib::SendWeakRef::from(tray_theme_row.downgrade());
+    tray_row.connect_active_notify(move |row| {
+        if let Some(r) = tray_theme_weak.clone().into_weak_ref().upgrade() {
+            r.set_visible(row.is_active());
+        }
+    });
+    system_group.add(&tray_theme_row);
 
     let autostart_row = libadwaita::SwitchRow::new();
     autostart_row.set_title("Launch at Login");
@@ -407,7 +494,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     autostart_row.set_active(settings.autostart_enabled);
     let auto_ctx = ctx.clone();
     autostart_row.connect_active_notify(move |row| {
-        let _ = shortcut::change_autostart_setting(&auto_ctx, row.is_active());
+        if let Err(err) = shortcut::change_autostart_setting(&auto_ctx, row.is_active()) {
+            auto_ctx.report_error("change_autostart_setting", err);
+        }
     });
     system_group.add(&autostart_row);
 
@@ -419,7 +508,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     update_row.set_active(settings.update_checks_enabled);
     let upd_ctx = ctx.clone();
     update_row.connect_active_notify(move |row| {
-        let _ = shortcut::change_update_checks_setting(&upd_ctx, row.is_active());
+        if let Err(err) = shortcut::change_update_checks_setting(&upd_ctx, row.is_active()) {
+            upd_ctx.report_error("change_update_checks_setting", err);
+        }
     });
     system_group.add(&update_row);
 
@@ -457,7 +548,7 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     // Active shortcuts overview
     let expander = libadwaita::ExpanderRow::new();
     expander.set_title("Active Shortcuts Overview");
-    expander.set_subtitle("View current key combinations across the Otush suite");
+    expander.set_subtitle("View and customize key combinations across the Otush suite");
     let list_icon = gtk4::Image::from_icon_name("view-list-bullet-symbolic");
     expander.add_prefix(&list_icon);
 
@@ -473,7 +564,7 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         row.set_title(&binding.name);
         let badge = format_shortcut_badge_string(&binding.current_binding);
         row.set_subtitle(&badge);
-        row.set_activatable(false);
+        row.set_activatable(true);
 
         let icon_name = match binding.id.as_str() {
             "transcribe" => "audio-input-microphone-symbolic",
@@ -482,6 +573,7 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
             "transform_selection" => "edit-select-symbolic",
             "show_history" => "document-open-recent-symbolic",
             "search_overlay" => "system-search-symbolic",
+            "agent_chat" => "chat-symbolic",
             "quick_note" => "text-editor-symbolic",
             "todo_palette" => "checkbox-checked-symbolic",
             "doc_parser" => "x-office-document-symbolic",
@@ -489,6 +581,34 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         };
         let icon = gtk4::Image::from_icon_name(icon_name);
         row.add_prefix(&icon);
+
+        // Recapture button: opens a capture dialog for a new combination.
+        let edit_ctx = ctx.clone();
+        let edit_id = binding.id.clone();
+        let edit_current = binding.current_binding.clone();
+        let recapture_btn = gtk4::Button::from_icon_name("document-edit-symbolic");
+        recapture_btn.set_tooltip_text(Some("Change shortcut"));
+        recapture_btn.set_valign(gtk4::Align::Center);
+        recapture_btn.add_css_class("flat");
+        recapture_btn.connect_clicked(move |_| {
+            show_shortcut_capture_dialog(&edit_ctx, &edit_id, &edit_current);
+        });
+        row.add_suffix(&recapture_btn);
+
+        // Reset button: restore the default combination.
+        let reset_ctx = ctx.clone();
+        let reset_id = binding.id.clone();
+        let reset_btn = gtk4::Button::from_icon_name("edit-undo-symbolic");
+        reset_btn.set_tooltip_text(Some("Reset to default"));
+        reset_btn.set_valign(gtk4::Align::Center);
+        reset_btn.add_css_class("flat");
+        reset_btn.connect_clicked(move |_| {
+            if let Err(err) = shortcut::reset_binding(&reset_ctx, reset_id.clone()) {
+                reset_ctx.report_error("reset_binding", err);
+            }
+        });
+        row.add_suffix(&reset_btn);
+
         expander.add_row(&row);
     }
 
@@ -530,4 +650,157 @@ fn format_shortcut_badge_string(raw: &str) -> String {
         })
         .collect();
     tokens.join(" + ")
+}
+
+/// Modal capture dialog for rebinding one shortcut.
+///
+/// Suspends global dispatch while open (so the pressed chord cannot fire an
+/// action mid-capture), captures the next key press with modifiers via an
+/// `EventControllerKey`, validates it, and persists it through
+/// [`shortcut::change_binding`]. Escape cancels. Dispatch is always resumed
+/// when the dialog closes.
+fn show_shortcut_capture_dialog(ctx: &AppContext, id: &str, current: &str) {
+    crate::shortcut::suspend_all_shortcuts(ctx);
+
+    let dialog = libadwaita::Window::new();
+    dialog.set_title(Some("Press a New Shortcut"));
+    dialog.set_modal(true);
+    dialog.set_default_size(360, 160);
+
+    let content = gtk4::Box::new(gtk4::Orientation::Vertical, 12);
+    content.set_margin_top(24);
+    content.set_margin_bottom(24);
+    content.set_margin_start(24);
+    content.set_margin_end(24);
+
+    let heading = gtk4::Label::new(Some("Press a New Shortcut"));
+    heading.add_css_class("title-2");
+    content.append(&heading);
+
+    let hint = gtk4::Label::new(Some(&format!(
+        "Current: {}\nPress the new key combination, or Escape to cancel.",
+        format_shortcut_badge_string(current)
+    )));
+    hint.set_wrap(true);
+    content.append(&hint);
+
+    let status_row = libadwaita::ActionRow::new();
+    status_row.set_title("Waiting for keys…");
+    status_row.set_activatable(false);
+    content.append(&status_row);
+
+    let cancel_btn = gtk4::Button::with_label("Cancel");
+    cancel_btn.set_halign(gtk4::Align::Center);
+    content.append(&cancel_btn);
+
+    dialog.set_content(Some(&content));
+
+    let capture_ctx = ctx.clone();
+    let capture_id = id.to_string();
+    let dialog_weak = glib::SendWeakRef::from(dialog.downgrade());
+    let status_weak = glib::SendWeakRef::from(status_row.downgrade());
+
+    let dialog_weak_cancel = dialog_weak.clone();
+    cancel_btn.connect_clicked(move |_| {
+        if let Some(d) = dialog_weak_cancel.clone().into_weak_ref().upgrade() {
+            d.close();
+        }
+    });
+
+    let key_controller = gtk4::EventControllerKey::new();
+    key_controller.connect_key_pressed(move |_, keyval, _keycode, state| {
+        use gdk4::ModifierType;
+
+        // Escape cancels without applying.
+        if keyval == gdk4::Key::Escape {
+            if let Some(d) = dialog_weak.clone().into_weak_ref().upgrade() {
+                d.close();
+            }
+            return glib::Propagation::Stop;
+        }
+
+        // Ignore lone modifier presses; wait for the full chord.
+        let name = keyval.name().map(|s| s.to_string()).unwrap_or_default();
+        if name.is_empty()
+            || [
+                "Shift_L",
+                "Shift_R",
+                "Control_L",
+                "Control_R",
+                "Alt_L",
+                "Alt_R",
+                "Meta_L",
+                "Meta_R",
+                "Super_L",
+                "Super_R",
+            ]
+            .contains(&name.as_str())
+        {
+            return glib::Propagation::Stop;
+        }
+
+        let mut parts: Vec<String> = Vec::new();
+        if state.contains(ModifierType::CONTROL_MASK) {
+            parts.push("Ctrl".to_string());
+        }
+        if state.contains(ModifierType::ALT_MASK) {
+            parts.push("Alt".to_string());
+        }
+        if state.contains(ModifierType::SHIFT_MASK) {
+            parts.push("Shift".to_string());
+        }
+        if state.contains(ModifierType::META_MASK) {
+            parts.push("Super".to_string());
+        }
+        parts.push(capture_key_label(&name));
+        let candidate = parts.join("+");
+
+        match shortcut::change_binding(&capture_ctx, capture_id.clone(), candidate.clone()) {
+            Ok(response) if response.success => {
+                if let Some(d) = dialog_weak.clone().into_weak_ref().upgrade() {
+                    d.close();
+                }
+            }
+            Err(e) => {
+                if let Some(s) = status_weak.clone().into_weak_ref().upgrade() {
+                    s.set_title(&format!("Invalid: {e}"));
+                }
+            }
+            Ok(response) => {
+                if let Some(s) = status_weak.clone().into_weak_ref().upgrade() {
+                    let detail = response.error.unwrap_or_else(|| "rejected".to_string());
+                    s.set_title(&format!("Not applied: {detail}"));
+                }
+            }
+        }
+        glib::Propagation::Stop
+    });
+    dialog.add_controller(key_controller);
+
+    let dialog_ctx = ctx.clone();
+    dialog.connect_destroy(move |_| {
+        crate::shortcut::resume_all_shortcuts(&dialog_ctx);
+    });
+    dialog.present();
+}
+
+/// Map a GDK key name to the binding-string token used by the portal engine.
+fn capture_key_label(gdk_name: &str) -> String {
+    match gdk_name {
+        "space" => "Space".to_string(),
+        "Escape" => "Escape".to_string(),
+        "Return" => "Enter".to_string(),
+        "Tab" => "Tab".to_string(),
+        "BackSpace" => "Backspace".to_string(),
+        "Delete" => "Delete".to_string(),
+        "Insert" => "Insert".to_string(),
+        "Pause" => "Pause".to_string(),
+        "Home" => "Home".to_string(),
+        "End" => "End".to_string(),
+        "Page_Up" => "PageUp".to_string(),
+        "Page_Down" => "PageDown".to_string(),
+        "Scroll_Lock" => "Scroll_Lock".to_string(),
+        single if single.len() == 1 => single.to_uppercase(),
+        other => other.to_string(),
+    }
 }

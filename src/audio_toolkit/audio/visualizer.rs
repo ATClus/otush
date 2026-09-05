@@ -191,7 +191,7 @@ mod tests {
         let buckets = vis.feed(&silence).expect("full window produces buckets");
         assert_eq!(buckets.len(), 16);
         for &b in &buckets {
-            assert!(b >= 0.0 && b <= 1.0);
+            assert!((0.0..=1.0).contains(&b));
             assert!(b < 0.1, "Silence should produce near-zero levels, got {b}");
         }
     }

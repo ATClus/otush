@@ -48,16 +48,24 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let expanded_stt: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let expanded_web: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
+    // Owned row lists, one per rebuilt group (see `PageGroup`).
+    let llm_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
+    let stt_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
+    let web_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
+
     // Initial render
-    refresh_llm_providers_group(ctx, &llm_group, &expanded_llm);
-    refresh_stt_providers_group(ctx, &stt_group, &expanded_stt);
-    refresh_web_providers_group(ctx, &web_group, &expanded_web);
+    refresh_llm_providers_group(ctx, &llm_group, &expanded_llm, &llm_rows);
+    refresh_stt_providers_group(ctx, &stt_group, &expanded_stt, &stt_rows);
+    refresh_web_providers_group(ctx, &web_group, &expanded_web, &web_rows);
 
     // Live refresh on bus events
     let llm_weak = glib::SendWeakRef::from(llm_group.downgrade());
     let stt_weak = glib::SendWeakRef::from(stt_group.downgrade());
     let web_weak = glib::SendWeakRef::from(web_group.downgrade());
     let ctx_bus = ctx.clone();
+    let llm_rows_bus = llm_rows.clone();
+    let stt_rows_bus = stt_rows.clone();
+    let web_rows_bus = web_rows.clone();
 
     ctx.bus.subscribe(move |event| {
         let ctx = ctx_bus.clone();
@@ -67,6 +75,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         let exp_llm = expanded_llm.clone();
         let exp_stt = expanded_stt.clone();
         let exp_web = expanded_web.clone();
+        let llm_rows = llm_rows_bus.clone();
+        let stt_rows = stt_rows_bus.clone();
+        let web_rows = web_rows_bus.clone();
 
         glib::MainContext::default().invoke(move || {
             if let AppEvent::SettingsChanged { setting, .. } = event {
@@ -74,21 +85,21 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     || setting == "post_process_provider_models"
                 {
                     if let Some(grp) = llm_weak.into_weak_ref().upgrade() {
-                        refresh_llm_providers_group(&ctx, &grp, &exp_llm);
+                        refresh_llm_providers_group(&ctx, &grp, &exp_llm, &llm_rows);
                     }
                 } else if setting == "transcription_providers_reordered"
                     || setting == "transcription_provider_model"
                     || setting == "local_transcription_enabled"
                 {
                     if let Some(grp) = stt_weak.into_weak_ref().upgrade() {
-                        refresh_stt_providers_group(&ctx, &grp, &exp_stt);
+                        refresh_stt_providers_group(&ctx, &grp, &exp_stt, &stt_rows);
                     }
                 } else if setting == "web_providers_reordered"
                     || setting == "web_provider_api_key"
                     || setting == "web_provider_base_url"
                 {
                     if let Some(grp) = web_weak.into_weak_ref().upgrade() {
-                        refresh_web_providers_group(&ctx, &grp, &exp_web);
+                        refresh_web_providers_group(&ctx, &grp, &exp_web, &web_rows);
                     }
                 }
             }
@@ -106,8 +117,9 @@ fn refresh_llm_providers_group(
     ctx: &AppContext,
     group: &libadwaita::PreferencesGroup,
     expanded_ids: &Arc<Mutex<HashSet<String>>>,
+    rows: &Arc<Mutex<crate::ui::pages::PageGroup>>,
 ) {
-    crate::ui::pages::clear_group_rows(group);
+    rows.lock().unwrap_or_else(|e| e.into_inner()).clear(group);
 
     let settings = settings::get_settings(ctx);
     let total_providers = settings.post_process_providers.len();
@@ -164,7 +176,11 @@ fn refresh_llm_providers_group(
             let up_ctx = ctx.clone();
             let up_pid = provider.id.clone();
             up_btn.connect_clicked(move |_| {
-                let _ = shortcut::move_post_process_provider_priority(&up_ctx, &up_pid, true);
+                if let Err(err) =
+                    shortcut::move_post_process_provider_priority(&up_ctx, &up_pid, true)
+                {
+                    up_ctx.report_error("move_post_process_provider_priority", err);
+                }
             });
             row.add_suffix(&up_btn);
         }
@@ -178,7 +194,11 @@ fn refresh_llm_providers_group(
             let down_ctx = ctx.clone();
             let down_pid = provider.id.clone();
             down_btn.connect_clicked(move |_| {
-                let _ = shortcut::move_post_process_provider_priority(&down_ctx, &down_pid, false);
+                if let Err(err) =
+                    shortcut::move_post_process_provider_priority(&down_ctx, &down_pid, false)
+                {
+                    down_ctx.report_error("move_post_process_provider_priority", err);
+                }
             });
             row.add_suffix(&down_btn);
         }
@@ -191,11 +211,13 @@ fn refresh_llm_providers_group(
         let en_ctx = ctx.clone();
         let en_id = provider.id.clone();
         enable_switch.connect_active_notify(move |sw| {
-            let _ = shortcut::toggle_post_process_provider_enabled(
+            if let Err(err) = shortcut::toggle_post_process_provider_enabled(
                 &en_ctx,
                 en_id.clone(),
                 sw.is_active(),
-            );
+            ) {
+                en_ctx.report_error("toggle_post_process_provider_enabled", err);
+            }
         });
         row.add_suffix(&enable_switch);
 
@@ -214,11 +236,13 @@ fn refresh_llm_providers_group(
         let key_ctx = ctx.clone();
         let key_id = provider.id.clone();
         api_key_row.connect_changed(move |r| {
-            let _ = shortcut::change_post_process_api_key_setting(
+            if let Err(err) = shortcut::change_post_process_api_key_setting(
                 &key_ctx,
                 key_id.clone(),
                 r.text().to_string(),
-            );
+            ) {
+                key_ctx.report_error("change_post_process_api_key_setting", err);
+            }
         });
         row.add_row(&api_key_row);
 
@@ -264,11 +288,13 @@ fn refresh_llm_providers_group(
                                 if row.text().is_empty() {
                                     if let Some(first) = models.first() {
                                         row.set_text(first);
-                                        let _ = shortcut::change_post_process_model_setting(
+                                        if let Err(err) = shortcut::change_post_process_model_setting(
                                             &task_ctx,
                                             task_pid.clone(),
                                             first.clone(),
-                                        );
+                                        ) {
+                                            task_ctx.report_error("change_post_process_model_setting", err);
+                                        }
                                     }
                                 }
                                 let tip = format!("Available models ({} found):\n{}", models.len(), models.join(", "));
@@ -290,11 +316,13 @@ fn refresh_llm_providers_group(
         let model_ctx = ctx.clone();
         let model_id = provider.id.clone();
         model_row.connect_changed(move |r| {
-            let _ = shortcut::change_post_process_model_setting(
+            if let Err(err) = shortcut::change_post_process_model_setting(
                 &model_ctx,
                 model_id.clone(),
                 r.text().to_string(),
-            );
+            ) {
+                model_ctx.report_error("change_post_process_model_setting", err);
+            }
         });
         row.add_row(&model_row);
 
@@ -309,11 +337,13 @@ fn refresh_llm_providers_group(
             let url_ctx = ctx.clone();
             let url_id = provider.id.clone();
             url_row.connect_changed(move |r| {
-                let _ = shortcut::change_post_process_base_url_setting(
+                if let Err(err) = shortcut::change_post_process_base_url_setting(
                     &url_ctx,
                     url_id.clone(),
                     r.text().to_string(),
-                );
+                ) {
+                    url_ctx.report_error("change_post_process_base_url_setting", err);
+                }
             });
             row.add_row(&url_row);
         }
@@ -339,11 +369,11 @@ fn refresh_llm_providers_group(
         let timeout_id = provider.id.clone();
         timeout_adj.connect_value_changed(move |adj| {
             let val = adj.value().round() as u32;
-            let _ = shortcut::change_post_process_timeout_setting(
-                &timeout_ctx,
-                timeout_id.clone(),
-                val,
-            );
+            if let Err(err) =
+                shortcut::change_post_process_timeout_setting(&timeout_ctx, timeout_id.clone(), val)
+            {
+                timeout_ctx.report_error("change_post_process_timeout_setting", err);
+            }
         });
         row.add_row(&timeout_row);
 
@@ -377,12 +407,14 @@ fn refresh_llm_providers_group(
         let r_budget = provider.reasoning.budget_tokens;
         reasoning_row.connect_selected_notify(move |combo| {
             let effort = settings::ReasoningEffort::from_index(combo.selected());
-            let _ = shortcut::set_post_process_provider_reasoning(
+            if let Err(err) = shortcut::set_post_process_provider_reasoning(
                 &r_ctx,
                 r_pid.clone(),
                 effort,
                 r_budget,
-            );
+            ) {
+                r_ctx.report_error("set_post_process_provider_reasoning", err);
+            }
         });
         row.add_row(&reasoning_row);
 
@@ -448,8 +480,9 @@ fn refresh_llm_providers_group(
         test_row.add_suffix(&test_btn);
         row.add_row(&test_row);
 
-        group.add(&row);
-        crate::ui::pages::track_row(group, &row);
+        rows.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(group, &row);
     }
 }
 
@@ -461,8 +494,9 @@ fn refresh_stt_providers_group(
     ctx: &AppContext,
     group: &libadwaita::PreferencesGroup,
     expanded_ids: &Arc<Mutex<HashSet<String>>>,
+    rows: &Arc<Mutex<crate::ui::pages::PageGroup>>,
 ) {
-    crate::ui::pages::clear_group_rows(group);
+    rows.lock().unwrap_or_else(|e| e.into_inner()).clear(group);
 
     let settings = settings::get_settings(ctx);
 
@@ -485,11 +519,14 @@ fn refresh_stt_providers_group(
     ));
     let sw_ctx = ctx.clone();
     local_switch.connect_active_notify(move |sw| {
-        let _ = shortcut::toggle_local_transcription_setting(&sw_ctx, sw.is_active());
+        if let Err(err) = shortcut::toggle_local_transcription_setting(&sw_ctx, sw.is_active()) {
+            sw_ctx.report_error("toggle_local_transcription_setting", err);
+        }
     });
     local_row.add_suffix(&local_switch);
-    group.add(&local_row);
-    crate::ui::pages::track_row(group, &local_row);
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &local_row);
 
     let total_providers = settings.transcription_providers.len();
 
@@ -539,7 +576,11 @@ fn refresh_stt_providers_group(
             let up_ctx = ctx.clone();
             let up_pid = provider.id.clone();
             up_btn.connect_clicked(move |_| {
-                let _ = shortcut::move_transcription_provider_priority(&up_ctx, &up_pid, true);
+                if let Err(err) =
+                    shortcut::move_transcription_provider_priority(&up_ctx, &up_pid, true)
+                {
+                    up_ctx.report_error("move_transcription_provider_priority", err);
+                }
             });
             row.add_suffix(&up_btn);
         }
@@ -553,7 +594,11 @@ fn refresh_stt_providers_group(
             let down_ctx = ctx.clone();
             let down_pid = provider.id.clone();
             down_btn.connect_clicked(move |_| {
-                let _ = shortcut::move_transcription_provider_priority(&down_ctx, &down_pid, false);
+                if let Err(err) =
+                    shortcut::move_transcription_provider_priority(&down_ctx, &down_pid, false)
+                {
+                    down_ctx.report_error("move_transcription_provider_priority", err);
+                }
             });
             row.add_suffix(&down_btn);
         }
@@ -566,11 +611,13 @@ fn refresh_stt_providers_group(
         let en_ctx = ctx.clone();
         let en_id = provider.id.clone();
         enable_switch.connect_active_notify(move |sw| {
-            let _ = shortcut::toggle_transcription_provider_enabled(
+            if let Err(err) = shortcut::toggle_transcription_provider_enabled(
                 &en_ctx,
                 en_id.clone(),
                 sw.is_active(),
-            );
+            ) {
+                en_ctx.report_error("toggle_transcription_provider_enabled", err);
+            }
         });
         row.add_suffix(&enable_switch);
 
@@ -589,11 +636,13 @@ fn refresh_stt_providers_group(
         let key_ctx = ctx.clone();
         let key_id = provider.id.clone();
         api_key_row.connect_changed(move |r| {
-            let _ = shortcut::change_transcription_api_key_setting(
+            if let Err(err) = shortcut::change_transcription_api_key_setting(
                 &key_ctx,
                 key_id.clone(),
                 r.text().to_string(),
-            );
+            ) {
+                key_ctx.report_error("change_transcription_api_key_setting", err);
+            }
         });
         row.add_row(&api_key_row);
 
@@ -607,11 +656,13 @@ fn refresh_stt_providers_group(
         let model_ctx = ctx.clone();
         let model_id = provider.id.clone();
         model_row.connect_changed(move |r| {
-            let _ = shortcut::change_transcription_model_setting(
+            if let Err(err) = shortcut::change_transcription_model_setting(
                 &model_ctx,
                 model_id.clone(),
                 r.text().to_string(),
-            );
+            ) {
+                model_ctx.report_error("change_transcription_model_setting", err);
+            }
         });
         row.add_row(&model_row);
 
@@ -626,11 +677,13 @@ fn refresh_stt_providers_group(
             let url_ctx = ctx.clone();
             let url_id = provider.id.clone();
             url_row.connect_changed(move |r| {
-                let _ = shortcut::change_transcription_base_url_setting(
+                if let Err(err) = shortcut::change_transcription_base_url_setting(
                     &url_ctx,
                     url_id.clone(),
                     r.text().to_string(),
-                );
+                ) {
+                    url_ctx.report_error("change_transcription_base_url_setting", err);
+                }
             });
             row.add_row(&url_row);
         }
@@ -656,11 +709,13 @@ fn refresh_stt_providers_group(
         let timeout_id = provider.id.clone();
         timeout_adj.connect_value_changed(move |adj| {
             let val = adj.value().round() as u32;
-            let _ = shortcut::change_transcription_timeout_setting(
+            if let Err(err) = shortcut::change_transcription_timeout_setting(
                 &timeout_ctx,
                 timeout_id.clone(),
                 val,
-            );
+            ) {
+                timeout_ctx.report_error("change_transcription_timeout_setting", err);
+            }
         });
         row.add_row(&timeout_row);
 
@@ -677,9 +732,11 @@ fn refresh_stt_providers_group(
             let sf_ctx = ctx.clone();
             smart_format_row.connect_active_notify(move |sw| {
                 let active = sw.is_active();
-                let _ = shortcut::update_deepgram_config(&sf_ctx, move |cfg| {
+                if let Err(err) = shortcut::update_deepgram_config(&sf_ctx, move |cfg| {
                     cfg.smart_format = active;
-                });
+                }) {
+                    sf_ctx.report_error("update_deepgram_config", err);
+                }
             });
             row.add_row(&smart_format_row);
         }
@@ -744,8 +801,9 @@ fn refresh_stt_providers_group(
         test_row.add_suffix(&test_btn);
         row.add_row(&test_row);
 
-        group.add(&row);
-        crate::ui::pages::track_row(group, &row);
+        rows.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(group, &row);
     }
 }
 
@@ -757,8 +815,9 @@ fn refresh_web_providers_group(
     ctx: &AppContext,
     group: &libadwaita::PreferencesGroup,
     expanded_ids: &Arc<Mutex<HashSet<String>>>,
+    rows: &Arc<Mutex<crate::ui::pages::PageGroup>>,
 ) {
-    crate::ui::pages::clear_group_rows(group);
+    rows.lock().unwrap_or_else(|e| e.into_inner()).clear(group);
 
     let settings = settings::get_settings(ctx);
 
@@ -797,7 +856,11 @@ fn refresh_web_providers_group(
         let en_ctx = ctx.clone();
         let en_id = provider.id.clone();
         enable_switch.connect_active_notify(move |sw| {
-            let _ = shortcut::toggle_web_provider_enabled(&en_ctx, en_id.clone(), sw.is_active());
+            if let Err(err) =
+                shortcut::toggle_web_provider_enabled(&en_ctx, en_id.clone(), sw.is_active())
+            {
+                en_ctx.report_error("toggle_web_provider_enabled", err);
+            }
         });
         row.add_suffix(&enable_switch);
 
@@ -816,11 +879,13 @@ fn refresh_web_providers_group(
         let key_ctx = ctx.clone();
         let key_id = provider.id.clone();
         api_key_row.connect_changed(move |r| {
-            let _ = shortcut::change_web_provider_api_key_setting(
+            if let Err(err) = shortcut::change_web_provider_api_key_setting(
                 &key_ctx,
                 key_id.clone(),
                 r.text().to_string(),
-            );
+            ) {
+                key_ctx.report_error("change_web_provider_api_key_setting", err);
+            }
         });
         row.add_row(&api_key_row);
 
@@ -835,11 +900,13 @@ fn refresh_web_providers_group(
             let url_ctx = ctx.clone();
             let url_id = provider.id.clone();
             url_row.connect_changed(move |r| {
-                let _ = shortcut::change_web_provider_base_url_setting(
+                if let Err(err) = shortcut::change_web_provider_base_url_setting(
                     &url_ctx,
                     url_id.clone(),
                     r.text().to_string(),
-                );
+                ) {
+                    url_ctx.report_error("change_web_provider_base_url_setting", err);
+                }
             });
             row.add_row(&url_row);
         }
@@ -865,11 +932,11 @@ fn refresh_web_providers_group(
         let timeout_id = provider.id.clone();
         timeout_adj.connect_value_changed(move |adj| {
             let val = adj.value().round() as u32;
-            let _ = shortcut::change_web_provider_timeout_setting(
-                &timeout_ctx,
-                timeout_id.clone(),
-                val,
-            );
+            if let Err(err) =
+                shortcut::change_web_provider_timeout_setting(&timeout_ctx, timeout_id.clone(), val)
+            {
+                timeout_ctx.report_error("change_web_provider_timeout_setting", err);
+            }
         });
         row.add_row(&timeout_row);
 
@@ -934,7 +1001,8 @@ fn refresh_web_providers_group(
         test_row.add_suffix(&test_btn);
         row.add_row(&test_row);
 
-        group.add(&row);
-        crate::ui::pages::track_row(group, &row);
+        rows.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(group, &row);
     }
 }

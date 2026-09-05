@@ -27,15 +27,42 @@ cpal = "0.16.0"
 anyhow = "1.0.95"
 rubato = "0.16.2"
 hound = "3.5.1"
-symphonia = { version = "0.5.4", features = ["all"] }
+symphonia = { version = "0.5.4", default-features = false, features = [
+  "mp3",
+  "aac",
+  "isomp4",
+  "ogg",
+  "vorbis",
+  "flac",
+  "wav",
+  "pcm",
+] }
 log = "0.4.25"
 env_filter = "0.1.0"
-tokio = "1.43.0"
-vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
+# Explicit feature set: the main target uses fs/net/io/time/macros across
+# managers, clients, and tests — previously provided implicitly via feature
+# unification from reqwest/dev-deps, which is fragile under resolver changes.
+tokio = { version = "1.43.0", features = [
+  "macros",
+  "rt-multi-thread",
+  "sync",
+  "time",
+  "io-util",
+  "fs",
+  "net",
+] }
+# Pinned to the upstream commit in Cargo.lock so `cargo update` cannot
+# silently move the VAD implementation.
+vad-rs = { git = "https://github.com/cjpais/vad-rs", rev = "2a412ed858695b9251f3f5a1a20d95b59fa7c498", default-features = false }
 earshot = "1.2.2"
 enigo = "0.6.1"
-rodio = { git = "https://github.com/cjpais/rodio.git" }
-reqwest = { version = "0.12", features = ["json", "stream", "gzip", "brotli", "deflate", "multipart"] }
+# Pinned to the commit in Cargo.lock; unpin only deliberately (audio playback).
+rodio = { git = "https://github.com/cjpais/rodio.git", rev = "fed30292db417cb95305c118c0e1d804fb74cbff" }
+# Kept minimal: `json` (APIs), `stream` (resumable model downloads),
+# `multipart` (Firecrawl uploads), `gzip` (common CDN encoding). `brotli` and
+# `deflate` pulled large codec stacks for JSON-dominated APIs; re-add only if
+# a provider demonstrably requires them.
+reqwest = { version = "0.12", features = ["json", "stream", "gzip", "multipart"] }
 tokio-tungstenite = { version = "0.26", features = ["native-tls"] }
 base64 = "0.22"
 futures-util = "0.3"
@@ -71,7 +98,11 @@ opener = "0.8.5"
 ashpd = { version = "0.13.13", features = ["global_shortcuts"] }
 ksni = { version = "0.3", features = ["blocking"] }
 arboard = "3"
-image = "0.25"
+thiserror = "2"
+# Only PNG decoding is used (bundled tray/overlay icons via
+# `image::load_from_memory`); the default feature set pulls every codec plus
+# rayon. Add formats only if a bundled asset requires them.
+image = { version = "0.25", default-features = false, features = ["png"] }
 gio = "0.22"
 async-channel = "2"
 evdev = "0.12"

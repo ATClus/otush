@@ -21,9 +21,6 @@ pub static FILE_LOG_LEVEL: AtomicU8 = AtomicU8::new(LevelFilter::Debug as u8);
 /// file paths or transcribed text) onto the UI event bus.
 pub static UI_LOG_STREAMING: AtomicBool = AtomicBool::new(false);
 
-/// Deprecated alias for [`UI_LOG_STREAMING`].
-pub static WEBVIEW_LOG_STREAMING: &AtomicBool = &UI_LOG_STREAMING;
-
 fn level_filter_from_u8(value: u8) -> LevelFilter {
     match value {
         0 => LevelFilter::Off,
@@ -80,9 +77,15 @@ impl log::Log for OtushLogger {
             eprintln!("[{} {}] {}", record.level(), record.target(), record.args());
         }
 
-        // File.
+        // File. Recover from a poisoned file mutex instead of panicking: a
+        // logging failure must never crash transcription or recording.
         if record.level() <= file_level {
-            if let Some(file) = self.file.lock().unwrap().as_mut() {
+            if let Some(file) = self.file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+                // Note: `chrono::Local::now()` runs per record. This logger is
+                // called at most a few hundred times per second outside the
+                // audio callback (which must never log per frame), so a
+                // background writer thread is not warranted yet — revisit if
+                // profiling shows `log` in a hot path.
                 let ts = chrono::Local::now().format("%Y-%m-%d %H:%M:%S%.3f");
                 let _ = writeln!(
                     file,
@@ -107,7 +110,7 @@ impl log::Log for OtushLogger {
     }
 
     fn flush(&self) {
-        if let Some(file) = self.file.lock().unwrap().as_mut() {
+        if let Some(file) = self.file.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
             let _ = file.flush();
         }
     }

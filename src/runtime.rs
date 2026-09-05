@@ -12,9 +12,17 @@ static RUNTIME: OnceLock<tokio::runtime::Runtime> = OnceLock::new();
 
 /// Create the global runtime. Call once from `lib.rs::run` before any async
 /// work.
+///
+/// The pool is intentionally small: backend work is a mix of short network
+/// polls and a few long downloads, while heavy CPU (transcription) and
+/// blocking I/O (SQLite, WAV) run on the same pool via `spawn_blocking`.
+/// Keep main-thread-adjacent latency low by never `block_on` from GTK code.
 pub fn init() {
     let _ = RUNTIME.get_or_init(|| {
         tokio::runtime::Builder::new_multi_thread()
+            .thread_name("otush-worker")
+            .worker_threads(4)
+            .max_blocking_threads(8)
             .enable_all()
             .build()
             .expect("failed to create the Tokio runtime")
@@ -46,6 +54,14 @@ where
 }
 
 /// Run a future to completion on the runtime, blocking the current thread.
+///
+/// # Panics / deadlocks
+///
+/// Never call this from the GTK main thread or from inside a future already
+/// running on this runtime (it would block the reactor or deadlock). The only
+/// legitimate caller is a dedicated worker thread that must bridge sync and
+/// async code — today, the transcription stream worker driving the Deepgram
+/// websocket pump.
 pub fn block_on<F: std::future::Future>(future: F) -> F::Output {
     RUNTIME
         .get()

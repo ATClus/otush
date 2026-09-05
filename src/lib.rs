@@ -5,6 +5,7 @@
 //! [`context::EventBus`]; the GTK shell (Phase 2+) subscribes to [`AppEvent`]s.
 
 mod actions;
+pub mod agents;
 mod app;
 mod audio_feedback;
 pub mod audio_toolkit;
@@ -19,7 +20,6 @@ mod logging;
 mod managers;
 mod memory;
 mod overlay;
-mod paste_tx;
 pub mod portable;
 mod resources;
 mod runtime;
@@ -37,10 +37,10 @@ mod utils;
 pub mod web_client;
 
 pub use cli::CliArgs;
-pub use context::{AppContext, AppEvent, AppPaths, EventBus};
+pub use context::{AppContext, AppEvent, AppPaths, EventBus, Subscription};
 pub use transcription_coordinator::TranscriptionCoordinator;
 
-pub use logging::{FILE_LOG_LEVEL, UI_LOG_STREAMING, WEBVIEW_LOG_STREAMING};
+pub use logging::{FILE_LOG_LEVEL, UI_LOG_STREAMING};
 
 use crate::managers::audio::AudioRecordingManager;
 use crate::managers::history::HistoryManager;
@@ -106,7 +106,7 @@ pub fn init_core(ctx: &AppContext, cli_args: &CliArgs) {
     if cli_args.debug {
         // CLI --debug overrides debug_mode and log level (runtime-only, not
         // persisted).
-        WEBVIEW_LOG_STREAMING.store(true, std::sync::atomic::Ordering::Relaxed);
+        UI_LOG_STREAMING.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     // Set up signal handlers for toggling transcription. On Linux, SIGUSR1 is

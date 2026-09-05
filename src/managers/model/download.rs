@@ -140,7 +140,7 @@ pub async fn download_model(ctx: &AppContext, url_or_spec: &str) -> Result<PathB
 
     let cancel_flag = Arc::new(AtomicBool::new(false));
     {
-        let mut guard = CANCEL_DOWNLOAD.lock().unwrap();
+        let mut guard = CANCEL_DOWNLOAD.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(Arc::clone(&cancel_flag));
     }
 
@@ -250,7 +250,7 @@ pub async fn download_model(ctx: &AppContext, url_or_spec: &str) -> Result<PathB
 
     // Clean cancellation flag
     {
-        let mut guard = CANCEL_DOWNLOAD.lock().unwrap();
+        let mut guard = CANCEL_DOWNLOAD.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     }
 
@@ -272,8 +272,11 @@ pub async fn download_model(ctx: &AppContext, url_or_spec: &str) -> Result<PathB
 }
 
 /// Cancel any active model download.
+///
+/// Wired to the Cancel button shown on a downloading model row; the download
+/// loop polls the flag set here (see `download_model`).
 pub fn cancel_download() {
-    let mut guard = CANCEL_DOWNLOAD.lock().unwrap();
+    let mut guard = CANCEL_DOWNLOAD.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(flag) = guard.take() {
         flag.store(true, Ordering::SeqCst);
     }

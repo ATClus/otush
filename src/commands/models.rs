@@ -1,78 +1,32 @@
+use super::errors::{CommandError, CommandResult};
 use crate::context::{AppContext, AppEvent};
-use crate::managers::model::ModelInfo;
-use crate::managers::transcription::{ModelStateEvent, TranscriptionManager};
+use crate::managers::transcription::ModelStateEvent;
 use crate::settings::{get_settings, write_settings, ModelUnloadTimeout};
-use std::sync::Arc;
-
-/// Retrieve the list of all cataloged and locally installed models.
-pub async fn get_available_models(ctx: &AppContext) -> Result<Vec<ModelInfo>, String> {
-    Ok(ctx.model.get_available_models())
-}
-
-/// Retrieve model metadata for a specific model ID.
-pub async fn get_model_info(
-    ctx: &AppContext,
-    model_id: String,
-) -> Result<Option<ModelInfo>, String> {
-    Ok(ctx.model.get_model_info(&model_id))
-}
-
-/// Open the local models directory in the user's file manager (Nautilus).
-pub fn open_models_directory(ctx: &AppContext) -> Result<(), String> {
-    let dir = ctx.model.models_dir();
-    opener::open(dir).map_err(|e| format!("Failed to open models folder: {e}"))
-}
 
 /// Re-scan local sources for models added since launch.
-pub async fn rescan_local_models(ctx: &AppContext) -> Result<(), String> {
+pub async fn rescan_local_models(ctx: &AppContext) -> CommandResult<()> {
     let mm = ctx.model.clone();
     crate::runtime::spawn_blocking(move || mm.rescan_local_models())
         .await
-        .map_err(|e| format!("rescan task panicked: {e}"))?
-        .map_err(|e| e.to_string())
-}
-
-/// Download a model from a URL or Hugging Face repository spec.
-pub async fn download_model_from_url(ctx: &AppContext, url: String) -> Result<String, String> {
-    crate::managers::model::download::download_model(ctx, &url)
-        .await
-        .map(|p| p.to_string_lossy().to_string())
-}
-
-/// Cancel an ongoing model download.
-pub fn cancel_download() {
-    crate::managers::model::download::cancel_download();
-}
-
-/// Explicitly load the currently selected model into memory.
-pub async fn load_selected_model(ctx: &AppContext) -> Result<(), String> {
-    let settings = get_settings(ctx);
-    if settings.selected_model.is_empty() {
-        return Err("No model is currently selected".to_string());
-    }
-    let tm = ctx.transcription.clone();
-    let model_id = settings.selected_model.clone();
-    crate::runtime::spawn_blocking(move || tm.load_model(&model_id))
-        .await
-        .map_err(|e| format!("Task failed: {e}"))?
-        .map_err(|e| e.to_string())
+        .map_err(CommandError::rescan_join)?
+        .map_err(CommandError::from)
 }
 
 /// Delete a model's files from disk and unload it if active.
-pub async fn delete_model(ctx: &AppContext, model_id: String) -> Result<(), String> {
+pub async fn delete_model(ctx: &AppContext, model_id: String) -> CommandResult<()> {
     // If deleting the active model, unload it and clear the setting
     let settings = get_settings(ctx);
     if settings.selected_model == model_id {
         ctx.transcription
             .unload_model()
-            .map_err(|e| format!("Failed to unload model: {}", e))?;
+            .map_err(|e| CommandError::ModelUnload(e.to_string()))?;
 
         let mut settings = get_settings(ctx);
         settings.selected_model = String::new();
         write_settings(ctx, settings);
     }
 
-    ctx.model.delete_model(&model_id).map_err(|e| e.to_string())
+    Ok(ctx.model.delete_model(&model_id)?)
 }
 
 /// Shared logic for switching the active model, used by both the UI and the
@@ -81,7 +35,7 @@ pub async fn delete_model(ctx: &AppContext, model_id: String) -> Result<(), Stri
 /// Validates the model, updates the persisted setting, and loads the model
 /// unless the unload timeout is set to "Immediately" (in which case the model
 /// will be loaded on-demand during the next transcription).
-pub fn switch_active_model(ctx: &AppContext, model_id: &str) -> Result<(), String> {
+pub fn switch_active_model(ctx: &AppContext, model_id: &str) -> CommandResult<()> {
     let model_manager = &ctx.model;
     let transcription_manager = &ctx.transcription;
 
@@ -90,15 +44,15 @@ pub fn switch_active_model(ctx: &AppContext, model_id: &str) -> Result<(), Strin
     // flag on drop (including early returns, errors, and panics).
     let _loading_guard = transcription_manager
         .try_start_loading()
-        .ok_or_else(|| "Model load already in progress".to_string())?;
+        .ok_or(CommandError::ModelLoadBusy)?;
 
     // Check if model exists and is available
     let model_info = model_manager
         .get_model_info(model_id)
-        .ok_or_else(|| format!("Model not found: {}", model_id))?;
+        .ok_or_else(|| CommandError::ModelNotFound(model_id.to_string()))?;
 
     if !model_info.is_downloaded {
-        return Err(format!("Model not downloaded: {}", model_id));
+        return Err(CommandError::ModelNotDownloaded(model_id.to_string()));
     }
 
     let settings = get_settings(ctx);
@@ -138,31 +92,8 @@ pub fn switch_active_model(ctx: &AppContext, model_id: &str) -> Result<(), Strin
         settings.selected_model = old_model;
         settings.onboarding_completed = old_onboarding_completed;
         write_settings(ctx, settings);
-        return Err(e.to_string());
+        return Err(CommandError::from(e));
     }
 
     Ok(())
 }
-
-pub async fn set_active_model(ctx: &AppContext, model_id: String) -> Result<(), String> {
-    switch_active_model(ctx, &model_id)
-}
-
-pub async fn get_current_model(ctx: &AppContext) -> Result<String, String> {
-    let settings = get_settings(ctx);
-    Ok(settings.selected_model)
-}
-
-pub async fn get_transcription_model_status(ctx: &AppContext) -> Result<Option<String>, String> {
-    Ok(ctx.transcription.get_current_model())
-}
-
-pub async fn is_model_loading(ctx: &AppContext) -> Result<bool, String> {
-    // Check if transcription manager has a loaded model
-    let current_model = ctx.transcription.get_current_model();
-    Ok(current_model.is_none())
-}
-
-/// Keep the type alias used by callers that pass the transcription manager
-/// around (e.g. tray menu handlers).
-pub type TranscriptionManagerRef = Arc<TranscriptionManager>;

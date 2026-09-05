@@ -5,6 +5,7 @@ use crate::context::{AppContext, AppEvent};
 use crate::shortcut;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
+use std::sync::{Arc, Mutex};
 
 /// Build the AI & Prompts preferences page.
 pub fn build(ctx: &AppContext) -> gtk4::Widget {
@@ -32,19 +33,27 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     prompts_group.set_hexpand(true);
     page.add(&prompts_group);
 
+    // Owned row lists, one per rebuilt group (see `PageGroup`).
+    let master_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
+    let prompts_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
+
     // Initial render
-    refresh_master_group(ctx, &post_process_group);
-    refresh_prompts_group(ctx, &prompts_group);
+    refresh_master_group(ctx, &post_process_group, &master_rows);
+    refresh_prompts_group(ctx, &prompts_group, &prompts_rows);
 
     // Live refresh on bus events
     let post_weak = glib::SendWeakRef::from(post_process_group.downgrade());
     let prompts_weak = glib::SendWeakRef::from(prompts_group.downgrade());
     let ctx_bus = ctx.clone();
+    let master_rows_bus = master_rows.clone();
+    let prompts_rows_bus = prompts_rows.clone();
 
     ctx.bus.subscribe(move |event| {
         let ctx = ctx_bus.clone();
         let post_weak = post_weak.clone();
         let prompts_weak = prompts_weak.clone();
+        let master_rows = master_rows_bus.clone();
+        let prompts_rows = prompts_rows_bus.clone();
 
         glib::MainContext::default().invoke(move || {
             if let AppEvent::SettingsChanged { setting, .. } = event {
@@ -53,7 +62,7 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     || setting == "post_process_prompt_name"
                 {
                     if let Some(grp) = post_weak.into_weak_ref().upgrade() {
-                        refresh_master_group(&ctx, &grp);
+                        refresh_master_group(&ctx, &grp, &master_rows);
                     }
                 } else if setting == "post_process_prompts"
                     || setting == "post_process_prompts_structure"
@@ -61,10 +70,10 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     || setting == "post_process_providers_reordered"
                 {
                     if let Some(grp) = prompts_weak.into_weak_ref().upgrade() {
-                        refresh_prompts_group(&ctx, &grp);
+                        refresh_prompts_group(&ctx, &grp, &prompts_rows);
                     }
                     if let Some(grp) = post_weak.into_weak_ref().upgrade() {
-                        refresh_master_group(&ctx, &grp);
+                        refresh_master_group(&ctx, &grp, &master_rows);
                     }
                 }
             }
@@ -74,8 +83,12 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     page.upcast::<gtk4::Widget>()
 }
 
-fn refresh_master_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
-    crate::ui::pages::clear_group_rows(group);
+fn refresh_master_group(
+    ctx: &AppContext,
+    group: &libadwaita::PreferencesGroup,
+    rows: &Arc<Mutex<crate::ui::pages::PageGroup>>,
+) {
+    rows.lock().unwrap_or_else(|e| e.into_inner()).clear(group);
 
     let settings = ctx.settings();
 
@@ -121,7 +134,9 @@ fn refresh_master_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) 
     prompt_row.connect_selected_notify(move |r| {
         let idx = r.selected() as usize;
         if let Some(id) = prompt_ids.get(idx) {
-            let _ = shortcut::set_post_process_selected_prompt(&p_ctx, id.clone());
+            if let Err(err) = shortcut::set_post_process_selected_prompt(&p_ctx, id.clone()) {
+                p_ctx.report_error("set_post_process_selected_prompt", err);
+            }
         }
     });
 
@@ -129,21 +144,28 @@ fn refresh_master_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) 
     let prompt_row_weak = glib::SendWeakRef::from(prompt_row.downgrade());
     master_switch.connect_active_notify(move |row| {
         let is_active = row.is_active();
-        let _ = shortcut::change_post_process_enabled_setting(&switch_ctx, is_active);
+        if let Err(err) = shortcut::change_post_process_enabled_setting(&switch_ctx, is_active) {
+            switch_ctx.report_error("change_post_process_enabled_setting", err);
+        }
         if let Some(pr) = prompt_row_weak.clone().into_weak_ref().upgrade() {
             pr.set_visible(is_active);
         }
     });
 
-    group.add(&master_switch);
-    crate::ui::pages::track_row(group, &master_switch);
-
-    group.add(&prompt_row);
-    crate::ui::pages::track_row(group, &prompt_row);
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &master_switch);
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &prompt_row);
 }
 
-fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
-    crate::ui::pages::clear_group_rows(group);
+fn refresh_prompts_group(
+    ctx: &AppContext,
+    group: &libadwaita::PreferencesGroup,
+    rows: &Arc<Mutex<crate::ui::pages::PageGroup>>,
+) {
+    rows.lock().unwrap_or_else(|e| e.into_inner()).clear(group);
 
     let settings = ctx.settings();
     let prompts = settings.post_process_prompts;
@@ -180,7 +202,9 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
             let del_ctx = ctx.clone();
             let del_id = prompt.id.clone();
             del_btn.connect_clicked(move |_| {
-                let _ = shortcut::remove_post_process_prompt(&del_ctx, del_id.clone());
+                if let Err(err) = shortcut::remove_post_process_prompt(&del_ctx, del_id.clone()) {
+                    del_ctx.report_error("remove_post_process_prompt", err);
+                }
             });
             row.add_suffix(&del_btn);
         }
@@ -204,7 +228,11 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
             if let Some(row) = row_weak.clone().into_weak_ref().upgrade() {
                 row.set_title(&title);
             }
-            let _ = shortcut::update_post_process_prompt_name(&n_ctx, n_id.clone(), new_name);
+            if let Err(err) =
+                shortcut::update_post_process_prompt_name(&n_ctx, n_id.clone(), new_name)
+            {
+                n_ctx.report_error("update_post_process_prompt_name", err);
+            }
         });
         row.add_row(&name_row);
 
@@ -233,11 +261,13 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
         pref_prov_row.connect_selected_notify(move |r| {
             let idx = r.selected() as usize;
             if let Some(target_pref) = pref_ids.get(idx) {
-                let _ = shortcut::set_post_process_prompt_preferred_provider(
+                if let Err(err) = shortcut::set_post_process_prompt_preferred_provider(
                     &pref_ctx,
                     pref_prompt_id.clone(),
                     target_pref.clone(),
-                );
+                ) {
+                    pref_ctx.report_error("set_post_process_prompt_preferred_provider", err);
+                }
             }
         });
         row.add_row(&pref_prov_row);
@@ -275,11 +305,11 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
             let start = buf.start_iter();
             let end = buf.end_iter();
             let text = buf.text(&start, &end, false);
-            let _ = shortcut::update_post_process_prompt_content(
-                &t_ctx,
-                t_id.clone(),
-                text.to_string(),
-            );
+            if let Err(err) =
+                shortcut::update_post_process_prompt_content(&t_ctx, t_id.clone(), text.to_string())
+            {
+                t_ctx.report_error("update_post_process_prompt_content", err);
+            }
         });
 
         let scrolled = gtk4::ScrolledWindow::new();
@@ -292,8 +322,9 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
         template_row.set_child(Some(&template_box));
         row.add_row(&template_row);
 
-        group.add(&row);
-        crate::ui::pages::track_row(group, &row);
+        rows.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(group, &row);
     }
 
     // Add Custom Prompt Button
@@ -314,13 +345,16 @@ fn refresh_prompts_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup)
 
     let add_ctx = ctx.clone();
     add_btn.connect_clicked(move |_| {
-        let _ = shortcut::add_post_process_prompt(
+        if let Err(err) = shortcut::add_post_process_prompt(
             &add_ctx,
             "New Prompt".to_string(),
             "Please edit this transcript:\n${output}".to_string(),
-        );
+        ) {
+            add_ctx.report_error("add_post_process_prompt", err);
+        }
     });
     add_row.add_suffix(&add_btn);
-    group.add(&add_row);
-    crate::ui::pages::track_row(group, &add_row);
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &add_row);
 }

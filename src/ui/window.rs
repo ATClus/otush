@@ -81,6 +81,12 @@ const SECTIONS: &[Section] = &[
         category: SectionCategory::Preferences,
     },
     Section {
+        id: "agents",
+        title: "Agents",
+        icon: "chat-symbolic",
+        category: SectionCategory::Preferences,
+    },
+    Section {
         id: "providers",
         title: "Cloud Providers",
         icon: "network-server-symbolic",
@@ -192,14 +198,21 @@ pub fn build_main_window(
             first_selectable_row = Some(row.clone());
         }
 
-        let page = crate::ui::pages::build_page(section.id, ctx);
-        content_stack.add_named(&page, Some(section.id));
+        // Pages are NOT built here: the selection handler below constructs
+        // each page lazily on first selection (see its comment).
     }
 
-    // Wire sidebar selection → visible content page & update header title
+    // Wire sidebar selection → visible content page & update header title.
+    // Pages are built lazily on first selection (not all upfront): each page
+    // probes settings, the history DB, and device detection, so eager
+    // construction of all 14 sections slows startup for pages never opened.
     let content_stack_weak = content_stack.downgrade();
     let window_title_weak = window_title.downgrade();
     let split_weak = split.downgrade();
+    let built_pages = std::rc::Rc::new(std::cell::RefCell::new(
+        std::collections::HashSet::<String>::new(),
+    ));
+    let lazy_ctx = ctx.clone();
 
     sidebar_list.connect_row_selected(move |_list, row| {
         if let Some(row) = row {
@@ -208,6 +221,12 @@ pub fn build_main_window(
                 return;
             }
             if let Some(stack) = content_stack_weak.upgrade() {
+                let needs_build = !built_pages.borrow().contains(widget_name.as_str());
+                if needs_build {
+                    let page = crate::ui::pages::build_page(&widget_name, &lazy_ctx);
+                    stack.add_named(&page, Some(&widget_name));
+                    built_pages.borrow_mut().insert(widget_name.to_string());
+                }
                 stack.set_visible_child_name(&widget_name);
             }
             if let Some(w_title) = window_title_weak.upgrade() {

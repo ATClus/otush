@@ -93,7 +93,6 @@ pub fn map_token_to_keys(token: &str) -> Vec<Key> {
 
 pub struct ShortcutKeyMatcher {
     pub primary_keys: Vec<Key>,
-    pub all_keys: Vec<Key>,
 }
 
 impl ShortcutKeyMatcher {
@@ -126,13 +125,10 @@ impl ShortcutKeyMatcher {
 
         // If shortcut consists only of modifiers (e.g. "ctrl+shift"), check all keys
         if primary_keys.is_empty() {
-            primary_keys = all_keys.clone();
+            primary_keys = all_keys;
         }
 
-        Self {
-            primary_keys,
-            all_keys,
-        }
+        Self { primary_keys }
     }
 
     pub fn open_key_devices() -> Vec<evdev::Device> {
@@ -167,7 +163,7 @@ impl ShortcutKeyMatcher {
 pub fn start_ptt_release_watcher(ctx: &AppContext, binding_id: &str, hotkey_str: &str) {
     // Cancel any previous watcher
     {
-        let mut guard = CURRENT_WATCHER.lock().unwrap();
+        let mut guard = CURRENT_WATCHER.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(prev) = guard.take() {
             prev.store(false, Ordering::SeqCst);
         }
@@ -184,7 +180,7 @@ pub fn start_ptt_release_watcher(ctx: &AppContext, binding_id: &str, hotkey_str:
 
     let is_active = Arc::new(AtomicBool::new(true));
     {
-        let mut guard = CURRENT_WATCHER.lock().unwrap();
+        let mut guard = CURRENT_WATCHER.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(Arc::clone(&is_active));
     }
 
@@ -224,14 +220,14 @@ pub fn start_ptt_release_watcher(ctx: &AppContext, binding_id: &str, hotkey_str:
             tokio::time::sleep(check_interval).await;
         }
 
-        let mut guard = CURRENT_WATCHER.lock().unwrap();
+        let mut guard = CURRENT_WATCHER.lock().unwrap_or_else(|e| e.into_inner());
         *guard = None;
     });
 }
 
 /// Stop any active release watcher.
 pub fn cancel_ptt_release_watcher() {
-    let mut guard = CURRENT_WATCHER.lock().unwrap();
+    let mut guard = CURRENT_WATCHER.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(watcher) = guard.take() {
         watcher.store(false, Ordering::SeqCst);
     }

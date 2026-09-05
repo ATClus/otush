@@ -657,7 +657,9 @@ fn build_and_present_palette(ctx: &AppContext) {
         *guard = None;
     });
 
-    // Event bus listener for real-time history updates while open
+    // Event bus listener for real-time history updates while open.
+    // The subscription is removed on destroy so repeated open/close cycles
+    // cannot accumulate callbacks on the bus.
     let trigger_reload_btn = gtk4::Button::new();
     let reload_fn = reload_entries.clone();
     trigger_reload_btn.connect_clicked(move |_| {
@@ -666,7 +668,7 @@ fn build_and_present_palette(ctx: &AppContext) {
 
     let trigger_weak = glib::SendWeakRef::from(trigger_reload_btn.downgrade());
     let bus = ctx.bus.clone();
-    bus.subscribe(move |event| {
+    let subscription = bus.subscribe(move |event| {
         if matches!(
             event,
             AppEvent::HistoryUpdated(
@@ -679,6 +681,14 @@ fn build_and_present_palette(ctx: &AppContext) {
                     btn.emit_clicked();
                 }
             });
+        }
+    });
+    let subscription = std::sync::Arc::new(std::sync::Mutex::new(Some(subscription)));
+    window.connect_destroy(move |_| {
+        if let Ok(mut guard) = subscription.lock() {
+            if let Some(sub) = guard.take() {
+                sub.unsubscribe();
+            }
         }
     });
 

@@ -91,7 +91,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     ptt.set_active(settings.push_to_talk);
     let ptt_ctx = ctx.clone();
     ptt.connect_active_notify(move |row| {
-        let _ = shortcut::change_ptt_setting(&ptt_ctx, row.is_active());
+        if let Err(err) = shortcut::change_ptt_setting(&ptt_ctx, row.is_active()) {
+            ptt_ctx.report_error("change_ptt_setting", err);
+        }
     });
 
     // Always-on microphone
@@ -107,7 +109,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         let ctx = always_on_ctx.clone();
         let enabled = row.is_active();
         crate::runtime::spawn(async move {
-            let _ = commands::audio::update_microphone_mode(&ctx, enabled).await;
+            if let Err(err) = commands::audio::update_microphone_mode(&ctx, enabled).await {
+                ctx.report_error("update_microphone_mode", err);
+            }
         });
     });
 
@@ -149,7 +153,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
         let ctx = src_ctx.clone();
         glib::spawn_future_local(async move {
-            let _ = commands::audio::set_audio_capture_source(&ctx, mode).await;
+            if let Err(err) = commands::audio::set_audio_capture_source(&ctx, mode).await {
+                ctx.report_error("set_audio_capture_source", err);
+            }
         });
     });
 
@@ -242,7 +248,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     gain_row.set_snap_to_ticks(true);
     let gain_ctx = ctx.clone();
     gain_adjustment.connect_value_changed(move |adj| {
-        let _ = shortcut::change_audio_input_gain_setting(&gain_ctx, adj.value() as f32);
+        if let Err(err) = shortcut::change_audio_input_gain_setting(&gain_ctx, adj.value() as f32) {
+            gain_ctx.report_error("change_audio_input_gain_setting", err);
+        }
     });
     dsp_group.add(&gain_row);
 
@@ -255,7 +263,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     norm_row.set_active(settings.audio_normalization_enabled);
     let norm_ctx = ctx.clone();
     norm_row.connect_active_notify(move |row| {
-        let _ = shortcut::change_audio_normalization_setting(&norm_ctx, row.is_active());
+        if let Err(err) = shortcut::change_audio_normalization_setting(&norm_ctx, row.is_active()) {
+            norm_ctx.report_error("change_audio_normalization_setting", err);
+        }
     });
     dsp_group.add(&norm_row);
 
@@ -268,7 +278,10 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     hpf_row.set_active(settings.audio_high_pass_filter_enabled);
     let hpf_ctx = ctx.clone();
     hpf_row.connect_active_notify(move |row| {
-        let _ = shortcut::change_audio_high_pass_filter_setting(&hpf_ctx, row.is_active());
+        if let Err(err) = shortcut::change_audio_high_pass_filter_setting(&hpf_ctx, row.is_active())
+        {
+            hpf_ctx.report_error("change_audio_high_pass_filter_setting", err);
+        }
     });
     dsp_group.add(&hpf_row);
 
@@ -309,7 +322,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let threshold_weak = glib::SendWeakRef::from(threshold_row.downgrade());
     noise_row.connect_active_notify(move |row| {
         let is_active = row.is_active();
-        let _ = shortcut::change_audio_noise_reduction_setting(&noise_ctx, is_active);
+        if let Err(err) = shortcut::change_audio_noise_reduction_setting(&noise_ctx, is_active) {
+            noise_ctx.report_error("change_audio_noise_reduction_setting", err);
+        }
         if let Some(tr) = threshold_weak.clone().into_weak_ref().upgrade() {
             tr.set_visible(is_active);
         }
@@ -357,7 +372,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         };
         let ctx = ctx2.clone();
         glib::spawn_future_local(async move {
-            let _ = shortcut::change_vad_backend_setting(&ctx, backend).await;
+            if let Err(err) = shortcut::change_vad_backend_setting(&ctx, backend).await {
+                ctx.report_error("change_vad_backend_setting", err);
+            }
         });
     });
 
@@ -365,7 +382,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let backend_weak = glib::SendWeakRef::from(vad_backend_row.downgrade());
     vad_enabled.connect_active_notify(move |row| {
         let is_active = row.is_active();
-        let _ = shortcut::change_vad_enabled_setting(&ctx1, is_active);
+        if let Err(err) = shortcut::change_vad_enabled_setting(&ctx1, is_active) {
+            ctx1.report_error("change_vad_enabled_setting", err);
+        }
         if let Some(br) = backend_weak.clone().into_weak_ref().upgrade() {
             br.set_visible(is_active);
         }
@@ -381,7 +400,11 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     filler.set_active(settings.filler_word_removal_enabled);
     let ctx3 = ctx.clone();
     filler.connect_active_notify(move |row| {
-        let _ = shortcut::change_filler_word_removal_enabled_setting(&ctx3, row.is_active());
+        if let Err(err) =
+            shortcut::change_filler_word_removal_enabled_setting(&ctx3, row.is_active())
+        {
+            ctx3.report_error("change_filler_word_removal_enabled_setting", err);
+        }
     });
     vad_group.add(&filler);
 
@@ -561,7 +584,11 @@ fn populate_microphones(ctx: &AppContext, row: &libadwaita::ComboRow) {
                                 .unwrap_or_default();
                             let ctx = ctx_for_select.clone();
                             glib::spawn_future_local(async move {
-                                let _ = commands::audio::set_selected_microphone(&ctx, name).await;
+                                if let Err(err) =
+                                    commands::audio::set_selected_microphone(&ctx, name).await
+                                {
+                                    ctx.report_error("set_selected_microphone", err);
+                                }
                             });
                         }
                     });

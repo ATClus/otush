@@ -8,6 +8,7 @@ use gdk4::prelude::*;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum CategoryFilter {
@@ -202,7 +203,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         let ctx = limit_ctx.clone();
         let value = adj.value() as usize;
         glib::spawn_future_local(async move {
-            let _ = history_cmds::update_history_limit(&ctx, value).await;
+            if let Err(err) = history_cmds::update_history_limit(&ctx, value).await {
+                ctx.report_error("update_history_limit", err);
+            }
         });
     });
     retention_group.add(&limit_row);
@@ -214,16 +217,21 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
         apply_history_filter();
     });
 
-    // Initial render + live refresh on history events
+    // Initial render + live refresh on history events.
+    // `rows` owns the group rows so rebuilds remove exactly what they added.
+    let rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
     let ctx_render = ctx.clone();
-    refresh_entries(&ctx_render, &entries_group);
+    let rows_render = rows.clone();
+    refresh_entries(&ctx_render, &entries_group, &rows_render);
 
     let group_for_events = glib::SendWeakRef::from(entries_group.downgrade());
+    let rows_for_events = rows.clone();
     let bus = ctx.bus.clone();
 
     bus.subscribe(move |event| {
         let ctx = ctx_render.clone();
         let group = group_for_events.clone();
+        let rows = rows_for_events.clone();
 
         glib::MainContext::default().invoke(move || {
             let weak = group.into_weak_ref();
@@ -231,7 +239,7 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                 return;
             };
             if matches!(event, AppEvent::HistoryUpdated(_)) {
-                refresh_entries(&ctx, &group);
+                refresh_entries(&ctx, &group, &rows);
             }
         });
     });
@@ -239,16 +247,22 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     page.upcast::<gtk4::Widget>()
 }
 
-fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
-    crate::ui::pages::clear_group_rows(group);
+fn refresh_entries(
+    ctx: &AppContext,
+    group: &libadwaita::PreferencesGroup,
+    rows: &Arc<Mutex<crate::ui::pages::PageGroup>>,
+) {
+    rows.lock().unwrap_or_else(|e| e.into_inner()).clear(group);
     HISTORY_TRACKED.with(|t| t.borrow_mut().clear());
 
     let ctx = ctx.clone();
+    let rows = rows.clone();
     let group_weak = glib::SendWeakRef::from(group.downgrade());
     crate::runtime::spawn(async move {
         let result = history_cmds::get_history_entries(&ctx, None, Some(50)).await;
         let ctx = ctx.clone();
         let group_weak = group_weak.clone();
+        let rows = rows.clone();
         glib::MainContext::default().invoke(move || {
             let Some(group) = group_weak.into_weak_ref().upgrade() else {
                 return;
@@ -265,8 +279,9 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                             gtk4::Image::from_icon_name("document-open-recent-symbolic");
                         empty_row.add_prefix(&empty_icon);
                         empty_row.set_activatable(false);
-                        group.add(&empty_row);
-                        crate::ui::pages::track_row(&group, &empty_row);
+                        rows.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .add(&group, &empty_row);
                         return;
                     }
 
@@ -370,7 +385,11 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                             let ctx = save_ctx.clone();
                             let id = id;
                             crate::runtime::spawn(async move {
-                                let _ = history_cmds::toggle_history_entry_saved(&ctx, id).await;
+                                if let Err(err) =
+                                    history_cmds::toggle_history_entry_saved(&ctx, id).await
+                                {
+                                    ctx.report_error("toggle_history_entry_saved", err);
+                                }
                             });
                         });
                         manage_row.add_suffix(&keep_switch);
@@ -467,13 +486,17 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                             let ctx = delete_ctx.clone();
                             let id = delete_id;
                             crate::runtime::spawn(async move {
-                                let _ = history_cmds::delete_history_entry(&ctx, id).await;
+                                if let Err(err) = history_cmds::delete_history_entry(&ctx, id).await
+                                {
+                                    ctx.report_error("delete_history_entry", err);
+                                }
                             });
                         });
                         row.add_suffix(&delete_button);
 
-                        group.add(&row);
-                        crate::ui::pages::track_row(&group, &row);
+                        rows.lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .add(&group, &row);
                         new_tracked.push((entry, row));
                     }
 
@@ -483,9 +506,10 @@ fn refresh_entries(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
                 Err(e) => {
                     let row = libadwaita::ActionRow::new();
                     row.set_title("Failed to load history");
-                    row.set_subtitle(&e);
-                    group.add(&row);
-                    crate::ui::pages::track_row(&group, &row);
+                    row.set_subtitle(&e.to_string());
+                    rows.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .add(&group, &row);
                 }
             }
         });

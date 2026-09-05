@@ -1,3 +1,10 @@
+//! Low-level audio processing toolkit (GUI-agnostic).
+//!
+//! Submodules: `audio` (cpal capture, decode, DSP, resampling, WAV), `vad`
+//! (Silero ONNX and Earshot energy voice-activity detection), `text`
+//! (filler-word removal, normalization), `lang_id` (output language
+//! detection), and `export` (SRT/VTT/JSON/Markdown transcript export).
+
 pub mod audio;
 pub mod constants;
 pub mod export;

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 //! XDG Desktop Portal `GlobalShortcuts` engine (Wayland-native, GNOME).
 //!
 //! GNOME blocks raw global grabs on Wayland, so bindings go through
@@ -63,7 +62,7 @@ pub fn trigger_rebind() {
 /// Sync desired shortcut map with AppSettings and trigger rebind on portal session.
 pub fn sync_desired_bindings(settings: &crate::settings::AppSettings) {
     let desired = desired_map();
-    let mut map = desired.lock().unwrap();
+    let mut map = desired.lock().unwrap_or_else(|e| e.into_inner());
     map.clear();
     for (id, binding) in &settings.bindings {
         if id != "cancel" && !binding.current_binding.trim().is_empty() {
@@ -468,7 +467,7 @@ async fn rebind(
     desired: &Arc<Mutex<HashMap<String, ShortcutBinding>>>,
 ) -> Result<usize, String> {
     let formatted_triggers: Vec<(String, String, String)> = {
-        let map = desired.lock().unwrap();
+        let map = desired.lock().unwrap_or_else(|e| e.into_inner());
         let mut list: Vec<(String, String, String)> = map
             .values()
             .filter(|b| !b.current_binding.trim().is_empty() && b.id != "cancel")
@@ -493,7 +492,7 @@ async fn rebind(
 
     // If an active session already has these exact shortcuts bound, skip redundant recreation.
     if session_guard.is_some() {
-        let last = handle.last_bound.lock().unwrap();
+        let last = handle.last_bound.lock().unwrap_or_else(|e| e.into_inner());
         if last.as_ref() == Some(&current_fingerprint) {
             debug!("Portal shortcuts unchanged, skipping rebind");
             return Ok(current_fingerprint.len());
@@ -547,7 +546,7 @@ async fn rebind(
     };
 
     *session_guard = Some(new_session);
-    *handle.last_bound.lock().unwrap() = Some(current_fingerprint);
+    *handle.last_bound.lock().unwrap_or_else(|e| e.into_inner()) = Some(current_fingerprint);
     info!("Successfully bound {count} global shortcuts on portal session");
     Ok(count)
 }
@@ -569,7 +568,7 @@ pub fn init_shortcuts(ctx: &AppContext) {
     let desired = desired_map();
     {
         let settings = crate::settings::get_settings(ctx);
-        let mut map = desired.lock().unwrap();
+        let mut map = desired.lock().unwrap_or_else(|e| e.into_inner());
         for (id, binding) in &settings.bindings {
             if id != "cancel" {
                 map.insert(id.clone(), binding.clone());
@@ -667,7 +666,7 @@ pub fn register_shortcut(ctx: &AppContext, binding: ShortcutBinding) -> Result<(
     if !binding.current_binding.trim().is_empty() && binding.id != "cancel" {
         desired_map()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert(binding.id.clone(), binding);
         trigger_rebind();
         sync_bindings_to_gnome_gsettings(ctx);
@@ -677,7 +676,10 @@ pub fn register_shortcut(ctx: &AppContext, binding: ShortcutBinding) -> Result<(
 
 /// Unregister a shortcut: remove from the desired list and re-bind.
 pub fn unregister_shortcut(ctx: &AppContext, binding: ShortcutBinding) -> Result<(), String> {
-    desired_map().lock().unwrap().remove(&binding.id);
+    desired_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove(&binding.id);
     trigger_rebind();
     sync_bindings_to_gnome_gsettings(ctx);
     Ok(())
@@ -692,14 +694,17 @@ pub fn register_cancel_shortcut(ctx: &AppContext) {
     {
         desired_map()
             .lock()
-            .unwrap()
+            .unwrap_or_else(|e| e.into_inner())
             .insert("cancel".to_string(), binding);
     }
 }
 
 /// Unregister the cancel shortcut (called when recording stops).
 pub fn unregister_cancel_shortcut(_ctx: &AppContext) {
-    desired_map().lock().unwrap().remove("cancel");
+    desired_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .remove("cancel");
 }
 
 /// Validate a shortcut string for the portal engine (e.g. "Ctrl+Space", "Super+Shift+R").

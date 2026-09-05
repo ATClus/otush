@@ -6,6 +6,7 @@ use gtk4::prelude::*;
 use libadwaita::prelude::*;
 use std::cell::RefCell;
 use std::rc::Rc;
+use std::sync::{Arc, Mutex};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum NoteFilter {
@@ -115,14 +116,16 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     list_group.set_hexpand(true);
     page.add(&list_group);
 
+    let rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
     let refresh_notes = {
         let ctx = ctx.clone();
         let group = list_group.clone();
         let search = search_entry.clone();
         let filter = active_filter.clone();
+        let rows = rows.clone();
 
         move || {
-            crate::ui::pages::clear_group_rows(&group);
+            rows.lock().unwrap_or_else(|e| e.into_inner()).clear(&group);
 
             let query = search.text().to_string();
             let query_opt = if query.trim().is_empty() {
@@ -155,8 +158,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     let empty_icon = gtk4::Image::from_icon_name("text-editor-symbolic");
                     empty_row.add_prefix(&empty_icon);
                     empty_row.set_activatable(false);
-                    group.add(&empty_row);
-                    crate::ui::pages::track_row(&group, &empty_row);
+                    rows.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .add(&group, &empty_row);
                     return;
                 }
 
@@ -277,8 +281,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     });
                     row.add_suffix(&del_btn);
 
-                    group.add(&row);
-                    crate::ui::pages::track_row(&group, &row);
+                    rows.lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .add(&group, &row);
                 }
             }
         }

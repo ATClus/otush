@@ -1,11 +1,14 @@
+//! Small shared helpers: env detection, operation cancellation, and text redaction.
+//!
+//! The GTK overlay, tray icon, and clipboard/paste helpers live in their own
+//! modules ([`crate::overlay`], [`crate::tray`], [`crate::clipboard`]); import
+//! those modules directly. Only the helpers defined in this module
+//! (`cancel_current_operation`, `redact_text`, `is_*`) are shared from here.
+
 use crate::context::AppContext;
 use crate::shortcut;
+use crate::tray::{set_tray_state, TrayIconState};
 use log::info;
-
-// Re-export all utility modules for easy access
-pub use crate::clipboard::*;
-pub use crate::overlay::*;
-pub use crate::tray::*;
 
 /// Preserve diagnostic text in development builds, but redact it in releases.
 /// Do not use for secrets such as API keys, which must always be redacted.
@@ -35,8 +38,8 @@ pub fn cancel_current_operation(ctx: &AppContext) {
     tm.cancel_stream();
 
     // Update tray icon and hide overlay
-    set_tray_state(ctx, crate::tray::TrayIconState::Idle);
-    hide_recording_overlay(ctx);
+    set_tray_state(ctx, TrayIconState::Idle);
+    crate::overlay::hide_recording_overlay(ctx);
 
     // Unload model if immediate unload is enabled
     tm.maybe_unload_immediately("cancellation");

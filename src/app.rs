@@ -90,6 +90,9 @@ fn subscribe_bus(ctx: &AppContext, toasts: &libadwaita::ToastOverlay) {
                     toasts.add_toast(toast);
                 }
                 AppEvent::ThemeChanged(theme) => apply_theme(theme),
+                AppEvent::CommandFailed { context, message } => {
+                    toasts.add_toast(libadwaita::Toast::new(&format!("{context}: {message}")));
+                }
                 _ => {}
             }
         });

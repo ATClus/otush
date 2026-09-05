@@ -1,3 +1,4 @@
+use super::errors::{CommandError, CommandResult};
 use crate::actions::process_transcription_output;
 use crate::context::{AppContext, AppEvent};
 use crate::managers::history::{HistoryUpdatePayload, PaginatedHistory};
@@ -20,7 +21,7 @@ pub fn is_playing_history_audio(id: i64) -> bool {
 /// Stop any currently playing history audio.
 pub fn stop_history_audio() {
     CURRENT_PLAYING_ID.store(0, Ordering::SeqCst);
-    let mut guard = STOP_PLAYBACK_FLAG.lock().unwrap();
+    let mut guard = STOP_PLAYBACK_FLAG.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(flag) = guard.take() {
         flag.store(true, Ordering::SeqCst);
     }
@@ -28,7 +29,7 @@ pub fn stop_history_audio() {
 
 /// Toggle playback of history entry audio.
 /// Returns Ok(true) if playback started, or Ok(false) if playback stopped.
-pub async fn toggle_play_history_audio(ctx: &AppContext, id: i64) -> Result<bool, String> {
+pub async fn toggle_play_history_audio(ctx: &AppContext, id: i64) -> CommandResult<bool> {
     if CURRENT_PLAYING_ID.load(Ordering::SeqCst) == id {
         stop_history_audio();
         ctx.bus
@@ -43,18 +44,20 @@ pub async fn toggle_play_history_audio(ctx: &AppContext, id: i64) -> Result<bool
     let entry = ctx
         .history
         .get_entry_by_id(id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("History entry {} not found", id))?;
+        .await?
+        .ok_or(CommandError::HistoryEntryNotFound(id))?;
 
     let audio_path = ctx.history.get_audio_file_path(&entry.file_name);
     if !audio_path.exists() {
-        return Err(format!("Audio file '{}' does not exist", entry.file_name));
+        return Err(CommandError::audio_file_missing(
+            &audio_path,
+            &entry.file_name,
+        ));
     }
 
     let stop_flag = Arc::new(AtomicBool::new(false));
     {
-        let mut guard = STOP_PLAYBACK_FLAG.lock().unwrap();
+        let mut guard = STOP_PLAYBACK_FLAG.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(Arc::clone(&stop_flag));
     }
     CURRENT_PLAYING_ID.store(id, Ordering::SeqCst);
@@ -100,74 +103,34 @@ pub async fn get_history_entries(
     ctx: &AppContext,
     cursor: Option<i64>,
     limit: Option<usize>,
-) -> Result<PaginatedHistory, String> {
-    ctx.history
-        .get_history_entries(cursor, limit)
-        .await
-        .map_err(|e| e.to_string())
+) -> CommandResult<PaginatedHistory> {
+    Ok(ctx.history.get_history_entries(cursor, limit).await?)
 }
 
 /// Toggle the starred/saved bookmark state for a history entry.
-pub async fn toggle_history_entry_saved(ctx: &AppContext, id: i64) -> Result<(), String> {
-    ctx.history
-        .toggle_saved_status(id)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Retrieve the absolute filesystem path for an archived recording WAV file.
-pub async fn get_audio_file_path(ctx: &AppContext, file_name: String) -> Result<String, String> {
-    let path = ctx.history.get_audio_file_path(&file_name);
-    path.to_str()
-        .ok_or_else(|| "Invalid file path".to_string())
-        .map(|s| s.to_string())
+pub async fn toggle_history_entry_saved(ctx: &AppContext, id: i64) -> CommandResult<()> {
+    Ok(ctx.history.toggle_saved_status(id).await?)
 }
 
 /// Permanently delete a history database record and its associated audio file.
-pub async fn delete_history_entry(ctx: &AppContext, id: i64) -> Result<(), String> {
-    ctx.history
-        .delete_entry(id)
-        .await
-        .map_err(|e| e.to_string())
-}
-
-/// Copy the final transcription text of a history record to the clipboard.
-pub async fn copy_history_entry_transcription(ctx: &AppContext, id: i64) -> Result<String, String> {
-    let entry = ctx
-        .history
-        .get_entry_by_id(id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("History entry {} not found", id))?;
-
-    let text = entry
-        .post_processed_text
-        .as_deref()
-        .unwrap_or(&entry.transcription_text);
-
-    if text.trim().is_empty() {
-        return Err("Transcription is empty".to_string());
-    }
-
-    crate::clipboard::write_clipboard_text(ctx, text)?;
-    Ok(text.to_string())
+pub async fn delete_history_entry(ctx: &AppContext, id: i64) -> CommandResult<()> {
+    Ok(ctx.history.delete_entry(id).await?)
 }
 
 /// Re-run speech-to-text transcription on an archived historical audio file.
-pub async fn retry_history_entry_transcription(ctx: &AppContext, id: i64) -> Result<(), String> {
+pub async fn retry_history_entry_transcription(ctx: &AppContext, id: i64) -> CommandResult<()> {
     let entry = ctx
         .history
         .get_entry_by_id(id)
-        .await
-        .map_err(|e| e.to_string())?
-        .ok_or_else(|| format!("History entry {} not found", id))?;
+        .await?
+        .ok_or(CommandError::HistoryEntryNotFound(id))?;
 
     let audio_path = ctx.history.get_audio_file_path(&entry.file_name);
     let samples = crate::audio_toolkit::read_wav_samples(&audio_path)
-        .map_err(|e| format!("Failed to load audio: {}", e))?;
+        .map_err(|e| CommandError::AudioLoad(e.to_string()))?;
 
     if samples.is_empty() {
-        return Err("Recording has no audio samples".to_string());
+        return Err(CommandError::EmptyRecording);
     }
 
     let settings = ctx.settings();
@@ -176,14 +139,15 @@ pub async fn retry_history_entry_transcription(ctx: &AppContext, id: i64) -> Res
         let tm = ctx.transcription.clone();
         tokio::task::spawn_blocking(move || tm.transcribe(samples))
             .await
-            .map_err(|e| format!("Transcription task panicked: {}", e))?
-            .map_err(|e| e.to_string())?
+            .map_err(CommandError::transcription_join)??
     } else {
-        crate::stt_client::transcribe_with_fallback(&settings, &samples).await?
+        crate::stt_client::transcribe_with_fallback(&settings, &samples)
+            .await
+            .map_err(CommandError::Input)?
     };
 
     if transcription.is_empty() {
-        return Err("Recording contains no speech".to_string());
+        return Err(CommandError::NoSpeech);
     }
 
     let processed =
@@ -197,43 +161,15 @@ pub async fn retry_history_entry_transcription(ctx: &AppContext, id: i64) -> Res
             processed.post_process_prompt,
         )
         .map(|_| ())
-        .map_err(|e| e.to_string())
+        .map_err(CommandError::from)
 }
 
-pub async fn update_history_limit(ctx: &AppContext, limit: usize) -> Result<(), String> {
+pub async fn update_history_limit(ctx: &AppContext, limit: usize) -> CommandResult<()> {
     let mut settings = crate::settings::get_settings(ctx);
     settings.history_limit = limit;
     crate::settings::write_settings(ctx, settings);
 
-    ctx.history
-        .cleanup_old_entries()
-        .map_err(|e| e.to_string())?;
-
-    Ok(())
-}
-
-pub async fn update_recording_retention_period(
-    ctx: &AppContext,
-    period: String,
-) -> Result<(), String> {
-    use crate::settings::RecordingRetentionPeriod;
-
-    let retention_period = match period.as_str() {
-        "never" => RecordingRetentionPeriod::Never,
-        "preserve_limit" => RecordingRetentionPeriod::PreserveLimit,
-        "days3" => RecordingRetentionPeriod::Days3,
-        "weeks2" => RecordingRetentionPeriod::Weeks2,
-        "months3" => RecordingRetentionPeriod::Months3,
-        _ => return Err(format!("Invalid retention period: {}", period)),
-    };
-
-    let mut settings = crate::settings::get_settings(ctx);
-    settings.recording_retention_period = retention_period;
-    crate::settings::write_settings(ctx, settings);
-
-    ctx.history
-        .cleanup_old_entries()
-        .map_err(|e| e.to_string())?;
+    ctx.history.cleanup_old_entries()?;
 
     Ok(())
 }

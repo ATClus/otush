@@ -1,6 +1,7 @@
 //! Settings pages, one per sidebar section.
 
 pub mod advanced;
+pub mod agents;
 pub mod audio;
 pub mod docs;
 pub mod general;
@@ -14,34 +15,45 @@ pub mod todos;
 
 use crate::context::AppContext;
 use libadwaita::prelude::*;
-use std::cell::RefCell;
-use std::collections::HashMap;
 
-// Rows added to a PreferencesGroup, keyed by the group's widget name, so a
-// rebuild can remove exactly the rows it owns (AdwPreferencesGroup wraps rows
-// internally; generic child iteration hits the internal box instead).
-thread_local! {
-    static GROUP_ROWS: RefCell<HashMap<String, Vec<gtk4::Widget>>> = RefCell::new(HashMap::new());
+/// Owned row list for one [`libadwaita::PreferencesGroup`].
+///
+/// `AdwPreferencesGroup` wraps rows internally, so generic child iteration
+/// cannot find them for removal on rebuild. `PageGroup` keeps the rows it
+/// added and removes exactly those on [`PageGroup::clear`] — no global map,
+/// no string keys, no cross-group aliasing. Rows are held as
+/// [`glib::SendWeakRef`] so the handle stays `Send + Sync` across the
+/// event-bus boundary and never pins a removed row alive; the removal itself
+/// always runs on the GTK main thread. Keep one per rebuilt group next to
+/// the group itself (usually in an `Arc<Mutex<…>>` shared with the bus
+/// callbacks that trigger rebuilds).
+#[derive(Default)]
+pub struct PageGroup {
+    rows: Vec<glib::SendWeakRef<gtk4::Widget>>,
 }
 
-/// Remove the rows previously tracked for `group` (see [`track_row`]).
-pub fn clear_group_rows(group: &libadwaita::PreferencesGroup) {
-    let key = group.widget_name().to_string();
-    let rows = GROUP_ROWS.with(|m| m.borrow_mut().remove(&key).unwrap_or_default());
-    for row in rows {
-        group.remove(&row);
+impl PageGroup {
+    pub fn new() -> Self {
+        Self::default()
     }
-}
 
-/// Remember a row added to `group` so the next rebuild can remove it.
-pub fn track_row(group: &libadwaita::PreferencesGroup, row: &impl IsA<gtk4::Widget>) {
-    let key = group.widget_name().to_string();
-    GROUP_ROWS.with(|m| {
-        m.borrow_mut()
-            .entry(key)
-            .or_default()
-            .push(row.clone().upcast())
-    });
+    /// Remove all previously added rows from `group`. Must run on the GTK
+    /// main thread (it upgrades widget refs). Dead rows are skipped.
+    pub fn clear(&mut self, group: &libadwaita::PreferencesGroup) {
+        for row in self.rows.drain(..) {
+            if let Some(widget) = row.into_weak_ref().upgrade() {
+                group.remove(&widget);
+            }
+        }
+    }
+
+    /// Add `row` to `group` and remember it for the next [`PageGroup::clear`].
+    pub fn add(&mut self, group: &libadwaita::PreferencesGroup, row: &impl IsA<gtk4::Widget>) {
+        group.add(row);
+        self.rows.push(glib::SendWeakRef::from(
+            row.clone().upcast::<gtk4::Widget>().downgrade(),
+        ));
+    }
 }
 
 /// Build the content widget for a sidebar section id.
@@ -52,6 +64,7 @@ pub fn build_page(id: &str, ctx: &AppContext) -> gtk4::Widget {
         "models" | "transcription" | "speech" => models::build(ctx),
         "post_processing" | "prompts" | "ai" => providers_llm::build(ctx),
         "providers" | "cloud" => providers::build(ctx),
+        "agents" => agents::build(ctx),
         "notes" => notes::build(ctx),
         "todos" => todos::build(ctx),
         "docs" => docs::build(ctx),

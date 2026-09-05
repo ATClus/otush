@@ -176,7 +176,10 @@ impl ModelManager {
 
     pub fn get_available_models(&self) -> Vec<ModelInfo> {
         let mut list: Vec<ModelInfo> = {
-            let models = self.available_models.lock().unwrap();
+            let models = self
+                .available_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             models.values().cloned().collect()
         };
         list.sort_by(|a, b| {
@@ -190,7 +193,10 @@ impl ModelManager {
     }
 
     pub fn get_model_info(&self, model_id: &str) -> Option<ModelInfo> {
-        let models = self.available_models.lock().unwrap();
+        let models = self
+            .available_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         models.get(model_id).cloned()
     }
 
@@ -237,7 +243,10 @@ impl ModelManager {
         }
 
         {
-            let mut live = self.available_models.lock().unwrap();
+            let mut live = self
+                .available_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             *live = discovered;
         }
 
@@ -263,7 +272,10 @@ impl ModelManager {
         }
 
         {
-            let mut models = self.available_models.lock().unwrap();
+            let mut models = self
+                .available_models
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             models.remove(model_id);
         }
 
@@ -276,7 +288,10 @@ impl ModelManager {
         let settings_path = self.paths.settings_store_path();
         let mut settings = read_settings_from(&settings_path);
 
-        let models = self.available_models.lock().unwrap();
+        let models = self
+            .available_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let current_valid =
             !settings.selected_model.is_empty() && models.contains_key(&settings.selected_model);
 
@@ -301,7 +316,10 @@ impl ModelManager {
         supports_language_detection: bool,
         languages: Vec<String>,
     ) {
-        let mut models = self.available_models.lock().unwrap();
+        let mut models = self
+            .available_models
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(info) = models.get_mut(model_id) {
             let canonical = canonicalize_supported_languages(languages);
             info.supports_language_selection = canonical.len() > 1;

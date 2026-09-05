@@ -33,7 +33,7 @@ pub fn init_shortcuts(ctx: &AppContext) {
     let bindings_map = get_active_bindings_map();
     {
         let settings = ctx.settings();
-        let mut map = bindings_map.lock().unwrap();
+        let mut map = bindings_map.lock().unwrap_or_else(|e| e.into_inner());
         for (id, binding) in &settings.bindings {
             map.insert(id.clone(), binding.clone());
         }
@@ -46,7 +46,7 @@ pub fn init_shortcuts(ctx: &AppContext) {
         if let AppEvent::SettingsChanged { setting, .. } = event {
             if setting == "bindings" {
                 let settings = ctx_sub.settings();
-                let mut map = b_map.lock().unwrap();
+                let mut map = b_map.lock().unwrap_or_else(|e| e.into_inner());
                 map.clear();
                 for (id, binding) in &settings.bindings {
                     map.insert(id.clone(), binding.clone());
@@ -105,7 +105,7 @@ fn run_evdev_listener_loop(
 
             // Check matches under lock without extra heap clones per iteration
             {
-                let map = bindings_map.lock().unwrap();
+                let map = bindings_map.lock().unwrap_or_else(|e| e.into_inner());
                 for binding in map.values() {
                     if binding.id == "cancel" && !ctx.audio.is_recording() {
                         continue;

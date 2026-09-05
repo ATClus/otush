@@ -48,7 +48,10 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     let clip_ctx = ctx.clone();
     clipboard_row.connect_selected_notify(move |row| {
         if let Some((id, _)) = clip_labels.get(row.selected() as usize) {
-            let _ = shortcut::change_clipboard_handling_setting(&clip_ctx, id.to_string());
+            if let Err(err) = shortcut::change_clipboard_handling_setting(&clip_ctx, id.to_string())
+            {
+                clip_ctx.report_error("change_clipboard_handling_setting", err);
+            }
         }
     });
     auto_group.add(&clipboard_row);
@@ -60,7 +63,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     script_row.connect_changed(move |r| {
         let text = r.text().trim().to_string();
         let opt = if text.is_empty() { None } else { Some(text) };
-        let _ = shortcut::change_external_script_path_setting(&sc_ctx, opt);
+        if let Err(err) = shortcut::change_external_script_path_setting(&sc_ctx, opt) {
+            sc_ctx.report_error("change_external_script_path_setting", err);
+        }
     });
     auto_group.add(&script_row);
 
@@ -70,7 +75,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     exp_row.set_active(settings.experimental_enabled);
     let exp_ctx = ctx.clone();
     exp_row.connect_active_notify(move |row| {
-        let _ = shortcut::change_experimental_enabled_setting(&exp_ctx, row.is_active());
+        if let Err(err) = shortcut::change_experimental_enabled_setting(&exp_ctx, row.is_active()) {
+            exp_ctx.report_error("change_experimental_enabled_setting", err);
+        }
     });
     auto_group.add(&exp_row);
 
@@ -91,7 +98,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     debug_mode_row.set_active(settings.debug_mode);
     let dbg_ctx = ctx.clone();
     debug_mode_row.connect_active_notify(move |row| {
-        let _ = shortcut::change_debug_mode_setting(&dbg_ctx, row.is_active());
+        if let Err(err) = shortcut::change_debug_mode_setting(&dbg_ctx, row.is_active()) {
+            dbg_ctx.report_error("change_debug_mode_setting", err);
+        }
     });
     debug_group.add(&debug_mode_row);
 
@@ -129,7 +138,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                 "warn" => LogLevel::Warn,
                 _ => LogLevel::Error,
             };
-            let _ = commands::set_log_level(&log_lvl_ctx, level);
+            if let Err(err) = commands::set_log_level(&log_lvl_ctx, level) {
+                log_lvl_ctx.report_error("set_log_level", err);
+            }
         }
     });
     debug_group.add(&log_level_row);
@@ -144,7 +155,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     log_btn.add_css_class("flat");
     let log_dir_ctx = ctx.clone();
     log_btn.connect_clicked(move |_| {
-        let _ = commands::open_log_dir(&log_dir_ctx);
+        if let Err(err) = commands::open_log_dir(&log_dir_ctx) {
+            log_dir_ctx.report_error("open_log_dir", err);
+        }
     });
     log_dir_row.add_suffix(&log_btn);
     debug_group.add(&log_dir_row);
@@ -159,7 +172,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     data_btn.add_css_class("flat");
     let data_dir_ctx = ctx.clone();
     data_btn.connect_clicked(move |_| {
-        let _ = commands::open_app_data_dir(&data_dir_ctx);
+        if let Err(err) = commands::open_app_data_dir(&data_dir_ctx) {
+            data_dir_ctx.report_error("open_app_data_dir", err);
+        }
     });
     data_dir_row.add_suffix(&data_btn);
     debug_group.add(&data_dir_row);

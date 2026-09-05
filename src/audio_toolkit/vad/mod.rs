@@ -1,3 +1,11 @@
+//! Voice-activity detection behind one interface.
+//!
+//! Two backends implement `VoiceActivityDetector`: `SileroVad` (Silero v4
+//! ONNX, accurate, needs the model file) and `EarshotVad` (pure-Rust energy
+//! detector, no model, fallback). `SmoothedVad` wraps either with onset
+//! pre-roll and hangover tail so word edges are not clipped. Timing constants
+//! (`VAD_*_MS`) are shared so both backends behave identically at boundaries.
+
 use anyhow::Result;
 
 use crate::audio_toolkit::constants;

@@ -152,7 +152,9 @@ fn decode_media_source(
                     sample_buf = Some(SampleBuffer::<f32>::new(audio_buf.capacity() as u64, spec));
                 }
 
-                let sbuf = sample_buf.as_mut().unwrap();
+                let Some(sbuf) = sample_buf.as_mut() else {
+                    return Err(anyhow::anyhow!("decoder sample buffer missing"));
+                };
                 sbuf.copy_interleaved_ref(audio_buf);
                 let interleaved = sbuf.samples();
 

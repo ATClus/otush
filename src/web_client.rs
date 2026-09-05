@@ -528,7 +528,8 @@ pub async fn firecrawl_parse_document(
     }
 }
 
-/// Test connection and measure latency to Firecrawl API using the official probe endpoint (https://docs.firecrawl.dev/introduction).
+/// Test connection and measure latency to the Firecrawl API using the official
+/// probe endpoint (<https://docs.firecrawl.dev/introduction>).
 pub async fn firecrawl_test_connection(
     base_url: &str,
     api_key: &str,

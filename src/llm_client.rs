@@ -1,3 +1,12 @@
+//! Multi-provider LLM chat-completion client (post-processing, notes, research).
+//!
+//! Speaks the OpenAI-compatible `/chat/completions` dialect to every
+//! post-processing provider (local Ollama plus cloud Anthropic, OpenAI, Groq,
+//! Mistral, Cerebras), with per-provider headers, reasoning-effort mapping,
+//! JSON-schema structured output, and vision/OCR. All requests run on the
+//! shared Tokio runtime via [`crate::runtime`]; API keys are read from
+//! settings at call time and never logged (see [`crate::utils::redact_text`]).
+
 use crate::settings::{PostProcessProvider, ReasoningEffort};
 use log::{debug, info};
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, REFERER, USER_AGENT};
@@ -7,10 +16,98 @@ use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::sync::{Mutex, OnceLock};
 
-#[derive(Debug, Serialize)]
-struct ChatMessage {
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ChatMessage {
     role: String,
     content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_calls: Option<Vec<ToolCallOut>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_call_id: Option<String>,
+}
+
+impl ChatMessage {
+    /// Plain user message.
+    pub fn user(content: impl Into<String>) -> Self {
+        Self {
+            role: "user".to_string(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Plain system message.
+    pub fn system(content: impl Into<String>) -> Self {
+        Self {
+            role: "system".to_string(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: None,
+        }
+    }
+
+    /// Assistant turn that requested tool calls.
+    pub fn assistant_with_tools(content: String, tool_calls: Vec<ToolCallOut>) -> Self {
+        Self {
+            role: "assistant".to_string(),
+            content,
+            tool_calls: Some(tool_calls),
+            tool_call_id: None,
+        }
+    }
+
+    /// Result of one tool execution, fed back as `role: "tool"`.
+    pub fn tool_result(tool_call_id: impl Into<String>, content: impl Into<String>) -> Self {
+        Self {
+            role: "tool".to_string(),
+            content: content.into(),
+            tool_calls: None,
+            tool_call_id: Some(tool_call_id.into()),
+        }
+    }
+}
+
+/// One tool call requested by the assistant (OpenAI-compat `tool_calls` item).
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolCallOut {
+    pub id: String,
+    #[serde(rename = "type")]
+    pub call_type: String,
+    pub function: ToolFunctionCall,
+}
+
+/// The `function` payload of a tool call: name + JSON-encoded arguments.
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ToolFunctionCall {
+    pub name: String,
+    pub arguments: String,
+}
+
+/// One function tool exposed to the model (OpenAI-compat `tools` item).
+#[derive(Debug, Serialize, Clone)]
+pub struct ToolDefinition {
+    pub name: String,
+    pub description: String,
+    /// JSON Schema object for the arguments.
+    pub parameters: Value,
+}
+
+impl ToolDefinition {
+    pub fn new(name: impl Into<String>, description: impl Into<String>, parameters: Value) -> Self {
+        Self {
+            name: name.into(),
+            description: description.into(),
+            parameters,
+        }
+    }
+}
+
+/// Assistant reply: final text, tool call requests, or both.
+#[derive(Debug, Clone, Default)]
+pub struct AssistantReply {
+    pub content: Option<String>,
+    pub tool_calls: Vec<ToolCallOut>,
 }
 
 #[derive(Debug, Serialize)]
@@ -181,8 +278,28 @@ struct ChatCompletionRequest {
     stream: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<ResponseFormat>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<ToolRequestItem>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tool_choice: Option<String>,
     #[serde(flatten)]
     reasoning: ReasoningParams,
+}
+
+/// OpenAI-compat `{"type": "function", "function": {...}}` wrapper.
+#[derive(Debug, Serialize)]
+struct ToolRequestItem {
+    #[serde(rename = "type")]
+    item_type: String,
+    function: ToolRequestFunction,
+}
+
+/// OpenAI-compat function descriptor inside a `tools` item.
+#[derive(Debug, Serialize)]
+struct ToolRequestFunction {
+    name: String,
+    description: String,
+    parameters: Value,
 }
 
 #[derive(Debug, Deserialize)]
@@ -212,6 +329,8 @@ struct ChatChoice {
 #[derive(Debug, Deserialize)]
 struct ChatMessageResponse {
     content: Option<String>,
+    #[serde(default)]
+    tool_calls: Option<Vec<ToolCallOut>>,
 }
 
 /// Build headers for API requests based on provider type and custom headers
@@ -493,17 +612,11 @@ pub async fn send_chat_completion_with_schema(
 
     // Add system prompt if provided
     if let Some(system) = system_prompt {
-        messages.push(ChatMessage {
-            role: "system".to_string(),
-            content: system,
-        });
+        messages.push(ChatMessage::system(system));
     }
 
     // Add user message
-    messages.push(ChatMessage {
-        role: "user".to_string(),
-        content: user_content,
-    });
+    messages.push(ChatMessage::user(user_content));
 
     // Build response_format if schema is provided
     let response_format = json_schema.map(|schema| ResponseFormat {
@@ -527,6 +640,8 @@ pub async fn send_chat_completion_with_schema(
         messages,
         stream: false,
         response_format,
+        tools: None,
+        tool_choice: None,
         reasoning,
     };
 
@@ -645,6 +760,122 @@ pub async fn send_chat_completion_with_schema(
     info!("LLM parsed content from first choice: {:?}", content);
 
     Ok(content)
+}
+
+/// Send a multi-turn chat request with optional function tools (agentic loop).
+///
+/// `tools` maps to the OpenAI-compat `tools` array with `tool_choice: "auto"`.
+/// The reasoning-disable/retry semantics match
+/// [`send_chat_completion_with_schema`]: a 400/422 on a request carrying
+/// reasoning fields retries once without them.
+pub async fn send_chat_messages(
+    provider: &PostProcessProvider,
+    api_key: String,
+    model: &str,
+    messages: Vec<ChatMessage>,
+    tools: Option<Vec<ToolDefinition>>,
+    disable_reasoning: bool,
+) -> Result<AssistantReply, String> {
+    let base_url = provider.base_url.trim_end_matches('/');
+    let url = format!("{}/chat/completions", base_url);
+
+    let client = cached_client(provider, &api_key)?;
+
+    let tool_items: Option<Vec<ToolRequestItem>> = tools.map(|defs| {
+        defs.into_iter()
+            .map(|def| ToolRequestItem {
+                item_type: "function".to_string(),
+                function: ToolRequestFunction {
+                    name: def.name,
+                    description: def.description,
+                    parameters: def.parameters,
+                },
+            })
+            .collect()
+    });
+    let tool_choice = if tool_items.is_some() {
+        Some("auto".to_string())
+    } else {
+        None
+    };
+
+    let key = endpoint_key(provider, model);
+    let reasoning = if !is_known_rejected(&key) {
+        build_reasoning_params(provider, disable_reasoning)
+    } else {
+        ReasoningParams::default()
+    };
+
+    let mut request_body = ChatCompletionRequest {
+        model: model.to_string(),
+        messages,
+        stream: false,
+        response_format: None,
+        tools: tool_items,
+        tool_choice,
+        reasoning,
+    };
+
+    let mut response = client
+        .post(&url)
+        .json(&request_body)
+        .send()
+        .await
+        .map_err(|e| report_reqwest_error("HTTP request failed", &e))?;
+    let mut status = response.status();
+
+    if !status.is_success()
+        && matches!(status.as_u16(), 400 | 422)
+        && !request_body.reasoning.is_empty()
+    {
+        let error_text = response.text().await.unwrap_or_else(|e| {
+            report_reqwest_error("Failed to read reasoning rejection response", &e)
+        });
+        info!(
+            "Endpoint rejected tool request with reasoning fields (status {}): {}. Retrying without reasoning fields",
+            status, error_text
+        );
+
+        request_body.reasoning = ReasoningParams::default();
+        response = client
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| report_reqwest_error("HTTP retry failed", &e))?;
+        status = response.status();
+
+        if status.is_success() {
+            remember_rejection(key);
+        }
+    }
+
+    if !status.is_success() {
+        let error_text = response
+            .text()
+            .await
+            .unwrap_or_else(|e| report_reqwest_error("Failed to read API error response", &e));
+        return Err(format!(
+            "API request failed with status {}: {}",
+            status, error_text
+        ));
+    }
+
+    let raw_response = response
+        .text()
+        .await
+        .map_err(|e| report_reqwest_error("Failed to read API response body", &e))?;
+
+    let completion: ChatCompletionResponse = serde_json::from_str(&raw_response)
+        .map_err(|e| format!("Failed to parse API response JSON: {e}"))?;
+
+    let Some(first) = completion.choices.first() else {
+        return Err("API response contained no choices".to_string());
+    };
+    Ok(AssistantReply {
+        content: first.message.content.clone(),
+        tool_calls: first.message.tool_calls.clone().unwrap_or_default(),
+    })
 }
 
 /// Fetch available models dynamically from an LLM provider API.
@@ -877,12 +1108,11 @@ mod tests {
     fn request_json(reasoning: ReasoningParams) -> Value {
         let request = ChatCompletionRequest {
             model: "test-model".to_string(),
-            messages: vec![ChatMessage {
-                role: "user".to_string(),
-                content: "hi".to_string(),
-            }],
+            messages: vec![ChatMessage::user("hi")],
             stream: false,
             response_format: None,
+            tools: None,
+            tool_choice: None,
             reasoning,
         };
         serde_json::to_value(&request).unwrap()

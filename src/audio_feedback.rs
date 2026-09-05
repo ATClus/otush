@@ -54,14 +54,6 @@ pub fn play_feedback_sound_blocking(ctx: &AppContext, sound_type: SoundType) {
     }
 }
 
-#[allow(dead_code)]
-pub fn play_test_sound(ctx: &AppContext, sound_type: SoundType) {
-    let settings = settings::get_settings(ctx);
-    if let Some(path) = resolve_sound_path(ctx, &settings, sound_type) {
-        play_sound_blocking(ctx, &path);
-    }
-}
-
 fn play_sound_async(ctx: &AppContext, path: PathBuf) {
     let ctx = ctx.clone();
     thread::spawn(move || {

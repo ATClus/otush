@@ -12,6 +12,9 @@ use crate::transcription_coordinator::is_transcribe_binding;
 
 static SHORTCUTS_SUSPENDED: AtomicBool = AtomicBool::new(false);
 
+/// Suspend global shortcut dispatch (e.g. while the user records a new
+/// shortcut, so no existing shortcut can fire mid-capture). Wired to the
+/// shortcut capture dialog; see [`crate::shortcut::suspend_shortcuts`].
 pub fn set_shortcuts_suspended(suspended: bool) {
     SHORTCUTS_SUSPENDED.store(suspended, Ordering::Relaxed);
 }

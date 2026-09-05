@@ -1,11 +1,11 @@
 //! System tray icon and menu (StatusNotifierItem via ksni).
 //!
 //! The tray is driven by a desired-state snapshot ([`TraySnapshot`]) that
-//! callers update through [`set_tray_state`], [`refresh_tray_icon`] and
-//! [`update_tray_menu`]. Every such call records intent and pushes the change
-//! to the running SNI service via `Handle::update` (which re-reads the icon
-//! and menu); the first call spawns the service. Menu callbacks dispatch to
-//! the app context on worker threads so the menu never blocks.
+//! callers update through [`set_tray_state`] and [`update_tray_menu`]. Every
+//! such call records intent and pushes the change to the running SNI service
+//! via `Handle::update` (which re-reads the icon and menu); the first call
+//! spawns the service. Menu callbacks dispatch to the app context on worker
+//! threads so the menu never blocks.
 //!
 //! On GNOME, the icon requires the "AppIndicator and KStatusNotifierItem
 //! Support" shell extension (shipped by default on Ubuntu's GNOME session).
@@ -33,8 +33,7 @@ impl TrayIconState {
     }
 }
 
-/// Tray icon theme.
-#[allow(dead_code)]
+/// Tray icon theme, mirroring [`TrayTheme`](crate::settings::TrayTheme).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum AppTheme {
     Dark,
@@ -42,11 +41,30 @@ pub enum AppTheme {
     Colored,
 }
 
-/// Gets the current app theme. GNOME Shell's top bar is dark by default,
-/// so the symbolic Dark theme (crisp white icon with red indicator on recording)
-/// provides the native GNOME 46+ status area look.
-pub fn get_current_theme(_ctx: &AppContext) -> AppTheme {
-    AppTheme::Dark
+/// Gets the current tray icon theme from settings (see
+/// [`TrayTheme`](crate::settings::TrayTheme)); GNOME Shell's top bar is dark
+/// by default, so `Dark` (light glyphs) is the default.
+pub fn get_current_theme(ctx: &AppContext) -> AppTheme {
+    match settings::get_settings(ctx).tray_theme {
+        settings::TrayTheme::Light => AppTheme::Light,
+        settings::TrayTheme::Colored => AppTheme::Colored,
+        settings::TrayTheme::Dark => AppTheme::Dark,
+    }
+}
+
+/// Refresh the tray icon after a settings change (e.g. tray theme) by
+/// re-pushing the current snapshot state.
+pub fn refresh_tray_theme(ctx: &AppContext) {
+    let state = TRAY_SNAPSHOT
+        .get()
+        .map(|snapshot| {
+            snapshot
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .icon_state
+        })
+        .unwrap_or(TrayIconState::Idle);
+    set_tray_state(ctx, state);
 }
 
 /// Gets the appropriate icon path (relative to the resource dir) for the
@@ -161,7 +179,7 @@ fn load_pixmap(name: &str) -> Option<ksni::Icon> {
     let cache = PIXMAP_CACHE.get_or_init(|| Mutex::new(HashMap::new()));
 
     {
-        let guard = cache.lock().unwrap();
+        let guard = cache.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(icon) = guard.get(name) {
             return Some(icon.clone());
         }
@@ -196,7 +214,7 @@ fn load_pixmap(name: &str) -> Option<ksni::Icon> {
         _ => return Some(icon),
     };
 
-    let mut guard = cache.lock().unwrap();
+    let mut guard = cache.lock().unwrap_or_else(|e| e.into_inner());
     guard.insert(static_key, icon.clone());
     Some(icon)
 }
@@ -251,12 +269,6 @@ pub fn set_tray_state(ctx: &AppContext, state: TrayIconState) {
             .unwrap_or_else(|e| e.into_inner())
             .icon_state = state;
     }
-    sync_tray(ctx);
-}
-
-/// Refresh the tray icon (e.g. after a theme change).
-#[allow(dead_code)]
-pub fn refresh_tray_icon(ctx: &AppContext) {
     sync_tray(ctx);
 }
 

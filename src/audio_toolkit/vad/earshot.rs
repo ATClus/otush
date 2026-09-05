@@ -1,3 +1,10 @@
+//! Model-less energy voice-activity detector.
+//!
+//! Pure-Rust fallback when the Silero ONNX model is unavailable: no model
+//! file, lower accuracy in noise, but zero download and instant startup.
+//! Expects exactly 16 ms of mono 16 kHz audio per prediction; the recorder
+//! uses `frame_samples()` to configure its resampler accordingly.
+
 use anyhow::Result;
 
 use super::{VadFrame, VoiceActivityDetector};

@@ -199,7 +199,7 @@ impl AudioRecorder {
                 let device_name = thread_device.name().unwrap_or_default();
                 let cached_config = config_cache
                     .lock()
-                    .unwrap()
+                    .unwrap_or_else(|e| e.into_inner())
                     .as_ref()
                     .filter(|(name, _)| !device_name.is_empty() && *name == device_name)
                     .map(|(_, cfg)| cfg.clone());
@@ -309,7 +309,8 @@ impl AudioRecorder {
                 // The device accepted this config; remember it so the next
                 // open skips the HAL property queries entirely.
                 if !config_was_cached && !device_name.is_empty() {
-                    *config_cache.lock().unwrap() = Some((device_name, config));
+                    *config_cache.lock().unwrap_or_else(|e| e.into_inner()) =
+                        Some((device_name, config));
                 }
 
                 Ok((stream, sample_rate))
@@ -338,7 +339,7 @@ impl AudioRecorder {
                     // A failed open may mean the cached config went stale
                     // (device re-plugged, rate/format changed in the OS).
                     // Drop it so the next attempt re-queries the device.
-                    *config_cache.lock().unwrap() = None;
+                    *config_cache.lock().unwrap_or_else(|e| e.into_inner()) = None;
                     log::error!("{error_message}");
                     let _ = init_tx.send(Err(error_message));
                 }
@@ -844,7 +845,7 @@ fn run_consumer(
         }
 
         if let Some(cfg) = vad {
-            let mut det = cfg.detector.lock().unwrap();
+            let mut det = cfg.detector.lock().unwrap_or_else(|e| e.into_inner());
             match det.push_frame(samples).unwrap_or(VadFrame::Speech(samples)) {
                 VadFrame::Speech(buf) => emit(buf),
                 VadFrame::Noise => {}
@@ -892,7 +893,7 @@ fn run_consumer(
                     // any frames.
                     if vad_policy != VadPolicy::Disabled {
                         if let Some(cfg) = &vad {
-                            let mut det = cfg.detector.lock().unwrap();
+                            let mut det = cfg.detector.lock().unwrap_or_else(|e| e.into_inner());
                             det.set_hangover_frames(cfg.hangover_for(vad_policy));
                             det.reset();
                         }
@@ -963,7 +964,11 @@ fn run_consumer(
                     // Suggestive, not conclusive, in either direction.
                     if vad_policy != VadPolicy::Disabled {
                         if let Some(cfg) = &vad {
-                            let report = cfg.detector.lock().unwrap().tail_report();
+                            let report = cfg
+                                .detector
+                                .lock()
+                                .unwrap_or_else(|e| e.into_inner())
+                                .tail_report();
                             if let Some(report) = report {
                                 log::debug!(
                                     "VAD at stop: withheld tail {} frames (~{}ms, {} voiced), in_speech={}, onset_counter={}, hangover_counter={}",

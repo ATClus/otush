@@ -70,7 +70,7 @@ impl FrameResampler {
                 if let Ok(out) = self
                     .resampler
                     .as_mut()
-                    .unwrap()
+                    .expect("resampler initialized when in use")
                     .process(&[&self.in_buf[..]], None)
                 {
                     // let duration = start.elapsed();
@@ -90,7 +90,7 @@ impl FrameResampler {
                 let result = self
                     .resampler
                     .as_mut()
-                    .unwrap()
+                    .expect("resampler initialized when in use")
                     .process_partial(Some(&[&self.in_buf[..]]), None);
                 if let Ok(out) = result {
                     self.out_count += out[0].len();
@@ -106,7 +106,11 @@ impl FrameResampler {
             // has emerged only once in*ratio + delay samples are out. Feed
             // zero chunks until then, trimming the synthetic remainder.
             if self.in_count > 0 {
-                let delay = self.resampler.as_ref().unwrap().output_delay();
+                let delay = self
+                    .resampler
+                    .as_ref()
+                    .expect("resampler initialized when in use")
+                    .output_delay();
                 let expected = self.in_count * self.out_hz / self.in_hz + delay;
                 let mut rounds = 0;
                 while self.out_count < expected && rounds < 8 {

@@ -90,6 +90,15 @@ pub struct ModelDownloadFinishedEvent {
     pub error: Option<String>,
 }
 
+/// One agent chat message surfaced to the UI.
+#[derive(Clone, Debug)]
+pub struct AgentMessageEvent {
+    pub id: i64,
+    pub role: String,
+    pub content: String,
+    pub tool_name: Option<String>,
+}
+
 /// One backend → UI event. The GTK shell subscribes via [`EventBus::subscribe`].
 #[derive(Clone, Debug)]
 pub enum AppEvent {
@@ -124,6 +133,32 @@ pub enum AppEvent {
     },
     // --- history ---
     HistoryUpdated(HistoryUpdatePayload),
+    // --- agents (AI chat overlay) ---
+    /// The agent/chat catalog changed (agents edited, chats added/deleted).
+    AgentChatsChanged,
+    /// A chat message was added or replaced (placeholder → final text).
+    AgentMessageAdded {
+        chat_id: i64,
+        message: AgentMessageEvent,
+    },
+    /// One tool step executed during a turn (timeline UI).
+    AgentStep {
+        chat_id: i64,
+        tool: String,
+        summary: String,
+    },
+    /// A turn finished (`message_id` = placeholder row to replace).
+    AgentDone {
+        chat_id: i64,
+        message_id: Option<i64>,
+        truncated: bool,
+    },
+    /// A fire-and-forget UI command failed (reported via
+    /// [`AppContext::report_error`]); the shell shows a toast.
+    CommandFailed {
+        context: String,
+        message: String,
+    },
     // --- debug ---
     /// A log line, forwarded only while debug mode is on (live log viewer).
     LogRecord(String),
@@ -132,14 +167,40 @@ pub enum AppEvent {
 /// A single event-bus subscriber callback.
 pub type EventBusSubscriber = Arc<dyn Fn(AppEvent) + Send + Sync>;
 
+/// Handle to a bus subscription. Dropping the handle does **not** unsubscribe
+/// (callbacks must stay `'static`); call [`Subscription::unsubscribe`] — e.g.
+/// from a window's `connect_destroy` — to stop receiving events and let the
+/// bus release the callback.
+pub struct Subscription {
+    bus: EventBus,
+    id: u64,
+}
+
+impl Subscription {
+    /// Remove the callback from the bus. Idempotent.
+    pub fn unsubscribe(&self) {
+        self.bus.unsubscribe(self.id);
+    }
+}
+
 /// Broadcast bus from backend threads to one-or-more UI subscribers.
 ///
 /// Subscribers register a callback (typically marshaling onto the GTK main
 /// loop via `glib::MainContext::default().invoke(...)`); `send` fans out to
 /// all live subscribers from any thread.
+///
+/// Prefer [`EventBus::subscribe`] (which returns a [`Subscription`]) for
+/// short-lived UI such as palettes and pages, and unsubscribe when the widget
+/// is destroyed so repeated open/close cycles cannot accumulate callbacks.
 #[derive(Clone, Default)]
 pub struct EventBus {
-    subscribers: Arc<Mutex<Arc<[EventBusSubscriber]>>>,
+    subscribers: Arc<Mutex<SubscriberList>>,
+}
+
+#[derive(Default)]
+struct SubscriberList {
+    next_id: u64,
+    callbacks: Vec<(u64, EventBusSubscriber)>,
 }
 
 impl EventBus {
@@ -147,25 +208,39 @@ impl EventBus {
         Self::default()
     }
 
-    /// Register a subscriber callback. It may be invoked from any thread, so
-    /// the callback should marshal to the UI thread (e.g. with
-    /// `glib::MainContext::default().invoke(...)`).
-    pub fn subscribe(&self, callback: impl Fn(AppEvent) + Send + Sync + 'static) {
-        let mut guard = self.subscribers.lock().unwrap();
-        let mut list: Vec<EventBusSubscriber> = (**guard).to_vec();
-        list.push(Arc::new(callback));
-        *guard = list.into();
+    /// Register a subscriber callback and return a [`Subscription`] handle.
+    /// The callback may be invoked from any thread, so it should marshal to
+    /// the UI thread (e.g. with `glib::MainContext::default().invoke(...)`)
+    /// and must never block.
+    pub fn subscribe(&self, callback: impl Fn(AppEvent) + Send + Sync + 'static) -> Subscription {
+        let mut guard = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        guard.next_id += 1;
+        let id = guard.next_id;
+        guard.callbacks.push((id, Arc::new(callback)));
+        Subscription {
+            bus: self.clone(),
+            id,
+        }
+    }
+
+    /// Remove a previously registered callback. Idempotent.
+    pub fn unsubscribe(&self, id: u64) {
+        let mut guard = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+        guard.callbacks.retain(|(cid, _)| *cid != id);
     }
 
     /// Fan out to all subscribers without allocating a vector on send.
     pub fn send(&self, event: AppEvent) {
-        let subscribers = Arc::clone(&*self.subscribers.lock().unwrap());
-        if subscribers.is_empty() {
+        let callbacks: Vec<EventBusSubscriber> = {
+            let guard = self.subscribers.lock().unwrap_or_else(|e| e.into_inner());
+            guard.callbacks.iter().map(|(_, cb)| cb.clone()).collect()
+        };
+        if callbacks.is_empty() {
             return;
         }
 
-        let count = subscribers.len();
-        for (i, callback) in subscribers.iter().enumerate() {
+        let count = callbacks.len();
+        for (i, callback) in callbacks.iter().enumerate() {
             if i + 1 == count {
                 callback(event);
                 break;
@@ -206,11 +281,56 @@ impl AppContext {
         });
     }
 
+    /// Report a fire-and-forget UI failure: always logged (warn), and
+    /// surfaced as a toast via the event bus so the failure is visible
+    /// instead of silently swallowed with `let _ = …`.
+    pub fn report_error(&self, context: &str, err: impl std::fmt::Display) {
+        log::warn!("{context}: {err}");
+        self.bus.send(AppEvent::CommandFailed {
+            context: context.to_string(),
+            message: err.to_string(),
+        });
+    }
+
     pub fn models_dir(&self) -> PathBuf {
         self.paths.models_dir()
     }
 
     pub fn resource_dir(&self) -> &Path {
         &self.paths.resource_dir
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn unsubscribed_callbacks_stop_receiving_events() {
+        let bus = EventBus::new();
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let hits_clone = hits.clone();
+        let sub = bus.subscribe(move |_| {
+            hits_clone.fetch_add(1, Ordering::SeqCst);
+        });
+        bus.send(AppEvent::PasteError);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+
+        sub.unsubscribe();
+        bus.send(AppEvent::PasteError);
+        assert_eq!(hits.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn unsubscribe_is_idempotent_and_foreign_ids_are_ignored() {
+        let bus = EventBus::new();
+        let sub = bus.subscribe(|_| {});
+        sub.unsubscribe();
+        sub.unsubscribe();
+        bus.unsubscribe(u64::MAX);
+        // No panic; an empty bus is a silent no-op.
+        bus.send(AppEvent::PasteError);
     }
 }

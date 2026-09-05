@@ -11,6 +11,7 @@ use crate::shortcut;
 use gdk4::prelude::*;
 use gtk4::prelude::*;
 use libadwaita::prelude::*;
+use std::sync::{Arc, Mutex};
 
 /// Build the Speech Recognition preferences page.
 pub fn build(ctx: &AppContext) -> gtk4::Widget {
@@ -70,7 +71,9 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     refresh_button.connect_clicked(move |_| {
         let ctx = refresh_ctx.clone();
         crate::runtime::spawn(async move {
-            let _ = model_cmds::rescan_local_models(&ctx).await;
+            if let Err(err) = model_cmds::rescan_local_models(&ctx).await {
+                ctx.report_error("rescan_local_models", err);
+            }
         });
     });
     folder_row.add_suffix(&refresh_button);
@@ -149,19 +152,27 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     });
     page.add_controller(drop_target);
 
+    // Owned row lists, one per rebuilt group (see `PageGroup`).
+    let mode_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
+    let models_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
+
     // Initial render
-    refresh_mode_group(ctx, &mode_group);
-    refresh_models_group(ctx, &models_group);
+    refresh_mode_group(ctx, &mode_group, &mode_rows);
+    refresh_models_group(ctx, &models_group, &models_rows);
 
     // Live refresh on bus events
     let mode_weak = glib::SendWeakRef::from(mode_group.downgrade());
     let models_weak = glib::SendWeakRef::from(models_group.downgrade());
     let ctx_bus = ctx.clone();
+    let mode_rows_bus = mode_rows.clone();
+    let models_rows_bus = models_rows.clone();
 
     ctx.bus.subscribe(move |event| {
         let ctx = ctx_bus.clone();
         let mode_weak = mode_weak.clone();
         let models_weak = models_weak.clone();
+        let mode_rows = mode_rows_bus.clone();
+        let models_rows = models_rows_bus.clone();
 
         glib::MainContext::default().invoke(move || match event {
             AppEvent::ModelsUpdated
@@ -169,7 +180,7 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
             | AppEvent::ModelDeleted(_)
             | AppEvent::ModelStateChanged(_) => {
                 if let Some(grp) = models_weak.into_weak_ref().upgrade() {
-                    refresh_models_group(&ctx, &grp);
+                    refresh_models_group(&ctx, &grp, &models_rows);
                 }
             }
             AppEvent::ModelDownloadProgress(progress) => {
@@ -182,7 +193,7 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     || setting == "model_unload_timeout" =>
             {
                 if let Some(grp) = mode_weak.into_weak_ref().upgrade() {
-                    refresh_mode_group(&ctx, &grp);
+                    refresh_mode_group(&ctx, &grp, &mode_rows);
                 }
             }
             _ => {}
@@ -192,8 +203,12 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     page.upcast::<gtk4::Widget>()
 }
 
-fn refresh_mode_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
-    crate::ui::pages::clear_group_rows(group);
+fn refresh_mode_group(
+    ctx: &AppContext,
+    group: &libadwaita::PreferencesGroup,
+    rows: &Arc<Mutex<crate::ui::pages::PageGroup>>,
+) {
+    rows.lock().unwrap_or_else(|e| e.into_inner()).clear(group);
 
     let settings = settings::get_settings(ctx);
 
@@ -251,84 +266,196 @@ fn refresh_mode_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
     let unload_weak = glib::SendWeakRef::from(unload_row.downgrade());
     local_switch_row.connect_active_notify(move |row| {
         let is_active = row.is_active();
-        let _ = shortcut::toggle_local_transcription_setting(&switch_ctx, is_active);
+        if let Err(err) = shortcut::toggle_local_transcription_setting(&switch_ctx, is_active) {
+            switch_ctx.report_error("toggle_local_transcription_setting", err);
+        }
         if let Some(ur) = unload_weak.clone().into_weak_ref().upgrade() {
             ur.set_visible(is_active);
         }
     });
-    group.add(&local_switch_row);
-    crate::ui::pages::track_row(group, &local_switch_row);
-    group.add(&unload_row);
-    crate::ui::pages::track_row(group, &unload_row);
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &local_switch_row);
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &unload_row);
 }
 
 fn populate_acceleration_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
     let settings = ctx.settings();
+    // Real detection snapshot: compiled-in ORT providers, static transcribe
+    // choices, and probed Vulkan GPU devices (cached process-wide).
+    let detected = crate::managers::transcription::get_available_accelerators();
 
-    // Transcribe accelerator
+    // Transcribe accelerator: Auto/CPU always; GPU only when a real Vulkan
+    // device was probed, so GPU cannot be selected on GPU-less machines.
     let accel_row = libadwaita::ComboRow::new();
     accel_row.set_title("Transcription Accelerator");
     accel_row.set_subtitle("Compute backend for transcribe.cpp GGML models");
     let accel_icon = gtk4::Image::from_icon_name("video-display-symbolic");
     accel_row.add_prefix(&accel_icon);
-    let accel_labels = [("auto", "Auto"), ("cpu", "CPU"), ("gpu", "GPU (Vulkan)")];
-    let model = gtk4::StringList::new(
-        &accel_labels
+    let mut accel_ids: Vec<&str> = vec!["auto", "cpu"];
+    let mut accel_labels: Vec<String> = vec!["Auto".to_string(), "CPU".to_string()];
+    let gpu_detected = !detected.gpu_devices.is_empty();
+    if gpu_detected {
+        accel_ids.push("gpu");
+        accel_labels.push("GPU (Vulkan)".to_string());
+    }
+    let saved_accel_id = match settings.transcribe_accelerator {
+        TranscribeAcceleratorSetting::Cpu => "cpu",
+        TranscribeAcceleratorSetting::Gpu => "gpu",
+        _ => "auto",
+    };
+    // A saved GPU choice on a now-GPU-less machine stays visible with a
+    // warning instead of silently switching the semantic.
+    let saved_accel_missing = saved_accel_id == "gpu" && !gpu_detected;
+    if saved_accel_missing {
+        accel_ids.push("gpu");
+        accel_labels.push("GPU (Vulkan, no device detected)".to_string());
+        accel_row.set_subtitle("Saved GPU backend has no device on this machine");
+    }
+    let accel_label_refs: Vec<&str> = accel_labels.iter().map(String::as_str).collect();
+    accel_row.set_model(Some(&gtk4::StringList::new(&accel_label_refs)));
+    accel_row.set_selected(
+        accel_ids
             .iter()
-            .map(|(_, label)| *label)
-            .collect::<Vec<_>>(),
+            .position(|id| *id == saved_accel_id)
+            .unwrap_or(0) as u32,
     );
-    accel_row.set_model(Some(&model));
-    accel_row.set_selected(match settings.transcribe_accelerator {
-        TranscribeAcceleratorSetting::Cpu => 1,
-        TranscribeAcceleratorSetting::Gpu => 2,
-        _ => 0,
-    });
     let ctx1 = ctx.clone();
     accel_row.connect_selected_notify(move |row| {
-        let accel = match row.selected() {
-            1 => TranscribeAcceleratorSetting::Cpu,
-            2 => TranscribeAcceleratorSetting::Gpu,
+        let accel = match accel_ids.get(row.selected() as usize) {
+            Some(&"cpu") => TranscribeAcceleratorSetting::Cpu,
+            Some(&"gpu") => TranscribeAcceleratorSetting::Gpu,
             _ => TranscribeAcceleratorSetting::Auto,
         };
-        let _ = shortcut::change_transcribe_accelerator_setting(&ctx1, accel);
+        if let Err(err) = shortcut::change_transcribe_accelerator_setting(&ctx1, accel) {
+            ctx1.report_error("change_transcribe_accelerator_setting", err);
+        }
     });
     group.add(&accel_row);
 
-    // ONNX accelerator
+    // GPU device picker: visible only when the GPU backend is selected and
+    // more than one device exists (a single device needs no choice).
+    if detected.gpu_devices.len() > 1 {
+        let gpu_row = libadwaita::ComboRow::new();
+        gpu_row.set_title("GPU Device");
+        gpu_row.set_subtitle("Vulkan device for GPU transcription");
+        let gpu_icon = gtk4::Image::from_icon_name("video-display-symbolic");
+        gpu_row.add_prefix(&gpu_icon);
+        let mut device_ids: Vec<String> = vec!["auto".to_string()];
+        let mut device_labels: Vec<String> = vec!["Automatic".to_string()];
+        for device in &detected.gpu_devices {
+            device_ids.push(device.id.clone());
+            device_labels.push(if device.total_vram_mb > 0 {
+                format!(
+                    "{} ({:.1} GiB)",
+                    device.name,
+                    device.total_vram_mb as f64 / 1024.0
+                )
+            } else {
+                device.name.clone()
+            });
+        }
+        let saved_device = settings.transcribe_gpu_device.clone().unwrap_or_default();
+        let saved_device_missing = !saved_device.is_empty() && !device_ids.contains(&saved_device);
+        if saved_device_missing {
+            device_ids.push(saved_device.clone());
+            device_labels.push(format!("{saved_device} (not detected)"));
+        }
+        let device_label_refs: Vec<&str> = device_labels.iter().map(String::as_str).collect();
+        gpu_row.set_model(Some(&gtk4::StringList::new(&device_label_refs)));
+        let saved_device_id = if saved_device.is_empty() {
+            "auto".to_string()
+        } else {
+            saved_device
+        };
+        gpu_row.set_selected(
+            device_ids
+                .iter()
+                .position(|id| *id == saved_device_id)
+                .unwrap_or(0) as u32,
+        );
+        gpu_row.set_visible(matches!(
+            settings.transcribe_accelerator,
+            TranscribeAcceleratorSetting::Gpu
+        ));
+        let gpu_ctx = ctx.clone();
+        gpu_row.connect_selected_notify(move |row| {
+            let id = device_ids
+                .get(row.selected() as usize)
+                .cloned()
+                .unwrap_or_default();
+            let mut s = gpu_ctx.settings();
+            s.transcribe_gpu_device = if id == "auto" { None } else { Some(id.clone()) };
+            gpu_ctx.write_settings(&s);
+            gpu_ctx.notify_setting_changed(
+                "transcribe_gpu_device",
+                serde_json::json!(s.transcribe_gpu_device),
+            );
+        });
+        group.add(&gpu_row);
+    }
+
+    // ONNX accelerator: Auto/CPU always plus exactly the providers compiled
+    // into this binary, so CUDA/ROCm cannot be selected when unsupported.
     let ort_row = libadwaita::ComboRow::new();
     ort_row.set_title("ONNX Accelerator (transcribe-rs)");
     ort_row.set_subtitle("Execution provider for ONNX/Parakeet models");
     let ort_icon = gtk4::Image::from_icon_name("preferences-system-symbolic");
     ort_row.add_prefix(&ort_icon);
-    let ort_labels = [
-        ("auto", "Auto"),
-        ("cpu", "CPU"),
-        ("cuda", "CUDA"),
-        ("rocm", "ROCm"),
-    ];
-    let model = gtk4::StringList::new(
-        &ort_labels
+    fn ort_entry(id: &str) -> Option<(&str, OrtAcceleratorSetting)> {
+        match id {
+            "auto" => Some(("Auto", OrtAcceleratorSetting::Auto)),
+            "cpu" => Some(("CPU", OrtAcceleratorSetting::Cpu)),
+            "cuda" => Some(("CUDA", OrtAcceleratorSetting::Cuda)),
+            "directml" => Some(("DirectML", OrtAcceleratorSetting::DirectMl)),
+            "rocm" => Some(("ROCm", OrtAcceleratorSetting::Rocm)),
+            _ => None,
+        }
+    }
+    let mut ort_ids: Vec<String> = vec!["auto".to_string(), "cpu".to_string()];
+    let mut ort_labels: Vec<String> = vec!["Auto".to_string(), "CPU".to_string()];
+    for id in &detected.ort {
+        if id == "auto" || id == "cpu" {
+            continue;
+        }
+        if let Some((label, _)) = ort_entry(id) {
+            ort_ids.push(id.clone());
+            ort_labels.push(label.to_string());
+        }
+    }
+    let saved_ort_id = match settings.ort_accelerator {
+        OrtAcceleratorSetting::Cpu => "cpu",
+        OrtAcceleratorSetting::Cuda => "cuda",
+        OrtAcceleratorSetting::DirectMl => "directml",
+        OrtAcceleratorSetting::Rocm => "rocm",
+        _ => "auto",
+    };
+    let saved_ort_missing = !ort_ids.iter().any(|id| id == saved_ort_id);
+    if saved_ort_missing {
+        ort_ids.push(saved_ort_id.to_string());
+        let label = ort_entry(saved_ort_id).map(|(l, _)| l).unwrap_or("Unknown");
+        ort_labels.push(format!("{label} (not compiled in)"));
+        ort_row.set_subtitle("Saved provider is not compiled into this build");
+    }
+    let ort_label_refs: Vec<&str> = ort_labels.iter().map(String::as_str).collect();
+    ort_row.set_model(Some(&gtk4::StringList::new(&ort_label_refs)));
+    ort_row.set_selected(
+        ort_ids
             .iter()
-            .map(|(_, label)| *label)
-            .collect::<Vec<_>>(),
+            .position(|id| id == saved_ort_id)
+            .unwrap_or(0) as u32,
     );
-    ort_row.set_model(Some(&model));
-    ort_row.set_selected(match settings.ort_accelerator {
-        OrtAcceleratorSetting::Cpu => 1,
-        OrtAcceleratorSetting::Cuda => 2,
-        OrtAcceleratorSetting::Rocm => 3,
-        _ => 0,
-    });
     let ctx2 = ctx.clone();
     ort_row.connect_selected_notify(move |row| {
-        let accel = match row.selected() {
-            1 => OrtAcceleratorSetting::Cpu,
-            2 => OrtAcceleratorSetting::Cuda,
-            3 => OrtAcceleratorSetting::Rocm,
-            _ => OrtAcceleratorSetting::Auto,
-        };
-        let _ = shortcut::change_ort_accelerator_setting(&ctx2, accel);
+        let accel = ort_ids
+            .get(row.selected() as usize)
+            .and_then(|id| ort_entry(id).map(|(_, setting)| setting))
+            .unwrap_or(OrtAcceleratorSetting::Auto);
+        if let Err(err) = shortcut::change_ort_accelerator_setting(&ctx2, accel) {
+            ctx2.report_error("change_ort_accelerator_setting", err);
+        }
     });
     group.add(&ort_row);
 }
@@ -380,8 +507,12 @@ fn populate_vocab_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) 
     group.add(&word_row);
 }
 
-fn refresh_models_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) {
-    crate::ui::pages::clear_group_rows(group);
+fn refresh_models_group(
+    ctx: &AppContext,
+    group: &libadwaita::PreferencesGroup,
+    rows: &Arc<Mutex<crate::ui::pages::PageGroup>>,
+) {
+    rows.lock().unwrap_or_else(|e| e.into_inner()).clear(group);
 
     let settings = ctx.settings();
     let selected = settings.selected_model;
@@ -409,15 +540,17 @@ fn refresh_models_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) 
             status_row.set_subtitle("A model loads automatically when recording starts");
         }
     }
-    group.add(&status_row);
-    crate::ui::pages::track_row(group, &status_row);
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &status_row);
 
     if models.is_empty() {
         let row = libadwaita::ActionRow::new();
         row.set_title("No models found");
         row.set_subtitle("Check your connection and try again.");
-        group.add(&row);
-        crate::ui::pages::track_row(group, &row);
+        rows.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(group, &row);
         return;
     }
 
@@ -505,7 +638,9 @@ fn refresh_models_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) 
                 let load_ctx = ctx.clone();
                 let id = model.id.clone();
                 load_button.connect_clicked(move |_| {
-                    let _ = model_cmds::switch_active_model(&load_ctx, &id);
+                    if let Err(err) = model_cmds::switch_active_model(&load_ctx, &id) {
+                        load_ctx.report_error("switch_active_model", err);
+                    }
                 });
                 action_slot.append(&load_button);
             }
@@ -522,7 +657,9 @@ fn refresh_models_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) 
                 let ctx = delete_ctx.clone();
                 let id = id.clone();
                 crate::runtime::spawn(async move {
-                    let _ = model_cmds::delete_model(&ctx, id).await;
+                    if let Err(err) = model_cmds::delete_model(&ctx, id).await {
+                        ctx.report_error("delete_model", err);
+                    }
                 });
             });
             row.add_suffix(&delete_button);
@@ -533,29 +670,47 @@ fn refresh_models_group(ctx: &AppContext, group: &libadwaita::PreferencesGroup) 
 
             let download_button = gtk4::Button::new();
             let dl_box = gtk4::Box::new(gtk4::Orientation::Horizontal, 6);
-            let dl_icon = gtk4::Image::from_icon_name("folder-download-symbolic");
-            dl_icon.set_pixel_size(14);
-            dl_box.append(&dl_icon);
-            dl_box.append(&gtk4::Label::new(Some("Download")));
-            download_button.set_child(Some(&dl_box));
-            download_button.add_css_class("suggested-action");
-            download_button.set_valign(gtk4::Align::Center);
-            download_button.set_tooltip_text(Some("Download model"));
-            let dl_ctx = ctx.clone();
-            let id = model.id.clone();
-            download_button.connect_clicked(move |_| {
-                let ctx = dl_ctx.clone();
-                let id = id.clone();
-                crate::runtime::spawn(async move {
-                    let _ = crate::managers::model::download::download_model(&ctx, &id).await;
+            if model.is_downloading {
+                let cancel_icon = gtk4::Image::from_icon_name("process-stop-symbolic");
+                cancel_icon.set_pixel_size(14);
+                dl_box.append(&cancel_icon);
+                dl_box.append(&gtk4::Label::new(Some("Cancel")));
+                download_button.set_child(Some(&dl_box));
+                download_button.set_valign(gtk4::Align::Center);
+                download_button.set_tooltip_text(Some("Cancel model download"));
+                download_button.connect_clicked(move |_| {
+                    crate::managers::model::download::cancel_download();
                 });
-            });
+            } else {
+                let dl_icon = gtk4::Image::from_icon_name("folder-download-symbolic");
+                dl_icon.set_pixel_size(14);
+                dl_box.append(&dl_icon);
+                dl_box.append(&gtk4::Label::new(Some("Download")));
+                download_button.set_child(Some(&dl_box));
+                download_button.add_css_class("suggested-action");
+                download_button.set_valign(gtk4::Align::Center);
+                download_button.set_tooltip_text(Some("Download model"));
+                let dl_ctx = ctx.clone();
+                let id = model.id.clone();
+                download_button.connect_clicked(move |_| {
+                    let ctx = dl_ctx.clone();
+                    let id = id.clone();
+                    crate::runtime::spawn(async move {
+                        if let Err(err) =
+                            crate::managers::model::download::download_model(&ctx, &id).await
+                        {
+                            ctx.report_error("download_model", err);
+                        }
+                    });
+                });
+            }
             action_slot.append(&download_button);
             row.add_suffix(&action_slot);
         }
 
-        group.add(&row);
-        crate::ui::pages::track_row(group, &row);
+        rows.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(group, &row);
     }
 }
 
