@@ -235,13 +235,23 @@ pub(crate) fn apply_settings_migrations(
         updated = true;
     }
 
-    // Upgrade Firecrawl base URL from /v1 to /v2 if present
+    // Upgrade Firecrawl base URL from /v1 to /v2 if present; trim stray
+    // trailing slashes so `normalize_firecrawl_base_url` stays idempotent.
     for wp in &mut settings.web_providers {
         if wp.id == "firecrawl"
             && (wp.base_url == "https://api.firecrawl.dev/v1"
                 || wp.base_url == "https://api.firecrawl.dev")
         {
             wp.base_url = "https://api.firecrawl.dev/v2".to_string();
+            updated = true;
+        }
+        let trimmed = wp.base_url.trim().trim_end_matches('/').to_string();
+        if trimmed != wp.base_url && !trimmed.is_empty() {
+            wp.base_url = trimmed;
+            updated = true;
+        }
+        if wp.timeout_seconds < 5 {
+            wp.timeout_seconds = 60;
             updated = true;
         }
     }

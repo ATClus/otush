@@ -110,7 +110,7 @@ Otush supports both fully private local execution and top-tier cloud APIs:
 | **Mistral AI** | Cloud | Mistral & Voxtral speech and language models |
 | **Cerebras** | Cloud | High-throughput Llama inference |
 | **OpenRouter** | Cloud | Unified access to hundreds of open/proprietary models |
-| **Tavily / Firecrawl** | Cloud | Web search, page scraping, and deep research synthesis |
+| **Tavily / Firecrawl** | Cloud | Web search, page scraping, site mapping/crawling, and deep research synthesis |
 
 ---
 

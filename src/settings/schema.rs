@@ -129,8 +129,12 @@ pub struct LLMPrompt {
 pub const AGENT_TOOL_NAMES: &[&str] = &[
     "tavily_search",
     "tavily_extract",
+    "tavily_crawl",
+    "tavily_map",
     "firecrawl_search",
     "firecrawl_scrape",
+    "firecrawl_map",
+    "firecrawl_crawl",
 ];
 
 /// Default per-tool call budget inside one user turn (each tool may be

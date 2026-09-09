@@ -377,6 +377,7 @@ fn build_agent_editor(
     for tool_name in AGENT_TOOL_NAMES {
         let tool_row = libadwaita::SwitchRow::new();
         tool_row.set_title(tool_name);
+        tool_row.set_subtitle(tool_description(tool_name));
         let enabled =
             agent.enabled_tools.is_empty() || agent.enabled_tools.contains(&tool_name.to_string());
         tool_row.set_active(enabled);
@@ -488,4 +489,19 @@ fn build_agent_editor(
         }
     });
     row.add_row(&topk_row);
+}
+
+/// One-line description for each agent web tool, shown under its toggle.
+fn tool_description(name: &str) -> &str {
+    match name {
+        "tavily_search" => "Tavily web search with recency and domain filters",
+        "tavily_extract" => "Extract article content from explicit URLs (Tavily)",
+        "tavily_crawl" => "Crawl a site from one URL with instructions (Tavily)",
+        "tavily_map" => "List a site's URL graph for discovery (Tavily)",
+        "firecrawl_search" => "Web search with markdown snippets (Firecrawl)",
+        "firecrawl_scrape" => "Scrape one URL into Markdown (Firecrawl)",
+        "firecrawl_map" => "List a site's URLs for discovery (Firecrawl)",
+        "firecrawl_crawl" => "Crawl a site into page markdowns (Firecrawl, slower)",
+        _ => "",
+    }
 }

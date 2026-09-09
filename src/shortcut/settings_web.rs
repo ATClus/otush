@@ -91,11 +91,24 @@ pub async fn test_web_provider_connection(
         .get(&provider_id)
         .cloned()
         .unwrap_or_default();
+    let timeout = crate::web_client::clamp_timeout_secs(provider.timeout_seconds as u64);
 
     match provider.id.as_str() {
-        "tavily" => crate::web_client::tavily_test_connection(&provider.base_url, &api_key).await,
+        "tavily" => {
+            crate::web_client::tavily_test_connection_with_timeout(
+                &provider.base_url,
+                &api_key,
+                timeout,
+            )
+            .await
+        }
         "firecrawl" => {
-            crate::web_client::firecrawl_test_connection(&provider.base_url, &api_key).await
+            crate::web_client::firecrawl_test_connection_with_timeout(
+                &provider.base_url,
+                &api_key,
+                timeout,
+            )
+            .await
         }
         _ => Err(format!("Unknown web provider: {}", provider.id)),
     }

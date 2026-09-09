@@ -289,15 +289,15 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                 .web_providers
                 .iter()
                 .find(|p| p.id == "tavily")
-                .map(|p| p.base_url.clone())
-                .unwrap_or_else(|| "https://api.tavily.com".to_string());
+                .map(|p| (p.base_url.clone(), p.timeout_seconds))
+                .unwrap_or_else(|| ("https://api.tavily.com".to_string(), 60));
 
             let firecrawl_base = settings
                 .web_providers
                 .iter()
                 .find(|p| p.id == "firecrawl")
-                .map(|p| p.base_url.clone())
-                .unwrap_or_else(|| "https://api.firecrawl.dev/v2".to_string());
+                .map(|p| (p.base_url.clone(), p.timeout_seconds))
+                .unwrap_or_else(|| ("https://api.firecrawl.dev/v2".to_string(), 60));
 
             let status_weak = glib::SendWeakRef::from(status.downgrade());
             let spin_weak = glib::SendWeakRef::from(spin.downgrade());
@@ -311,12 +311,18 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                 // 1. Try Tavily first
                 if !tavily_key.trim().is_empty() {
                     let depth = if is_deep { "advanced" } else { "basic" };
-                    match crate::web_client::tavily_search(
-                        &tavily_base,
+                    let timeout = crate::web_client::clamp_timeout_secs(tavily_base.1 as u64);
+                    match crate::web_client::tavily_search_with_options(
+                        &tavily_base.0,
                         &tavily_key,
-                        &query,
-                        depth,
-                        if is_deep { 8 } else { 5 },
+                        &crate::web_client::TavilySearchOptions {
+                            query: query.clone(),
+                            search_depth: Some(depth.to_string()),
+                            max_results: Some(if is_deep { 8 } else { 5 }),
+                            include_answer: Some(true),
+                            ..Default::default()
+                        },
+                        timeout,
                     )
                     .await
                     {
@@ -344,11 +350,16 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
 
                 // 2. If empty and Firecrawl available, try Firecrawl
                 if rendered.is_empty() && !firecrawl_key.trim().is_empty() {
-                    match crate::web_client::firecrawl_search(
-                        &firecrawl_base,
+                    let timeout = crate::web_client::clamp_timeout_secs(firecrawl_base.1 as u64);
+                    match crate::web_client::firecrawl_search_with_options(
+                        &firecrawl_base.0,
                         &firecrawl_key,
-                        &query,
-                        5,
+                        &crate::web_client::FirecrawlSearchOptions {
+                            query: query.clone(),
+                            limit: Some(5),
+                            ..Default::default()
+                        },
+                        timeout,
                     )
                     .await
                     {

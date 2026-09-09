@@ -540,8 +540,8 @@ fn build_and_present_doc_parser(ctx: &AppContext) {
                 .web_providers
                 .iter()
                 .find(|p| p.id == "firecrawl")
-                .map(|p| p.base_url.clone())
-                .unwrap_or_else(|| "https://api.firecrawl.dev/v2".to_string());
+                .map(|p| (p.base_url.clone(), p.timeout_seconds))
+                .unwrap_or_else(|| ("https://api.firecrawl.dev/v2".to_string(), 120));
 
             let filename_str = filename.clone();
             let state_weak = state_ref.clone();
@@ -561,11 +561,13 @@ fn build_and_present_doc_parser(ctx: &AppContext) {
 
                 // 1. Try Firecrawl /parse
                 if !firecrawl_key.trim().is_empty() {
-                    match crate::web_client::firecrawl_parse_document(
-                        &firecrawl_base,
+                    let timeout = crate::web_client::clamp_timeout_secs(firecrawl_base.1 as u64);
+                    match crate::web_client::firecrawl_parse_document_with_timeout(
+                        &firecrawl_base.0,
                         &firecrawl_key,
                         &filename_str,
                         file_bytes.clone(),
+                        timeout.max(std::time::Duration::from_secs(60)),
                     )
                     .await
                     {

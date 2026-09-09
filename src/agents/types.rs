@@ -183,7 +183,15 @@ mod tests {
 
     #[test]
     fn missing_model_is_actionable() {
-        let settings = settings_with_agents();
+        // Providers without a seeded default (e.g. a custom endpoint) still
+        // fail with an actionable message.
+        let mut settings = settings_with_agents();
+        let agent = settings
+            .agents
+            .iter_mut()
+            .find(|a| a.id == "chat-assistant")
+            .expect("seed agent");
+        agent.provider_id = "custom".to_string();
         let err = resolve_agent(&settings, "chat-assistant").expect_err("no model seeded");
         assert!(err.contains("No model configured"), "{err}");
     }
