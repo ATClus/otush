@@ -86,7 +86,13 @@ pub fn ensure_autostart_consistency(ctx: &AppContext) {
             return;
         }
     };
-    let present = path.exists();
+    let present = path.exists() || std::fs::symlink_metadata(&path).is_ok();
+    // `symlink_metadata` catches broken symlinks (`exists` follows links):
+    // GNOME Tweaks (and older app versions) may leave the entry as a link
+    // into `~/.local/share/applications/`, whose target
+    // `ensure_desktop_entry_registered` legitimately deletes on system
+    // installs. A broken link reads as missing/disabled, so it is recreated
+    // as a regular file below instead of being written through.
     let file_enabled = present && read_autostart_file_state(&path).unwrap_or(false);
     match reconcile_decision(wanted, present, file_enabled) {
         ReconcileAction::Refresh => apply_autostart(ctx, true),
@@ -148,6 +154,21 @@ pub fn apply_autostart(_ctx: &AppContext, enabled: bool) {
         );
         if let Some(parent) = path.parent() {
             let _ = std::fs::create_dir_all(parent);
+        }
+        // Never write through a symlink: `std::fs::write` follows links, so
+        // a stale link into `~/.local/share/applications/` (whose target
+        // `ensure_desktop_entry_registered` deletes on system installs)
+        // would resurrect the target as an autostart entry and re-break on
+        // the next launch. Replace any link with a regular file instead.
+        if std::fs::symlink_metadata(&path)
+            .map(|m| m.file_type().is_symlink())
+            .unwrap_or(false)
+        {
+            log::info!(
+                "Replacing symlinked autostart entry at {} with a regular file",
+                path.display()
+            );
+            let _ = std::fs::remove_file(&path);
         }
         std::fs::write(&path, content)
     } else {
@@ -328,5 +349,19 @@ mod tests {
             read_autostart_file_state(&dir.path().join("nope.desktop")),
             None
         );
+    }
+
+    #[test]
+    fn broken_symlink_reads_as_not_present() {
+        // `Path::exists` follows links, so a broken symlink must be probed
+        // via `symlink_metadata` — otherwise the reconciler mistakes it for
+        // a missing file and writes *through* it, resurrecting the target.
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("entry.desktop");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(dir.path().join("gone.desktop"), &path).expect("symlink");
+        assert!(!path.exists());
+        assert!(std::fs::symlink_metadata(&path).is_ok());
+        assert_eq!(read_autostart_file_state(&path), None);
     }
 }
