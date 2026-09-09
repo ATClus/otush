@@ -1,6 +1,6 @@
 [package]
 name = "otush"
-version = "1.9.0"
+version = "2.0.0"
 description = "Otush - the native AI voice and productivity suite for GNOME"
 authors = ["Otush contributors"]
 edition = "2021"
