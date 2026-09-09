@@ -44,40 +44,58 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
     web_group.set_hexpand(true);
     page.add(&web_group);
 
+    // --- 4. Text-to-Speech (TTS) Providers ---
+    let tts_group = libadwaita::PreferencesGroup::new();
+    tts_group.set_widget_name("providers_tts_group");
+    tts_group.set_title("Text-to-Speech (TTS)");
+    tts_group.set_description(Some(
+        "Speech synthesis for Read Aloud (notes, web, docs) and chat answers (Deepgram, OpenAI, Google). The active provider is tried first, then the rest in priority order.",
+    ));
+    tts_group.set_hexpand(true);
+    page.add(&tts_group);
+
     let expanded_llm: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let expanded_stt: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
     let expanded_web: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
+    let expanded_tts: Arc<Mutex<HashSet<String>>> = Arc::new(Mutex::new(HashSet::new()));
 
     // Owned row lists, one per rebuilt group (see `PageGroup`).
     let llm_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
     let stt_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
     let web_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
+    let tts_rows = Arc::new(Mutex::new(crate::ui::pages::PageGroup::new()));
 
     // Initial render
     refresh_llm_providers_group(ctx, &llm_group, &expanded_llm, &llm_rows);
     refresh_stt_providers_group(ctx, &stt_group, &expanded_stt, &stt_rows);
     refresh_web_providers_group(ctx, &web_group, &expanded_web, &web_rows);
+    refresh_tts_providers_group(ctx, &tts_group, &expanded_tts, &tts_rows);
 
     // Live refresh on bus events
     let llm_weak = glib::SendWeakRef::from(llm_group.downgrade());
     let stt_weak = glib::SendWeakRef::from(stt_group.downgrade());
     let web_weak = glib::SendWeakRef::from(web_group.downgrade());
+    let tts_weak = glib::SendWeakRef::from(tts_group.downgrade());
     let ctx_bus = ctx.clone();
     let llm_rows_bus = llm_rows.clone();
     let stt_rows_bus = stt_rows.clone();
     let web_rows_bus = web_rows.clone();
+    let tts_rows_bus = tts_rows.clone();
 
     ctx.bus.subscribe(move |event| {
         let ctx = ctx_bus.clone();
         let llm_weak = llm_weak.clone();
         let stt_weak = stt_weak.clone();
         let web_weak = web_weak.clone();
+        let tts_weak = tts_weak.clone();
         let exp_llm = expanded_llm.clone();
         let exp_stt = expanded_stt.clone();
         let exp_web = expanded_web.clone();
+        let exp_tts = expanded_tts.clone();
         let llm_rows = llm_rows_bus.clone();
         let stt_rows = stt_rows_bus.clone();
         let web_rows = web_rows_bus.clone();
+        let tts_rows = tts_rows_bus.clone();
 
         glib::MainContext::default().invoke(move || {
             if let AppEvent::SettingsChanged { setting, .. } = event {
@@ -100,6 +118,13 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                 {
                     if let Some(grp) = web_weak.into_weak_ref().upgrade() {
                         refresh_web_providers_group(&ctx, &grp, &exp_web, &web_rows);
+                    }
+                } else if setting == "tts_providers_reordered"
+                    || setting == "tts_active_provider"
+                    || setting == "tts_provider_enabled"
+                {
+                    if let Some(grp) = tts_weak.into_weak_ref().upgrade() {
+                        refresh_tts_providers_group(&ctx, &grp, &exp_tts, &tts_rows);
                     }
                 }
             }
@@ -1014,6 +1039,460 @@ fn refresh_web_providers_group(
                             Err(e) => {
                                 r.set_subtitle(&format!(
                                     "<span foreground=\"#e01b24\">✗ Test failed: {}</span>",
+                                    glib::markup_escape_text(&e)
+                                ));
+                            }
+                        }
+                    }
+                });
+            });
+        });
+
+        test_row.add_suffix(&test_btn);
+        row.add_row(&test_row);
+
+        rows.lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .add(group, &row);
+    }
+}
+
+// ============================================================================
+// 4. Text-to-Speech (TTS) Section (Deepgram, OpenAI, Google)
+// ============================================================================
+
+/// Default voice hint shown as subtitle help per provider.
+fn tts_voice_hint(provider_id: &str) -> &'static str {
+    match provider_id {
+        "deepgram" => "Aura-2 voice model, e.g. aura-2-thalia-en",
+        "openai" => "Voice, e.g. alloy, echo, fable, onyx, nova, shimmer",
+        "google" => "Voice name, e.g. pt-BR-Standard-A or en-US-Standard-C",
+        _ => "Voice ID",
+    }
+}
+
+fn refresh_tts_providers_group(
+    ctx: &AppContext,
+    group: &libadwaita::PreferencesGroup,
+    expanded_ids: &Arc<Mutex<HashSet<String>>>,
+    rows: &Arc<Mutex<crate::ui::pages::PageGroup>>,
+) {
+    rows.lock().unwrap_or_else(|e| e.into_inner()).clear(group);
+
+    let settings = settings::get_settings(ctx);
+
+    // 0. Global TTS options summary row.
+    let options_row = libadwaita::ActionRow::new();
+    options_row.set_title("Read Aloud Options");
+    options_row.set_subtitle(&format!(
+        "Speaking rate {:.2}x • {} chars per chunk • auto-read chat {}",
+        settings.effective_tts_speaking_rate(),
+        settings.tts_reader_chunk_chars.max(256),
+        if settings.tts_auto_read_chat {
+            "on"
+        } else {
+            "off"
+        },
+    ));
+    let options_icon = gtk4::Image::from_icon_name("audio-speakers-symbolic");
+    options_row.add_prefix(&options_icon);
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &options_row);
+
+    // Speaking rate slider.
+    let rate_adj = gtk4::Adjustment::new(
+        settings.effective_tts_speaking_rate() as f64,
+        0.5,
+        2.0,
+        0.05,
+        0.25,
+        0.0,
+    );
+    let rate_row = libadwaita::SpinRow::new(Some(&rate_adj), 0.05, 2);
+    rate_row.set_title("Speaking Rate");
+    rate_row.set_subtitle("Voice speed multiplier (0.50x – 2.00x)");
+    let rate_icon = gtk4::Image::from_icon_name("media-playback-start-symbolic");
+    rate_row.add_prefix(&rate_icon);
+    rate_row.set_snap_to_ticks(false);
+    rate_row.set_numeric(true);
+    let rate_ctx = ctx.clone();
+    rate_adj.connect_value_changed(move |adj| {
+        let val = adj.value() as f32;
+        if let Err(err) = shortcut::change_tts_speaking_rate_setting(&rate_ctx, val) {
+            rate_ctx.report_error("change_tts_speaking_rate_setting", err);
+        }
+    });
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &rate_row);
+
+    // Reader chunk size.
+    let chunk_adj = gtk4::Adjustment::new(
+        settings.tts_reader_chunk_chars.max(256) as f64,
+        256.0,
+        5000.0,
+        128.0,
+        512.0,
+        0.0,
+    );
+    let chunk_row = libadwaita::SpinRow::new(Some(&chunk_adj), 128.0, 0);
+    chunk_row.set_title("Reader Chunk Size (characters)");
+    chunk_row.set_subtitle("Long reads are split into chunks of this size");
+    let chunk_icon = gtk4::Image::from_icon_name("format-text-symbolic");
+    chunk_row.add_prefix(&chunk_icon);
+    chunk_row.set_snap_to_ticks(false);
+    chunk_row.set_numeric(true);
+    let chunk_ctx = ctx.clone();
+    chunk_adj.connect_value_changed(move |adj| {
+        let val = adj.value().round() as u32;
+        if let Err(err) = shortcut::change_tts_reader_chunk_chars_setting(&chunk_ctx, val) {
+            chunk_ctx.report_error("change_tts_reader_chunk_chars_setting", err);
+        }
+    });
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &chunk_row);
+
+    // Audio format selector.
+    let format_row = libadwaita::ComboRow::new();
+    format_row.set_title("Audio Format");
+    format_row.set_subtitle("Encoding requested from TTS providers");
+    let format_icon = gtk4::Image::from_icon_name("audio-x-generic-symbolic");
+    format_row.add_prefix(&format_icon);
+    let format_model = gtk4::StringList::new(&["MP3", "WAV"]);
+    format_row.set_model(Some(&format_model));
+    format_row.set_selected(match settings.tts_format {
+        settings::TtsFormat::Mp3 => 0,
+        settings::TtsFormat::Wav => 1,
+    });
+    let format_ctx = ctx.clone();
+    format_row.connect_selected_notify(move |combo| {
+        let format = match combo.selected() {
+            1 => settings::TtsFormat::Wav,
+            _ => settings::TtsFormat::Mp3,
+        };
+        if let Err(err) = shortcut::change_tts_format_setting(&format_ctx, format) {
+            format_ctx.report_error("change_tts_format_setting", err);
+        }
+    });
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &format_row);
+
+    // Auto-read chat answers.
+    let auto_row = libadwaita::SwitchRow::new();
+    auto_row.set_title("Auto-read Chat Answers");
+    auto_row.set_subtitle("Speak assistant replies automatically in the chat overlay");
+    let auto_icon = gtk4::Image::from_icon_name("audio-speakers-symbolic");
+    auto_row.add_prefix(&auto_icon);
+    auto_row.set_active(settings.tts_auto_read_chat);
+    let auto_ctx = ctx.clone();
+    auto_row.connect_active_notify(move |sw| {
+        if let Err(err) = shortcut::change_tts_auto_read_chat_setting(&auto_ctx, sw.is_active()) {
+            auto_ctx.report_error("change_tts_auto_read_chat_setting", err);
+        }
+    });
+    rows.lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .add(group, &auto_row);
+
+    let total_providers = settings.tts_providers.len();
+
+    for (idx, provider) in settings.tts_providers.iter().enumerate() {
+        let row = libadwaita::ExpanderRow::new();
+        let active_mark = if settings.tts_active_provider_id == provider.id {
+            " ★"
+        } else {
+            ""
+        };
+        row.set_title(&format!("#{}: {}{}", idx + 1, provider.label, active_mark));
+        let prov_icon = gtk4::Image::from_icon_name("audio-speakers-symbolic");
+        row.add_prefix(&prov_icon);
+
+        let current_model = settings
+            .tts_models
+            .get(&provider.id)
+            .cloned()
+            .unwrap_or_else(|| provider.model.clone());
+        let current_voice = settings
+            .tts_voices
+            .get(&provider.id)
+            .cloned()
+            .unwrap_or_else(|| provider.voice.clone());
+
+        let voice_display = if current_voice.is_empty() {
+            "(default)"
+        } else {
+            current_voice.as_str()
+        };
+        let model_display = if current_model.is_empty() {
+            "(default)"
+        } else {
+            current_model.as_str()
+        };
+        let subtitle = if provider.allow_base_url_edit {
+            format!(
+                "Voice: {voice_display} • Model: {model_display} • Endpoint: {}",
+                provider.base_url
+            )
+        } else {
+            format!("Voice: {voice_display} • Model: {model_display}")
+        };
+        row.set_subtitle(&subtitle);
+
+        let is_expanded = expanded_ids
+            .lock()
+            .map(|set| set.contains(&provider.id))
+            .unwrap_or(false);
+        row.set_expanded(is_expanded);
+
+        let exp_track = expanded_ids.clone();
+        let exp_pid = provider.id.clone();
+        row.connect_expanded_notify(move |r| {
+            if let Ok(mut set) = exp_track.lock() {
+                if r.is_expanded() {
+                    set.insert(exp_pid.clone());
+                } else {
+                    set.remove(&exp_pid);
+                }
+            }
+        });
+
+        // Priority Move Up button
+        if idx > 0 {
+            let up_btn = gtk4::Button::from_icon_name("go-up-symbolic");
+            up_btn.set_valign(gtk4::Align::Center);
+            up_btn.add_css_class("flat");
+            up_btn.set_tooltip_text(Some("Increase TTS fallback priority"));
+            let up_ctx = ctx.clone();
+            let up_pid = provider.id.clone();
+            up_btn.connect_clicked(move |_| {
+                if let Err(err) = shortcut::move_tts_provider_priority(&up_ctx, &up_pid, true) {
+                    up_ctx.report_error("move_tts_provider_priority", err);
+                }
+            });
+            row.add_suffix(&up_btn);
+        }
+
+        // Priority Move Down button
+        if idx + 1 < total_providers {
+            let down_btn = gtk4::Button::from_icon_name("go-down-symbolic");
+            down_btn.set_valign(gtk4::Align::Center);
+            down_btn.add_css_class("flat");
+            down_btn.set_tooltip_text(Some("Decrease TTS fallback priority"));
+            let down_ctx = ctx.clone();
+            let down_pid = provider.id.clone();
+            down_btn.connect_clicked(move |_| {
+                if let Err(err) = shortcut::move_tts_provider_priority(&down_ctx, &down_pid, false)
+                {
+                    down_ctx.report_error("move_tts_provider_priority", err);
+                }
+            });
+            row.add_suffix(&down_btn);
+        }
+
+        // Enable / Disable switch
+        let enable_switch = gtk4::Switch::new();
+        enable_switch.set_active(provider.enabled);
+        enable_switch.set_valign(gtk4::Align::Center);
+        enable_switch.set_tooltip_text(Some("Enable/disable provider in TTS fallback chain"));
+        let en_ctx = ctx.clone();
+        let en_id = provider.id.clone();
+        enable_switch.connect_active_notify(move |sw| {
+            if let Err(err) =
+                shortcut::toggle_tts_provider_enabled(&en_ctx, en_id.clone(), sw.is_active())
+            {
+                en_ctx.report_error("toggle_tts_provider_enabled", err);
+            }
+        });
+        row.add_suffix(&enable_switch);
+
+        // Set-active button.
+        let active_btn = gtk4::Button::with_label("Set Active");
+        active_btn.set_valign(gtk4::Align::Center);
+        active_btn.set_sensitive(settings.tts_active_provider_id != provider.id);
+        active_btn.set_tooltip_text(Some("Try this provider first for TTS"));
+        let active_ctx = ctx.clone();
+        let active_id = provider.id.clone();
+        active_btn.connect_clicked(move |_| {
+            if let Err(err) = shortcut::set_tts_active_provider(&active_ctx, active_id.clone()) {
+                active_ctx.report_error("set_tts_active_provider", err);
+            }
+        });
+        row.add_suffix(&active_btn);
+
+        // 1. API Key Row (empty = reuse the STT key of the same id).
+        let api_key_row = libadwaita::PasswordEntryRow::new();
+        api_key_row.set_title("API Key");
+        api_key_row.set_tooltip_text(Some(
+            "Empty = reuse the Speech-to-Text key of the same provider",
+        ));
+        let key_icon = gtk4::Image::from_icon_name("dialog-password-symbolic");
+        api_key_row.add_prefix(&key_icon);
+        let api_key = settings
+            .tts_api_keys
+            .get(&provider.id)
+            .cloned()
+            .unwrap_or_default();
+        api_key_row.set_text(&api_key);
+
+        let key_ctx = ctx.clone();
+        let key_id = provider.id.clone();
+        api_key_row.connect_changed(move |r| {
+            if let Err(err) =
+                shortcut::change_tts_api_key_setting(&key_ctx, key_id.clone(), r.text().to_string())
+            {
+                key_ctx.report_error("change_tts_api_key_setting", err);
+            }
+        });
+        row.add_row(&api_key_row);
+
+        // 2. Voice Row (freeform entry with per-provider hint).
+        let voice_row = libadwaita::EntryRow::new();
+        voice_row.set_title("Voice ID");
+        voice_row.set_tooltip_text(Some(tts_voice_hint(&provider.id)));
+        let voice_icon = gtk4::Image::from_icon_name("audio-input-microphone-symbolic");
+        voice_row.add_prefix(&voice_icon);
+        voice_row.set_text(&current_voice);
+
+        let voice_ctx = ctx.clone();
+        let voice_id = provider.id.clone();
+        voice_row.connect_changed(move |r| {
+            if let Err(err) = shortcut::change_tts_voice_setting(
+                &voice_ctx,
+                voice_id.clone(),
+                r.text().to_string(),
+            ) {
+                voice_ctx.report_error("change_tts_voice_setting", err);
+            }
+        });
+        row.add_row(&voice_row);
+
+        // 3. Model Row (freeform entry; Google ignores it).
+        let model_row = libadwaita::EntryRow::new();
+        model_row.set_title("Model ID");
+        if provider.id == "google" {
+            model_row.set_tooltip_text(Some(
+                "Google selects everything via the voice name (unused)",
+            ));
+        }
+        let model_icon = gtk4::Image::from_icon_name("application-x-executable-symbolic");
+        model_row.add_prefix(&model_icon);
+        model_row.set_text(&current_model);
+
+        let model_ctx = ctx.clone();
+        let model_id = provider.id.clone();
+        model_row.connect_changed(move |r| {
+            if let Err(err) = shortcut::change_tts_model_setting(
+                &model_ctx,
+                model_id.clone(),
+                r.text().to_string(),
+            ) {
+                model_ctx.report_error("change_tts_model_setting", err);
+            }
+        });
+        row.add_row(&model_row);
+
+        // 4. Base URL Row (if editable)
+        if provider.allow_base_url_edit {
+            let url_row = libadwaita::EntryRow::new();
+            url_row.set_title("Base URL");
+            let url_icon = gtk4::Image::from_icon_name("network-server-symbolic");
+            url_row.add_prefix(&url_icon);
+            url_row.set_text(&provider.base_url);
+
+            let url_ctx = ctx.clone();
+            let url_id = provider.id.clone();
+            url_row.connect_changed(move |r| {
+                if let Err(err) = shortcut::change_tts_base_url_setting(
+                    &url_ctx,
+                    url_id.clone(),
+                    r.text().to_string(),
+                ) {
+                    url_ctx.report_error("change_tts_base_url_setting", err);
+                }
+            });
+            row.add_row(&url_row);
+        }
+
+        // 5. Request Timeout Row (SpinRow)
+        let timeout_adj = gtk4::Adjustment::new(
+            provider.timeout_seconds.max(10) as f64,
+            10.0,
+            180.0,
+            5.0,
+            15.0,
+            0.0,
+        );
+        let timeout_row = libadwaita::SpinRow::new(Some(&timeout_adj), 5.0, 0);
+        timeout_row.set_title("Request Timeout (seconds)");
+        timeout_row.set_subtitle("Default 30s. Increase for long chapters.");
+        let time_icon = gtk4::Image::from_icon_name("preferences-system-time-symbolic");
+        timeout_row.add_prefix(&time_icon);
+        timeout_row.set_snap_to_ticks(true);
+        timeout_row.set_numeric(true);
+
+        let timeout_ctx = ctx.clone();
+        let timeout_id = provider.id.clone();
+        timeout_adj.connect_value_changed(move |adj| {
+            let val = adj.value().round() as u32;
+            if let Err(err) =
+                shortcut::change_tts_timeout_setting(&timeout_ctx, timeout_id.clone(), val)
+            {
+                timeout_ctx.report_error("change_tts_timeout_setting", err);
+            }
+        });
+        row.add_row(&timeout_row);
+
+        // 6. Test Connection Row
+        let test_row = libadwaita::ActionRow::new();
+        test_row.set_title("Connection Test");
+        test_row.set_subtitle("Synthesize a short sentence to verify API key and voice");
+        let test_icon = gtk4::Image::from_icon_name("network-transmit-receive-symbolic");
+        test_row.add_prefix(&test_icon);
+
+        let test_btn = gtk4::Button::with_label("Test TTS");
+        test_btn.set_valign(gtk4::Align::Center);
+        test_btn.add_css_class("suggested-action");
+
+        let test_ctx = ctx.clone();
+        let test_id = provider.id.clone();
+        let test_row_weak = glib::SendWeakRef::from(test_row.downgrade());
+        let test_btn_weak = glib::SendWeakRef::from(test_btn.downgrade());
+
+        test_btn.connect_clicked(move |_| {
+            if let Some(btn) = test_btn_weak.clone().into_weak_ref().upgrade() {
+                btn.set_sensitive(false);
+                btn.set_label("Testing…");
+            }
+            if let Some(r) = test_row_weak.clone().into_weak_ref().upgrade() {
+                r.set_subtitle("Synthesizing a short test sentence…");
+            }
+
+            let t_ctx = test_ctx.clone();
+            let t_id = test_id.clone();
+            let t_row_weak = test_row_weak.clone();
+            let t_btn_weak = test_btn_weak.clone();
+
+            crate::runtime::spawn(async move {
+                let res = shortcut::test_tts_provider_connection(&t_ctx, t_id).await;
+                glib::MainContext::default().invoke(move || {
+                    if let Some(btn) = t_btn_weak.into_weak_ref().upgrade() {
+                        btn.set_sensitive(true);
+                        btn.set_label("Test TTS");
+                    }
+                    if let Some(r) = t_row_weak.into_weak_ref().upgrade() {
+                        match res {
+                            Ok((bytes, ms)) => {
+                                r.set_subtitle(&format!(
+                                    "<span foreground=\"#2ec27e\">✓ Connected! Synthesized {} bytes in {}ms</span>",
+                                    bytes, ms
+                                ));
+                            }
+                            Err(e) => {
+                                r.set_subtitle(&format!(
+                                    "<span foreground=\"#e01b24\">✗ TTS failed: {}</span>",
                                     glib::markup_escape_text(&e)
                                 ));
                             }

@@ -2,7 +2,7 @@
 
 use super::defaults::{
     ensure_agent_defaults, ensure_post_process_defaults, ensure_transcription_provider_defaults,
-    get_default_settings,
+    ensure_tts_defaults, get_default_settings,
 };
 use super::migrations::{apply_settings_migrations, salvage_settings};
 use super::schema::AppSettings;
@@ -111,6 +111,9 @@ pub fn read_settings_from(path: &std::path::Path) -> AppSettings {
         write_store_at(path, &store_with_settings(&settings));
     }
     if ensure_transcription_provider_defaults(&mut settings) {
+        write_store_at(path, &store_with_settings(&settings));
+    }
+    if ensure_tts_defaults(&mut settings) {
         write_store_at(path, &store_with_settings(&settings));
     }
     if ensure_agent_defaults(&mut settings) {

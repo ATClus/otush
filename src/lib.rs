@@ -31,6 +31,7 @@ pub mod template;
 mod transcription_coordinator;
 mod tray;
 mod tray_i18n;
+pub mod tts_client;
 mod ui;
 mod updater;
 mod utils;

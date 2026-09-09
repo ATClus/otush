@@ -2,7 +2,8 @@
 
 use super::defaults::{
     default_agents, default_post_process_providers, default_transcribe_gpu_device,
-    default_transcription_providers, get_default_settings, CURRENT_SETTINGS_SCHEMA_VERSION,
+    default_transcription_providers, default_tts_providers, ensure_tts_defaults,
+    get_default_settings, CURRENT_SETTINGS_SCHEMA_VERSION,
 };
 use super::schema::*;
 use log::warn;
@@ -88,6 +89,11 @@ pub(crate) fn apply_settings_migrations(
         // transcribe.cpp 0.2 replaced integer registry indices with opaque
         // process-local handles. Clear every old index once.
         settings.transcribe_gpu_device = default_transcribe_gpu_device();
+        updated = true;
+    }
+    if stored_schema_version < 3 {
+        // TTS catalog is new: seed providers/keys/voices for existing stores.
+        ensure_tts_defaults(settings);
         settings.settings_schema_version = CURRENT_SETTINGS_SCHEMA_VERSION;
         updated = true;
     }
@@ -204,6 +210,17 @@ pub(crate) fn apply_settings_migrations(
             settings.post_process_providers.push(default_p);
             updated = true;
         }
+    }
+
+    // Merge any missing default TTS providers
+    for default_p in default_tts_providers() {
+        if !settings.tts_providers.iter().any(|p| p.id == default_p.id) {
+            settings.tts_providers.push(default_p);
+            updated = true;
+        }
+    }
+    if ensure_tts_defaults(settings) {
+        updated = true;
     }
 
     // Initialize web providers if empty

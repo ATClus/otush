@@ -20,6 +20,7 @@ pub mod settings_keyboard;
 pub mod settings_post_process;
 pub mod settings_transcription;
 pub mod settings_tray;
+pub mod settings_tts;
 pub mod settings_web;
 
 /// Initialize shortcuts using XDG Desktop Portal and Direct Evdev Keyboard Listener
@@ -98,6 +99,14 @@ pub use settings_transcription::{
     change_transcription_model_setting, change_transcription_timeout_setting,
     move_transcription_provider_priority, test_transcription_provider_connection,
     toggle_transcription_provider_enabled, update_deepgram_config,
+};
+
+pub use settings_tts::{
+    change_tts_api_key_setting, change_tts_auto_read_chat_setting, change_tts_base_url_setting,
+    change_tts_format_setting, change_tts_model_setting, change_tts_reader_chunk_chars_setting,
+    change_tts_speaking_rate_setting, change_tts_timeout_setting, change_tts_voice_setting,
+    move_tts_provider_priority, set_tts_active_provider, test_tts_provider_connection,
+    toggle_tts_provider_enabled,
 };
 
 pub use settings_web::{

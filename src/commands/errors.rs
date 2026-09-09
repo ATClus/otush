@@ -148,6 +148,14 @@ pub enum CommandError {
     /// A tool's network call failed or timed out.
     #[error("{0}")]
     ToolFailed(String),
+
+    /// TTS synthesis or playback failed.
+    #[error("Text-to-speech failed: {0}")]
+    Tts(String),
+
+    /// There is nothing speakable in the requested text.
+    #[error("Nothing to read: the text is empty")]
+    TtsNothingToRead,
 }
 
 impl CommandError {

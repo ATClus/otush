@@ -10,7 +10,7 @@ pub(crate) fn default_model() -> String {
     "".to_string()
 }
 
-pub(crate) const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 2;
+pub(crate) const CURRENT_SETTINGS_SCHEMA_VERSION: u32 = 3;
 
 pub(crate) fn default_settings_schema_version() -> u32 {
     CURRENT_SETTINGS_SCHEMA_VERSION
@@ -466,6 +466,186 @@ pub fn default_transcription_models() -> HashMap<String, String> {
     map
 }
 
+/// Default TTS voice per provider id (free-form string the user may edit).
+pub fn default_tts_voice_for_provider(provider_id: &str) -> String {
+    match provider_id {
+        "deepgram" => "aura-2-thalia-en".to_string(),
+        "openai" => "alloy".to_string(),
+        "google" => "pt-BR-Standard-A".to_string(),
+        _ => String::new(),
+    }
+}
+
+/// Default TTS model per provider id.
+pub fn default_tts_model_for_provider(provider_id: &str) -> String {
+    match provider_id {
+        // Deepgram selects the voice via the `model` query param; keep the
+        // struct `model` field in sync with the voice default.
+        "deepgram" => "aura-2-thalia-en".to_string(),
+        "openai" => "tts-1".to_string(),
+        // Google has no model id (voice name selects everything); keep empty.
+        _ => String::new(),
+    }
+}
+
+pub fn default_tts_providers() -> Vec<TtsProvider> {
+    vec![
+        TtsProvider {
+            id: "deepgram".to_string(),
+            label: "Deepgram".to_string(),
+            base_url: "https://api.deepgram.com/v1".to_string(),
+            model: default_tts_model_for_provider("deepgram"),
+            voice: default_tts_voice_for_provider("deepgram"),
+            enabled: true,
+            allow_base_url_edit: false,
+            timeout_seconds: 30,
+            custom_headers: HashMap::new(),
+        },
+        TtsProvider {
+            id: "openai".to_string(),
+            label: "OpenAI".to_string(),
+            base_url: "https://api.openai.com/v1".to_string(),
+            model: default_tts_model_for_provider("openai"),
+            voice: default_tts_voice_for_provider("openai"),
+            enabled: true,
+            allow_base_url_edit: false,
+            timeout_seconds: 30,
+            custom_headers: HashMap::new(),
+        },
+        TtsProvider {
+            id: "google".to_string(),
+            label: "Google".to_string(),
+            base_url: "https://texttospeech.googleapis.com/v1".to_string(),
+            model: default_tts_model_for_provider("google"),
+            voice: default_tts_voice_for_provider("google"),
+            enabled: true,
+            allow_base_url_edit: false,
+            timeout_seconds: 30,
+            custom_headers: HashMap::new(),
+        },
+    ]
+}
+
+pub fn default_tts_api_keys() -> SecretMap {
+    let mut map = HashMap::new();
+    for provider in default_tts_providers() {
+        map.insert(provider.id, String::new());
+    }
+    SecretMap(map)
+}
+
+pub fn default_tts_models() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for provider in default_tts_providers() {
+        map.insert(provider.id.clone(), provider.model.clone());
+    }
+    map
+}
+
+pub fn default_tts_voices() -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for provider in default_tts_providers() {
+        map.insert(provider.id.clone(), provider.voice.clone());
+    }
+    map
+}
+
+pub(crate) fn default_tts_active_provider_id() -> String {
+    "deepgram".to_string()
+}
+
+pub(crate) fn default_tts_speaking_rate() -> f32 {
+    1.0
+}
+
+pub(crate) fn default_tts_reader_chunk_chars() -> u32 {
+    1500
+}
+
+/// Merge missing TTS defaults into an existing store (idempotent).
+pub(crate) fn ensure_tts_defaults(settings: &mut AppSettings) -> bool {
+    let mut changed = false;
+    for provider in default_tts_providers() {
+        match settings
+            .tts_providers
+            .iter_mut()
+            .find(|p| p.id == provider.id)
+        {
+            Some(existing) => {
+                if existing.label != provider.label {
+                    existing.label = provider.label.clone();
+                    changed = true;
+                }
+            }
+            None => {
+                settings.tts_providers.push(provider.clone());
+                changed = true;
+            }
+        }
+
+        if !settings.tts_api_keys.contains_key(&provider.id) {
+            settings
+                .tts_api_keys
+                .insert(provider.id.clone(), String::new());
+            changed = true;
+        }
+
+        let default_model = default_tts_model_for_provider(&provider.id);
+        match settings.tts_models.get_mut(&provider.id) {
+            Some(existing) => {
+                if existing.is_empty() && !default_model.is_empty() {
+                    *existing = default_model.clone();
+                    changed = true;
+                }
+            }
+            None => {
+                settings
+                    .tts_models
+                    .insert(provider.id.clone(), default_model);
+                changed = true;
+            }
+        }
+
+        let default_voice = default_tts_voice_for_provider(&provider.id);
+        match settings.tts_voices.get_mut(&provider.id) {
+            Some(existing) => {
+                if existing.is_empty() && !default_voice.is_empty() {
+                    *existing = default_voice.clone();
+                    changed = true;
+                }
+            }
+            None => {
+                settings
+                    .tts_voices
+                    .insert(provider.id.clone(), default_voice);
+                changed = true;
+            }
+        }
+    }
+
+    if settings.tts_active_provider_id.trim().is_empty()
+        || !settings
+            .tts_providers
+            .iter()
+            .any(|p| p.id == settings.tts_active_provider_id)
+    {
+        settings.tts_active_provider_id = default_tts_active_provider_id();
+        changed = true;
+    }
+
+    if !(0.5..=2.0).contains(&settings.tts_speaking_rate) {
+        settings.tts_speaking_rate = default_tts_speaking_rate();
+        changed = true;
+    }
+
+    if settings.tts_reader_chunk_chars == 0 {
+        settings.tts_reader_chunk_chars = default_tts_reader_chunk_chars();
+        changed = true;
+    }
+
+    changed
+}
+
 pub(crate) fn default_post_process_api_keys() -> SecretMap {
     let mut map = HashMap::new();
     for provider in default_post_process_providers() {
@@ -881,6 +1061,31 @@ pub fn get_default_settings() -> AppSettings {
         },
     );
 
+    // TTS is a playback action, not an overlay: it speaks the focused
+    // readable text (note under cursor / open research findings) and stops
+    // on demand. No binding conflicts with the existing map above.
+    bindings.insert(
+        "read_aloud".to_string(),
+        ShortcutBinding {
+            id: "read_aloud".to_string(),
+            name: "Read Aloud (TTS)".to_string(),
+            description: "Reads the current note or research findings aloud.".to_string(),
+            default_binding: "ctrl+alt+r".to_string(),
+            current_binding: "ctrl+alt+r".to_string(),
+        },
+    );
+
+    bindings.insert(
+        "stop_speaking".to_string(),
+        ShortcutBinding {
+            id: "stop_speaking".to_string(),
+            name: "Stop Speaking (TTS)".to_string(),
+            description: "Stops any in-progress text-to-speech playback.".to_string(),
+            default_binding: "ctrl+alt+x".to_string(),
+            current_binding: "ctrl+alt+x".to_string(),
+        },
+    );
+
     AppSettings {
         settings_schema_version: default_settings_schema_version(),
         bindings,
@@ -920,6 +1125,15 @@ pub fn get_default_settings() -> AppSettings {
         transcription_providers: default_transcription_providers(),
         transcription_api_keys: default_transcription_api_keys(),
         transcription_models: default_transcription_models(),
+        tts_providers: default_tts_providers(),
+        tts_api_keys: default_tts_api_keys(),
+        tts_models: default_tts_models(),
+        tts_voices: default_tts_voices(),
+        tts_active_provider_id: default_tts_active_provider_id(),
+        tts_speaking_rate: default_tts_speaking_rate(),
+        tts_format: TtsFormat::default(),
+        tts_auto_read_chat: false,
+        tts_reader_chunk_chars: default_tts_reader_chunk_chars(),
         post_process_enabled: default_post_process_enabled(),
         post_process_provider_id: default_post_process_provider_id(),
         post_process_providers: default_post_process_providers(),

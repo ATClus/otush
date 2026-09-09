@@ -261,6 +261,10 @@ pub fn build(ctx: &AppContext) -> gtk4::Widget {
                     let copy_btn = create_copy_button(&ctx, &note.content);
                     row.add_suffix(&copy_btn);
 
+                    // Read aloud button (TTS reader mode)
+                    let read_btn = crate::ui::tts_controls::read_aloud_button(&ctx, &note.content);
+                    row.add_suffix(&read_btn);
+
                     // Delete button
                     let del_btn = gtk4::Button::from_icon_name("user-trash-symbolic");
                     del_btn.set_tooltip_text(Some("Delete note"));

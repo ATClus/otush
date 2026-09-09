@@ -125,6 +125,77 @@ impl ShortcutAction for DocParserAction {
     fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
 }
 
+/// Read Aloud (TTS): speak the currently selected text when there is
+/// something readable. Uses the primary selection first and falls back to
+/// Ctrl+C + clipboard (same as Transform Selection), so plain highlighting
+/// without Ctrl+C already works on Wayland/X11.
+#[derive(Debug)]
+pub struct ReadAloudAction;
+
+impl ShortcutAction for ReadAloudAction {
+    fn start(&self, ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {
+        use crate::context::TtsSource;
+        log::info!("ReadAloudAction triggered");
+        if crate::commands::tts::is_speaking() {
+            crate::commands::tts::stop_speaking(ctx, TtsSource::Reader);
+            return;
+        }
+        let ctx = ctx.clone();
+        crate::runtime::spawn(async move {
+            // `capture_selected_text` blocks (~60ms + key synthesis), so run
+            // it on the blocking pool, then synthesize on the async runtime.
+            let captured =
+                crate::runtime::spawn_blocking(crate::clipboard::capture_selected_text).await;
+            let text = match captured {
+                Ok(Ok(text)) => text,
+                Ok(Err(e)) => {
+                    ctx.report_error("read_aloud", crate::commands::errors::CommandError::Tts(e));
+                    return;
+                }
+                Err(e) => {
+                    ctx.report_error(
+                        "read_aloud",
+                        crate::commands::errors::CommandError::Tts(format!(
+                            "Selection capture task failed: {e}"
+                        )),
+                    );
+                    return;
+                }
+            };
+            log::debug!(
+                "ReadAloud captured {} chars for speech",
+                text.chars().count()
+            );
+            if crate::commands::tts::speakable_text(&text).is_empty() {
+                ctx.report_error(
+                    "read_aloud",
+                    crate::commands::errors::CommandError::TtsNothingToRead,
+                );
+                return;
+            }
+            if let Err(e) = crate::commands::tts::speak_text(&ctx, text).await {
+                ctx.report_error("read_aloud", e);
+            }
+        });
+    }
+
+    fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
+}
+
+/// Stop Speaking (TTS): halt any in-progress synthesis/playback.
+#[derive(Debug)]
+pub struct StopSpeakingAction;
+
+impl ShortcutAction for StopSpeakingAction {
+    fn start(&self, ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {
+        log::info!("StopSpeakingAction triggered");
+        crate::commands::tts::stop_speaking(ctx, crate::context::TtsSource::Reader);
+        crate::commands::tts::stop_speaking(ctx, crate::context::TtsSource::Chat);
+    }
+
+    fn stop(&self, _ctx: &AppContext, _binding_id: &str, _shortcut_str: &str) {}
+}
+
 // Static Action Map
 
 pub static ACTION_MAP: LazyLock<HashMap<String, Arc<dyn ShortcutAction>>> = LazyLock::new(|| {
@@ -174,6 +245,14 @@ pub static ACTION_MAP: LazyLock<HashMap<String, Arc<dyn ShortcutAction>>> = Lazy
     map.insert(
         "doc_parser".to_string(),
         Arc::new(DocParserAction) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "read_aloud".to_string(),
+        Arc::new(ReadAloudAction) as Arc<dyn ShortcutAction>,
+    );
+    map.insert(
+        "stop_speaking".to_string(),
+        Arc::new(StopSpeakingAction) as Arc<dyn ShortcutAction>,
     );
     map.insert(
         "cancel".to_string(),

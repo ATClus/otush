@@ -16,8 +16,8 @@ pub use schema::{
     KeyboardImplementation, LLMPrompt, LogLevel, ModelUnloadTimeout, OrtAcceleratorSetting,
     OverlayPosition, OverlayStyle, PasteMethod, PostProcessProvider, ProviderReasoningConfig,
     ReasoningEffort, RecordingRetentionPeriod, ShortcutBinding, SoundTheme, Theme,
-    TranscribeAcceleratorSetting, TranscriptionProvider, TrayTheme, TypingTool, VadBackend,
-    AGENT_TOOL_NAMES,
+    TranscribeAcceleratorSetting, TranscriptionProvider, TrayTheme, TtsFormat, TtsProvider,
+    TypingTool, VadBackend, AGENT_TOOL_NAMES,
 };
 pub use store::{
     get_settings, read_settings_from, write_settings, write_settings_to, SETTINGS_STORE_PATH,
@@ -467,6 +467,73 @@ mod tests {
             settings.transcribe_gpu_device.as_deref(),
             Some("[\"vulkan\",\"id\",\"0000:01:00.0\"]")
         );
+    }
+
+    #[test]
+    fn test_default_bindings_include_tts() {
+        let defaults = get_default_settings();
+        assert!(defaults.bindings.contains_key("read_aloud"));
+        assert!(defaults.bindings.contains_key("stop_speaking"));
+        assert_eq!(
+            defaults.bindings["read_aloud"].current_binding,
+            "ctrl+alt+r"
+        );
+        assert_eq!(
+            defaults.bindings["stop_speaking"].current_binding,
+            "ctrl+alt+x"
+        );
+        assert!(crate::actions::ACTION_MAP.contains_key("read_aloud"));
+        assert!(crate::actions::ACTION_MAP.contains_key("stop_speaking"));
+    }
+
+    #[test]
+    fn tts_migration_seeds_catalog_for_pre_tts_store() {
+        // A v2 store (no TTS keys at all) must parse via serde defaults, then
+        // migrate to schema 3 with a seeded 3-provider catalog.
+        let raw = serde_json::json!({
+            "settings_schema_version": 2,
+            "selected_model": "",
+        });
+        let mut settings: AppSettings =
+            serde_json::from_value(raw.clone()).expect("v2 store parses with defaults");
+        assert_eq!(settings.tts_providers.len(), 3);
+        assert!(apply_settings_migrations(&mut settings, &raw));
+        assert_eq!(
+            settings.settings_schema_version,
+            CURRENT_SETTINGS_SCHEMA_VERSION
+        );
+        assert_eq!(settings.tts_providers.len(), 3);
+        assert_eq!(settings.tts_active_provider_id, "deepgram");
+        assert_eq!(settings.tts_speaking_rate, 1.0);
+        assert_eq!(settings.tts_reader_chunk_chars, 1500);
+    }
+
+    #[test]
+    fn tts_salvage_keeps_valid_fields_when_voice_is_wrong_type() {
+        let mut stored = default_settings_json();
+        let map = stored.as_object_mut().unwrap();
+        map.insert("tts_voices".into(), serde_json::json!({ "deepgram": 42 }));
+        map.insert("tts_active_provider_id".into(), serde_json::json!("openai"));
+
+        assert!(serde_json::from_value::<AppSettings>(stored.clone()).is_err());
+
+        let salvaged = salvage_settings(&stored);
+        assert_eq!(salvaged.tts_active_provider_id, "openai");
+        assert_eq!(
+            salvaged.tts_voices.get("deepgram").map(String::as_str),
+            Some("aura-2-thalia-en")
+        );
+    }
+
+    #[test]
+    fn debug_output_redacts_tts_api_keys() {
+        let mut settings = get_default_settings();
+        settings
+            .tts_api_keys
+            .insert("deepgram".to_string(), "tts-secret-key".to_string());
+        let debug_output = format!("{:?}", settings);
+        assert!(!debug_output.contains("tts-secret-key"));
+        assert!(debug_output.contains("[REDACTED]"));
     }
 
     #[test]

@@ -99,6 +99,43 @@ pub struct AgentMessageEvent {
     pub tool_name: Option<String>,
 }
 
+/// Which TTS speak mode produced the audio: long-form reading (notes, web,
+/// docs) or short chat answers.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+pub enum TtsSource {
+    Reader,
+    Chat,
+}
+
+/// Playback state of the TTS engine, surfaced to the UI (mini-player, chat
+/// speaker buttons).
+#[derive(Clone, Debug)]
+pub enum TtsState {
+    /// Synthesis/playback started for `total` chunks.
+    Started {
+        total: usize,
+        source: TtsSource,
+    },
+    /// Chunk `done` of `total` finished (1-based `done`).
+    ChunkProgress {
+        done: usize,
+        total: usize,
+        source: TtsSource,
+    },
+    Paused {
+        source: TtsSource,
+    },
+    Resumed {
+        source: TtsSource,
+    },
+    Stopped {
+        source: TtsSource,
+    },
+    Error {
+        source: TtsSource,
+        message: String,
+    },
+}
 /// One backend → UI event. The GTK shell subscribes via [`EventBus::subscribe`].
 #[derive(Clone, Debug)]
 pub enum AppEvent {
@@ -124,6 +161,8 @@ pub enum AppEvent {
     RecordingError(RecordingErrorEvent),
     /// Mic level for the overlay level meter (throttled).
     MicLevel(f32),
+    /// TTS playback state (reader mini-player, chat speaker buttons).
+    TtsStateChanged(TtsState),
     ShowOverlay,
     HideOverlay,
     // --- clipboard / paste ---

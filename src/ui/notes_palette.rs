@@ -216,6 +216,12 @@ fn build_and_present_notes_palette(ctx: &AppContext) {
     copy_btn.add_css_class("flat");
     header_bar.pack_end(&copy_btn);
 
+    // Read Aloud Button (TTS reader mode: speaks the editor buffer)
+    let read_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
+    read_btn.set_tooltip_text(Some("Read note aloud"));
+    read_btn.add_css_class("flat");
+    header_bar.pack_end(&read_btn);
+
     // Star / Pin Button
     let pin_btn = gtk4::Button::from_icon_name("non-starred-symbolic");
     pin_btn.set_tooltip_text(Some("Pin note"));
@@ -329,6 +335,21 @@ fn build_and_present_notes_palette(ctx: &AppContext) {
     // State and Auto-Save Implementation
     // ========================================================================
     let buffer = text_view.buffer();
+
+    // Reader mini-player (TTS): play/pause + stop + chunk progress over the
+    // editor buffer. Placed under the status bar so it never covers text.
+    {
+        let buf_player = buffer.clone();
+        let player = crate::ui::tts_controls::reader_mini_player(ctx, move || {
+            let (start, end) = buf_player.bounds();
+            buf_player.text(&start, &end, true).to_string()
+        });
+        player.set_margin_start(16);
+        player.set_margin_end(16);
+        player.set_margin_top(2);
+        player.set_margin_bottom(6);
+        editor_box.append(&player);
+    }
     let suppress_changed = Rc::new(Cell::new(false));
     let state = Rc::new(RefCell::new(NoteSessionState {
         current_id: None,
@@ -788,6 +809,88 @@ fn build_and_present_notes_palette(ctx: &AppContext) {
         });
     }
 
+    // Read Aloud Action (TTS reader mode over the editor buffer)
+    {
+        let ctx_read = ctx.clone();
+        let buf_read = buffer.clone();
+        let toast_read = toast_overlay.clone();
+        let read_btn_weak = glib::SendWeakRef::from(read_btn.downgrade());
+        read_btn.connect_clicked(move |_| {
+            use crate::context::TtsSource;
+            if crate::commands::tts::is_speaking() {
+                crate::commands::tts::stop_speaking(&ctx_read, TtsSource::Reader);
+                return;
+            }
+            let (start, end) = buf_read.bounds();
+            let content = buf_read.text(&start, &end, true).to_string();
+            if crate::commands::tts::speakable_text(&content).is_empty() {
+                toast_read.add_toast(libadwaita::Toast::new("Nothing to read"));
+                return;
+            }
+            let ctx = ctx_read.clone();
+            let toast_weak = glib::SendWeakRef::from(toast_read.downgrade());
+            let btn_weak = read_btn_weak.clone();
+            crate::runtime::spawn(async move {
+                if let Err(e) = crate::commands::tts::speak_text(&ctx, content).await {
+                    let message = e.to_string();
+                    glib::MainContext::default().invoke(move || {
+                        if let Some(toast) = toast_weak.into_weak_ref().upgrade() {
+                            toast.add_toast(libadwaita::Toast::new(message.as_str()));
+                        }
+                        if let Some(btn) = btn_weak.into_weak_ref().upgrade() {
+                            btn.set_icon_name("media-playback-start-symbolic");
+                        }
+                    });
+                    ctx.report_error("read_aloud", e);
+                }
+            });
+        });
+        // Flip icon while the reader speaks.
+        let read_weak_bus = glib::SendWeakRef::from(read_btn.downgrade());
+        let read_sub = ctx.bus.subscribe(move |event| {
+            if let crate::context::AppEvent::TtsStateChanged(state) = event {
+                let for_reader = matches!(
+                    state,
+                    crate::context::TtsState::Started { source, .. }
+                        | crate::context::TtsState::ChunkProgress { source, .. }
+                        | crate::context::TtsState::Paused { source }
+                        | crate::context::TtsState::Resumed { source, .. }
+                        | crate::context::TtsState::Stopped { source }
+                        | crate::context::TtsState::Error { source, .. }
+                    if source == crate::context::TtsSource::Reader
+                );
+                if !for_reader {
+                    return;
+                }
+                let speaking = matches!(
+                    state,
+                    crate::context::TtsState::Started { .. }
+                        | crate::context::TtsState::ChunkProgress { .. }
+                        | crate::context::TtsState::Resumed { .. }
+                );
+                let read_weak_bus = read_weak_bus.clone();
+                glib::MainContext::default().invoke(move || {
+                    if let Some(btn) = read_weak_bus.into_weak_ref().upgrade() {
+                        btn.set_icon_name(if speaking {
+                            "media-playback-stop-symbolic"
+                        } else {
+                            "media-playback-start-symbolic"
+                        });
+                    }
+                });
+            }
+        });
+        let sub_holder = std::sync::Arc::new(std::sync::Mutex::new(Some(read_sub)));
+        window.connect_destroy(move |_| {
+            if let Some(sub) = sub_holder.lock().unwrap_or_else(|e| e.into_inner()).take() {
+                sub.unsubscribe();
+            }
+            if let Ok(mut guard) = NOTE_WINDOW.lock() {
+                *guard = None;
+            }
+        });
+    }
+
     // Delete Note Action
     {
         let ctx_del = ctx.clone();
@@ -867,6 +970,8 @@ fn build_and_present_notes_palette(ctx: &AppContext) {
     });
 
     window.connect_destroy(|_| {
+        // NOTE: the Read Aloud subscription is unsubscribed by its own
+        // `window.connect_destroy` holder above; this only clears the window.
         if let Ok(mut guard) = NOTE_WINDOW.lock() {
             *guard = None;
         }

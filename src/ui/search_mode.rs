@@ -72,6 +72,13 @@ pub fn build_search_mode(
     copy_btn.set_sensitive(false);
     header_bar.pack_end(&copy_btn);
 
+    // Read Aloud Button (Right): speaks the research findings (TTS reader).
+    let read_btn = gtk4::Button::from_icon_name("media-playback-start-symbolic");
+    read_btn.set_tooltip_text(Some("Read findings aloud"));
+    read_btn.add_css_class("flat");
+    read_btn.set_sensitive(false);
+    header_bar.pack_end(&read_btn);
+
     // Save as Note Button (Right)
     let save_note_btn = gtk4::Button::from_icon_name("document-new-symbolic");
     save_note_btn.set_tooltip_text(Some("Save to Quick Notes (Ctrl+S)"));
@@ -232,6 +239,7 @@ pub fn build_search_mode(
         let p_bar = progress_bar.clone();
         let c_btn = copy_btn.clone();
         let s_note_btn = save_note_btn.clone();
+        let read_btn_ref = read_btn.clone();
         let toast_ref = toast_overlay.clone();
         let state_ref = research_state.clone();
 
@@ -258,6 +266,7 @@ pub fn build_search_mode(
                 st_stack.set_visible_child_name("no_providers");
                 c_btn.set_sensitive(false);
                 s_note_btn.set_sensitive(false);
+                read_btn_ref.set_sensitive(false);
                 w_title.set_subtitle("Providers Unconfigured");
                 return;
             }
@@ -303,6 +312,7 @@ pub fn build_search_mode(
             let r_box_weak = glib::SendWeakRef::from(r_box.downgrade());
             let c_btn_weak = glib::SendWeakRef::from(c_btn.downgrade());
             let s_note_weak = glib::SendWeakRef::from(s_note_btn.downgrade());
+            let read_weak = glib::SendWeakRef::from(read_btn_ref.downgrade());
             let toast_weak = glib::SendWeakRef::from(toast_ref.downgrade());
 
             crate::runtime::spawn(async move {
@@ -412,6 +422,9 @@ pub fn build_search_mode(
                         if let Some(sb) = s_note_weak.into_weak_ref().upgrade() {
                             sb.set_sensitive(false);
                         }
+                        if let Some(rb) = read_weak.clone().into_weak_ref().upgrade() {
+                            rb.set_sensitive(false);
+                        }
                         return;
                     }
 
@@ -430,6 +443,9 @@ pub fn build_search_mode(
                     }
                     if let Some(sb) = s_note_weak.into_weak_ref().upgrade() {
                         sb.set_sensitive(true);
+                    }
+                    if let Some(rb) = read_weak.into_weak_ref().upgrade() {
+                        rb.set_sensitive(true);
                     }
 
                     if let Some(wt) = w_title_weak.into_weak_ref().upgrade() {
@@ -621,6 +637,7 @@ pub fn build_search_mode(
     let st_stack_clear = stack.clone();
     let c_btn_clear = copy_btn.clone();
     let s_note_clear = save_note_btn.clone();
+    let read_clear = read_btn.clone();
     let w_title_clear = window_title.clone();
     let state_clear = research_state.clone();
     clear_btn.connect_clicked(move |_| {
@@ -628,6 +645,7 @@ pub fn build_search_mode(
         st_stack_clear.set_visible_child_name("welcome");
         c_btn_clear.set_sensitive(false);
         s_note_clear.set_sensitive(false);
+        read_clear.set_sensitive(false);
         w_title_clear.set_subtitle("Tavily & Firecrawl Intelligence");
         if let Ok(mut st) = state_clear.lock() {
             *st = ResearchState::default();
@@ -652,6 +670,84 @@ pub fn build_search_mode(
             ));
         }
     });
+
+    // Wire Read Aloud Button (TTS reader over the findings markdown)
+    {
+        let ctx_read = ctx.clone();
+        let toast_read = toast_overlay.clone();
+        let state_read = research_state.clone();
+        let read_weak = glib::SendWeakRef::from(read_btn.downgrade());
+        read_btn.connect_clicked(move |_| {
+            use crate::context::TtsSource;
+            if crate::commands::tts::is_speaking() {
+                crate::commands::tts::stop_speaking(&ctx_read, TtsSource::Reader);
+                return;
+            }
+            let md = state_read
+                .lock()
+                .map(|st| st.full_markdown.clone())
+                .unwrap_or_default();
+            if crate::commands::tts::speakable_text(&md).is_empty() {
+                toast_read.add_toast(libadwaita::Toast::new("Nothing to read"));
+                return;
+            }
+            let ctx = ctx_read.clone();
+            let toast_weak = glib::SendWeakRef::from(toast_read.downgrade());
+            crate::runtime::spawn(async move {
+                if let Err(e) = crate::commands::tts::speak_text(&ctx, md).await {
+                    let message = e.to_string();
+                    glib::MainContext::default().invoke(move || {
+                        if let Some(toast) = toast_weak.into_weak_ref().upgrade() {
+                            toast.add_toast(libadwaita::Toast::new(message.as_str()));
+                        }
+                    });
+                    ctx.report_error("read_aloud", e);
+                }
+            });
+        });
+        // Flip icon while the reader speaks.
+        let read_weak_bus = glib::SendWeakRef::from(read_btn.downgrade());
+        ctx.bus.subscribe(move |event| {
+            if let crate::context::AppEvent::TtsStateChanged(state) = event {
+                let for_reader = matches!(
+                    state,
+                    crate::context::TtsState::Started { source, .. }
+                        | crate::context::TtsState::ChunkProgress { source, .. }
+                        | crate::context::TtsState::Paused { source }
+                        | crate::context::TtsState::Resumed { source, .. }
+                        | crate::context::TtsState::Stopped { source }
+                        | crate::context::TtsState::Error { source, .. }
+                    if source == crate::context::TtsSource::Reader
+                );
+                if !for_reader {
+                    return;
+                }
+                let speaking = matches!(
+                    state,
+                    crate::context::TtsState::Started { .. }
+                        | crate::context::TtsState::ChunkProgress { .. }
+                        | crate::context::TtsState::Resumed { .. }
+                );
+                let read_weak_bus = read_weak_bus.clone();
+                let read_weak = read_weak.clone();
+                glib::MainContext::default().invoke(move || {
+                    if let Some(btn) = read_weak_bus.into_weak_ref().upgrade() {
+                        btn.set_icon_name(if speaking {
+                            "media-playback-stop-symbolic"
+                        } else {
+                            "media-playback-start-symbolic"
+                        });
+                    }
+                    // Keep the button enabled while speaking so it can stop.
+                    if speaking {
+                        if let Some(btn) = read_weak.into_weak_ref().upgrade() {
+                            btn.set_sensitive(true);
+                        }
+                    }
+                });
+            }
+        });
+    }
 
     // Wire Save to Notes Button
     let ctx_note = ctx.clone();

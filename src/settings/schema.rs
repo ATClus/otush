@@ -319,6 +319,46 @@ fn default_stt_provider_timeout() -> u32 {
     15
 }
 
+/// Audio encoding requested from a TTS provider.
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum TtsFormat {
+    #[default]
+    Mp3,
+    Wav,
+}
+
+/// A Text-to-Speech provider entry. Mirrors [`TranscriptionProvider`]:
+/// `id` is stable (`deepgram` / `google` / `openai`), `voice` holds the
+/// provider-specific voice selector (Deepgram model voice like
+/// `aura-2-thalia-en`, OpenAI voice like `alloy`, Google voice name like
+/// `pt-BR-Standard-A`), and `model` the synthesis model where applicable.
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
+pub struct TtsProvider {
+    pub id: String,
+    pub label: String,
+    pub base_url: String,
+    pub model: String,
+    #[serde(default = "default_tts_voice_for_placeholder")]
+    pub voice: String,
+    #[serde(default = "default_provider_enabled")]
+    pub enabled: bool,
+    #[serde(default)]
+    pub allow_base_url_edit: bool,
+    #[serde(default = "default_tts_provider_timeout")]
+    pub timeout_seconds: u32,
+    #[serde(default)]
+    pub custom_headers: HashMap<String, String>,
+}
+
+fn default_tts_voice_for_placeholder() -> String {
+    String::new()
+}
+
+fn default_tts_provider_timeout() -> u32 {
+    30
+}
+
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq)]
 pub struct WebProvider {
     pub id: String,
@@ -702,6 +742,24 @@ pub struct AppSettings {
     pub transcription_api_keys: SecretMap,
     #[serde(default = "default_transcription_models")]
     pub transcription_models: HashMap<String, String>,
+    #[serde(default = "default_tts_providers")]
+    pub tts_providers: Vec<TtsProvider>,
+    #[serde(default = "default_tts_api_keys")]
+    pub tts_api_keys: SecretMap,
+    #[serde(default = "default_tts_models")]
+    pub tts_models: HashMap<String, String>,
+    #[serde(default = "default_tts_voices")]
+    pub tts_voices: HashMap<String, String>,
+    #[serde(default = "default_tts_active_provider_id")]
+    pub tts_active_provider_id: String,
+    #[serde(default = "default_tts_speaking_rate")]
+    pub tts_speaking_rate: f32,
+    #[serde(default)]
+    pub tts_format: TtsFormat,
+    #[serde(default)]
+    pub tts_auto_read_chat: bool,
+    #[serde(default = "default_tts_reader_chunk_chars")]
+    pub tts_reader_chunk_chars: u32,
     #[serde(default = "default_post_process_enabled")]
     pub post_process_enabled: bool,
     #[serde(default = "default_post_process_provider_id")]
@@ -847,6 +905,46 @@ impl AppSettings {
         self.transcription_providers
             .iter()
             .find(|provider| provider.enabled)
+    }
+
+    pub fn tts_provider(&self, provider_id: &str) -> Option<&TtsProvider> {
+        self.tts_providers
+            .iter()
+            .find(|provider| provider.id == provider_id)
+    }
+
+    pub fn tts_provider_mut(&mut self, provider_id: &str) -> Option<&mut TtsProvider> {
+        self.tts_providers
+            .iter_mut()
+            .find(|provider| provider.id == provider_id)
+    }
+
+    pub fn active_tts_provider(&self) -> Option<&TtsProvider> {
+        self.tts_provider(&self.tts_active_provider_id)
+            .filter(|provider| provider.enabled)
+            .or_else(|| self.tts_providers.iter().find(|provider| provider.enabled))
+    }
+
+    /// API key for a TTS provider, falling back to the STT key of the same
+    /// `id` (the Deepgram/OpenAI/Google key works for both directions).
+    pub fn tts_api_key(&self, provider_id: &str) -> String {
+        let tts_key = self
+            .tts_api_keys
+            .get(provider_id)
+            .cloned()
+            .unwrap_or_default();
+        if !tts_key.trim().is_empty() {
+            return tts_key;
+        }
+        self.transcription_api_keys
+            .get(provider_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
+    /// Effective speaking rate clamped to the 0.5..=2.0 range providers accept.
+    pub fn effective_tts_speaking_rate(&self) -> f32 {
+        self.tts_speaking_rate.clamp(0.5, 2.0)
     }
 
     pub fn agent(&self, agent_id: &str) -> Option<&AgentConfig> {

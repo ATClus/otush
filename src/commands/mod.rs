@@ -6,6 +6,7 @@ pub mod errors;
 pub mod history;
 pub mod models;
 pub mod transcription;
+pub mod tts;
 
 pub use errors::{CommandError, CommandResult};
 

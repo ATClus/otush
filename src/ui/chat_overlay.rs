@@ -549,8 +549,10 @@ fn build_chat_page(
                     },
                 }
             };
-            append_bubble(&transcript, "You", &text, false);
+            append_bubble(&ctx, &transcript, "You", &text, false);
             entry.set_text("");
+            // A new question interrupts any chat speech immediately.
+            crate::commands::tts::stop_speaking(&ctx, crate::context::TtsSource::Chat);
             if let Err(e) = crate::commands::agents::send_message(&ctx, chat_id, &text) {
                 ctx.report_error("send_message", e);
                 toast.add_toast(libadwaita::Toast::new("Could not send message"));
@@ -583,6 +585,7 @@ fn build_chat_page(
         let ctx = ctx.clone();
         let state = state.clone();
         stop_btn.connect_clicked(move |_| {
+            crate::commands::tts::stop_speaking(&ctx, crate::context::TtsSource::Chat);
             let chat_id = state.lock().map(|s| s.chat_id).unwrap_or(None);
             if let Some(id) = chat_id {
                 let _ = crate::commands::agents::stop_chat(&ctx, id);
@@ -676,7 +679,7 @@ fn build_chat_page(
                                 return;
                             }
                             if let Some(transcript) = transcript_weak.into_weak_ref().upgrade() {
-                                replace_last_assistant(&transcript, &message.content);
+                                replace_last_assistant(&ctx_bus, &transcript, &message.content);
                             }
                         }
                     }
@@ -697,13 +700,42 @@ fn build_chat_page(
                             btn.set_visible(false);
                         }
                         if truncated {
-                            if let Some(t) = toast_weak.into_weak_ref().upgrade() {
+                            if let Some(t) = toast_weak.clone().into_weak_ref().upgrade() {
                                 t.add_toast(libadwaita::Toast::new(
                                     "Stopped at the agent's tool-step limit",
                                 ));
                             }
                         }
-                        let _ = &ctx_bus;
+                        // Auto-read: speak the final answer (AgentMessageAdded
+                        // already rendered it into the transcript).
+                        if settings::get_settings(&ctx_bus).tts_auto_read_chat {
+                            let last_answer = transcript_weak
+                                .clone()
+                                .into_weak_ref()
+                                .upgrade()
+                                .and_then(|t| last_assistant_text(&t));
+                            if let Some(answer) = last_answer {
+                                if !crate::commands::tts::speakable_text(&answer).is_empty() {
+                                    let ctx = ctx_bus.clone();
+                                    let toast_w = toast_weak.clone();
+                                    crate::runtime::spawn(async move {
+                                        if let Err(e) =
+                                            crate::commands::tts::speak_chat_message(&ctx, answer)
+                                                .await
+                                        {
+                                            ctx.report_error("chat_auto_read", e);
+                                            glib::MainContext::default().invoke(move || {
+                                                if let Some(t) = toast_w.into_weak_ref().upgrade() {
+                                                    t.add_toast(libadwaita::Toast::new(
+                                                        "Auto-read failed (check TTS provider)",
+                                                    ));
+                                                }
+                                            });
+                                        }
+                                    });
+                                }
+                            }
+                        }
                     }
                     AppEvent::SettingsChanged { setting, .. }
                         if setting == "agents" || setting == "selected_agent_id" =>
@@ -800,9 +832,9 @@ fn load_chat(
     if let Ok(messages) = crate::commands::agents::list_messages(ctx, chat_id) {
         for msg in messages {
             match msg.role.as_str() {
-                "user" => append_bubble(transcript, "You", &msg.content, false),
+                "user" => append_bubble(ctx, transcript, "You", &msg.content, false),
                 "assistant" if msg.content != "…" => {
-                    append_bubble(transcript, &agent_name, &msg.content, true)
+                    append_bubble(ctx, transcript, &agent_name, &msg.content, true)
                 }
                 _ => {}
             }
@@ -1013,7 +1045,13 @@ fn clear_transcript(transcript: &gtk4::ListBox) {
     }
 }
 
-fn append_bubble(transcript: &gtk4::ListBox, who: &str, text: &str, is_agent: bool) {
+fn append_bubble(
+    ctx: &AppContext,
+    transcript: &gtk4::ListBox,
+    who: &str,
+    text: &str,
+    is_agent: bool,
+) {
     let row = gtk4::Box::new(gtk4::Orientation::Vertical, 4);
     row.set_margin_top(6);
     row.set_margin_bottom(6);
@@ -1062,6 +1100,8 @@ fn append_bubble(transcript: &gtk4::ListBox, who: &str, text: &str, is_agent: bo
             }
         });
         actions.append(&copy_btn);
+        let speak_btn = super::tts_controls::chat_speak_button(ctx, text);
+        actions.append(&speak_btn);
         card.append(&actions);
     }
 
@@ -1136,7 +1176,7 @@ fn st_live_bubble(state: &Arc<Mutex<ChatUi>>, transcript: &gtk4::ListBox) {
 /// Replace the last assistant bubble text (placeholder "…" → final answer).
 /// The placeholder is a plain label; the final answer renders markdown, so
 /// the old label is swapped for a rendered view in place.
-fn replace_last_assistant(transcript: &gtk4::ListBox, text: &str) {
+fn replace_last_assistant(ctx: &AppContext, transcript: &gtk4::ListBox, text: &str) {
     let mut last_body: Option<gtk4::Label> = None;
     let mut child = transcript.first_child();
     while let Some(row) = child {
@@ -1148,7 +1188,50 @@ fn replace_last_assistant(transcript: &gtk4::ListBox, text: &str) {
     if let Some(label) = last_body {
         promote_live_label_to_markdown(&label, text);
     } else {
-        append_bubble(transcript, "Assistant", text, true);
+        append_bubble(ctx, transcript, "Assistant", text, true);
+    }
+}
+
+/// Extract the last assistant answer text from the transcript (for
+/// auto-read): prefers the rendered markdown view, falls back to the live
+/// plain-text label.
+fn last_assistant_text(transcript: &gtk4::ListBox) -> Option<String> {
+    use gtk4::prelude::*;
+    let mut last: Option<String> = None;
+    let mut child = transcript.first_child();
+    while let Some(row) = child {
+        child = row.next_sibling();
+        collect_assistant_text(&row, &mut last);
+    }
+    last.filter(|t| !t.trim().is_empty())
+}
+
+fn collect_assistant_text(widget: &gtk4::Widget, out: &mut Option<String>) {
+    use gtk4::prelude::*;
+    // Rendered markdown views expose their source via accessible text.
+    if let Ok(view) = widget.clone().downcast::<gtk4::TextView>() {
+        if !view.is_editable() {
+            let (start, end) = view.buffer().bounds();
+            let text = view.buffer().text(&start, &end, true).to_string();
+            if !text.trim().is_empty() {
+                *out = Some(text);
+            }
+        }
+        return;
+    }
+    if let Ok(label) = widget.clone().downcast::<gtk4::Label>() {
+        if label.is_selectable() {
+            let text = label.text().to_string();
+            if !text.trim().is_empty() && text.trim() != "…" {
+                *out = Some(text);
+            }
+        }
+        return;
+    }
+    let mut child = widget.first_child();
+    while let Some(c) = child {
+        child = c.next_sibling();
+        collect_assistant_text(&c, out);
     }
 }
 

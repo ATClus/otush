@@ -18,4 +18,5 @@ pub mod pages;
 pub mod prompt_palette;
 pub mod search_mode;
 pub mod todo_palette;
+pub mod tts_controls;
 pub mod window;
