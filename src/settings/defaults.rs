@@ -655,7 +655,21 @@ pub(crate) fn default_post_process_api_keys() -> SecretMap {
 }
 
 pub fn default_model_for_provider(provider_id: &str) -> String {
+    // Cheap, widely-available chat defaults so a fresh install (or a
+    // provider added by migration) resolves a model without forcing the
+    // user through Fetch first. The Providers page + `fetch_models`
+    // remain authoritative for current catalogs; these are fallbacks.
     match provider_id {
+        "openai" => "gpt-4o-mini".to_string(),
+        "anthropic" => "claude-sonnet-4-5".to_string(),
+        "gemini" => "gemini-2.5-flash".to_string(),
+        "groq" => "llama-3.3-70b-versatile".to_string(),
+        "deepseek" => "deepseek-chat".to_string(),
+        "mistral" => "mistral-small-latest".to_string(),
+        "openrouter" => "openai/gpt-4o-mini".to_string(),
+        "zai" => "glm-4-flash".to_string(),
+        "cerebras" => "llama-3.3-70b".to_string(),
+        "moonshot" => "moonshot-v1-8k".to_string(),
         "meta" => "muse-spark-1.3".to_string(),
         _ => String::new(),
     }
