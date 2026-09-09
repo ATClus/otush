@@ -606,7 +606,7 @@ fn build_and_present_doc_parser(ctx: &AppContext) {
                                 "image/jpeg"
                             };
                             let model = if p.id == "gemini" {
-                                "gemini-2.0-flash"
+                                "gemini-2.5-flash"
                             } else {
                                 "gpt-4o"
                             };

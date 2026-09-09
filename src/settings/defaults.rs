@@ -407,7 +407,7 @@ pub fn default_transcription_providers() -> Vec<TranscriptionProvider> {
             id: "gemini".to_string(),
             label: "Google".to_string(),
             base_url: "https://generativelanguage.googleapis.com/v1beta".to_string(),
-            model: "gemini-2.0-flash".to_string(),
+            model: "gemini-2.5-flash".to_string(),
             enabled: true,
             allow_base_url_edit: false,
             timeout_seconds: 20,
@@ -429,7 +429,7 @@ pub fn default_transcription_providers() -> Vec<TranscriptionProvider> {
             id: "assemblyai".to_string(),
             label: "AssemblyAI".to_string(),
             base_url: "https://api.assemblyai.com/v2".to_string(),
-            model: "best".to_string(),
+            model: "universal-3-pro".to_string(),
             enabled: true,
             allow_base_url_edit: false,
             timeout_seconds: 25,
@@ -850,6 +850,15 @@ pub(crate) fn ensure_post_process_defaults(settings: &mut AppSettings) -> bool {
                     );
                     *existing = "muse-spark-1.3".to_string();
                     changed = true;
+                } else if existing.is_empty()
+                    && provider.id != "custom"
+                    && provider.id != "ollama"
+                    && provider.id != "local_slm"
+                {
+                    // Backfill the new per-provider chat defaults for stores
+                    // that predate them (empty model + known provider).
+                    *existing = default_model.clone();
+                    changed = true;
                 }
             }
             None => {
@@ -899,6 +908,21 @@ pub(crate) fn ensure_transcription_provider_defaults(settings: &mut AppSettings)
                     existing.deepgram = Some(DeepgramConfig::default());
                     changed = true;
                 }
+
+                // Migrate deprecated model ids to current ones.
+                let migrated = match existing.id.as_str() {
+                    _ if existing.model == "gemini-2.0-flash" => Some("gemini-2.5-flash"),
+                    _ if existing.model == "best" => Some("universal-3-pro"),
+                    _ => None,
+                };
+                if let Some(new_model) = migrated {
+                    info!(
+                        "Migrating transcription model for '{}' from '{}' to '{}'",
+                        existing.id, existing.model, new_model
+                    );
+                    existing.model = new_model.to_string();
+                    changed = true;
+                }
             }
             None => {
                 settings.transcription_providers.push(provider.clone());
@@ -918,6 +942,12 @@ pub(crate) fn ensure_transcription_provider_defaults(settings: &mut AppSettings)
             Some(existing) => {
                 if existing.is_empty() && !default_model.is_empty() {
                     *existing = default_model.clone();
+                    changed = true;
+                } else if existing == "best" {
+                    *existing = "universal-3-pro".to_string();
+                    changed = true;
+                } else if existing == "gemini-2.0-flash" {
+                    *existing = "gemini-2.5-flash".to_string();
                     changed = true;
                 }
             }

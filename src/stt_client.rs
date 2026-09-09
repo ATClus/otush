@@ -575,7 +575,7 @@ async fn transcribe_google_gemini(
                 }
             ]
         }],
-        "generationConfig": {
+        "generation_config": {
             "temperature": 0.0
         }
     });
@@ -612,7 +612,7 @@ async fn transcribe_google_gemini(
 async fn transcribe_gladia(
     provider: &TranscriptionProvider,
     api_key: &str,
-    _model: &str,
+    model: &str,
     language: &str,
     wav_bytes: Vec<u8>,
 ) -> Result<String, String> {
@@ -661,6 +661,13 @@ async fn transcribe_gladia(
         "diarization": false
     });
 
+    // Forward the configured model when it looks like a Gladia model id
+    // (default `solaria-1`); empty/foreign values are left to server default.
+    let model_trimmed = model.trim();
+    if !model_trimmed.is_empty() {
+        payload["model"] = serde_json::Value::String(model_trimmed.to_string());
+    }
+
     let lang_clean = language.trim();
     if !lang_clean.is_empty() && !lang_clean.eq_ignore_ascii_case("auto") {
         let code = lang_clean.split('-').next().unwrap_or(lang_clean);
@@ -695,11 +702,11 @@ async fn transcribe_gladia(
         return Err("Gladia response missing result_url or id".to_string());
     };
 
-    // Step 3: Poll for completion
+    // Step 3: Poll for completion, bounded by the provider timeout.
     let poll_interval = Duration::from_millis(500);
-    let max_polls = 60; // Up to 30 seconds
+    let deadline = Instant::now() + Duration::from_secs(provider.timeout_seconds.max(30) as u64);
 
-    for _ in 0..max_polls {
+    while Instant::now() < deadline {
         tokio::time::sleep(poll_interval).await;
         let poll_resp = client
             .get(&poll_url)
@@ -791,16 +798,19 @@ async fn transcribe_assemblyai(
         .and_then(|v| v.as_str())
         .ok_or_else(|| "AssemblyAI response missing upload_url".to_string())?;
 
-    // Step 2: Request transcription
+    // Step 2: Request transcription. `speech_models` (plural) is the
+    // current parameter; `speech_model` (singular) is deprecated. The
+    // legacy `best` alias maps to Universal-3 Pro.
     let transcript_url = format!("{}/transcript", base_url);
-    let effective_model = if model.trim().is_empty() {
-        "best"
+    let requested = model.trim();
+    let effective_model = if requested.is_empty() || requested.eq_ignore_ascii_case("best") {
+        "universal-3-pro"
     } else {
-        model.trim()
+        requested
     };
     let mut payload = serde_json::json!({
         "audio_url": upload_url_str,
-        "speech_model": effective_model
+        "speech_models": [effective_model]
     });
 
     let lang_clean = language.trim();
@@ -834,12 +844,14 @@ async fn transcribe_assemblyai(
         .and_then(|v| v.as_str())
         .ok_or_else(|| "AssemblyAI response missing transcript id".to_string())?;
 
-    // Step 3: Poll for completion
+    // Step 3: Poll for completion, bounded by the provider timeout so a
+    // stuck job surfaces as an actionable error instead of hanging a
+    // fixed 30s and masking the configured value.
     let poll_url = format!("{}/transcript/{}", base_url, transcript_id);
     let poll_interval = Duration::from_millis(500);
-    let max_polls = 60; // Up to 30 seconds
+    let deadline = Instant::now() + Duration::from_secs(provider.timeout_seconds.max(30) as u64);
 
-    for _ in 0..max_polls {
+    while Instant::now() < deadline {
         tokio::time::sleep(poll_interval).await;
         let poll_resp = client
             .get(&poll_url)

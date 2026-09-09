@@ -413,21 +413,26 @@ fn build_headers(provider: &PostProcessProvider, api_key: &str) -> Result<Header
         }
     }
 
-    // Provider-specific auth headers
+    // Provider-specific auth headers. Every configured default speaks the
+    // OpenAI-compatible `/chat/completions` dialect with Bearer auth — even
+    // Anthropic and Gemini, whose base URLs below point at OpenAI-compat
+    // routes (`api.anthropic.com/v1`, `.../v1beta/openai`). Native-only
+    // headers (`x-api-key`, `anthropic-version`, `x-goog-api-key`) are sent
+    // solely when the user overrides the base URL to a native endpoint.
     if !api_key.is_empty() {
-        if provider.id == "anthropic" || provider.base_url.contains("anthropic.com") {
+        let base = provider.base_url.to_lowercase();
+        let anthropic_native =
+            (provider.id == "anthropic" || base.contains("anthropic.com")) && !base.contains("/v1");
+        let gemini_native = (provider.id == "gemini" || base.contains("googleapis.com"))
+            && !base.contains("/openai");
+        if anthropic_native {
             headers.insert(
                 "x-api-key",
                 HeaderValue::from_str(api_key)
                     .map_err(|e| format!("Invalid API key header value: {}", e))?,
             );
             headers.insert("anthropic-version", HeaderValue::from_static("2023-06-01"));
-        } else if provider.id == "gemini" || provider.base_url.contains("googleapis.com") {
-            headers.insert(
-                AUTHORIZATION,
-                HeaderValue::from_str(&format!("Bearer {}", api_key))
-                    .map_err(|e| format!("Invalid authorization header value: {}", e))?,
-            );
+        } else if gemini_native {
             headers.insert(
                 "x-goog-api-key",
                 HeaderValue::from_str(api_key)
@@ -721,6 +726,38 @@ pub async fn send_chat_completion_with_schema(
         response.version(),
         sanitized_url(response.url())
     );
+
+    // A 400/422 on a request carrying `response_format` may be the endpoint
+    // rejecting structured output (DeepSeek chat, some OpenRouter upstreams,
+    // local servers). Retry once without it; the caller (`transcribe.rs`)
+    // already parses plain-text content as a fallback.
+    if !status.is_success()
+        && matches!(status.as_u16(), 400 | 422)
+        && request_body.response_format.is_some()
+    {
+        let error_text = response.text().await.unwrap_or_else(|e| {
+            report_reqwest_error("Failed to read schema rejection response", &e)
+        });
+        info!(
+            "Endpoint rejected request with response_format (status {}): {}. Retrying without structured output",
+            status, error_text
+        );
+
+        request_body.response_format = None;
+        response = client
+            .post(&url)
+            .json(&request_body)
+            .send()
+            .await
+            .map_err(|e| report_reqwest_error("HTTP retry failed", &e))?;
+        status = response.status();
+        debug!(
+            "Chat completion retry response received with status {} over {:?} from {}",
+            status,
+            response.version(),
+            sanitized_url(response.url())
+        );
+    }
 
     // A 400/422 on a request carrying reasoning fields might be the endpoint rejecting those fields — retry once without them.
     if !status.is_success()
